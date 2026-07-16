@@ -530,6 +530,21 @@ fn pass_turnover_guard_reasons(
     reasons
 }
 
+fn pass_progression_guard_reasons(
+    advancement: &AdvancementRecord,
+    min_pass_gain_yards_margin: f64,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if advancement.pass_gain_yards_margin() <= min_pass_gain_yards_margin {
+        reasons.push(format!(
+            "pass-gain-yards margin {:+.1} <= required {:+.1}",
+            advancement.pass_gain_yards_margin(),
+            min_pass_gain_yards_margin,
+        ));
+    }
+    reasons
+}
+
 fn forward_pass_confidence_reasons(
     confidence: &AdvancementConfidence,
     require_forward_lb9999: bool,
@@ -907,6 +922,7 @@ fn main() {
         env_bool("SOCCER_EVAL_REQUIRE_GOAL_DIFF_FOR_FORWARD_PASS", false);
     let min_goal_diff_margin = env_i32("SOCCER_EVAL_MIN_GOAL_DIFF_MARGIN", 0);
     let max_pass_turnover_rate_delta = env_f64("SOCCER_EVAL_MAX_PASS_TURNOVER_RATE_DELTA", 0.0);
+    let min_pass_gain_yards_margin = env_f64("SOCCER_EVAL_MIN_PASS_GAIN_YARDS_MARGIN", 0.0);
     let advancement_reasons = if require_forward_pass_climb {
         let mut reasons = forward_pass_gate_reasons(
             &advancement,
@@ -917,6 +933,10 @@ fn main() {
         reasons.extend(pass_turnover_guard_reasons(
             &advancement,
             max_pass_turnover_rate_delta,
+        ));
+        reasons.extend(pass_progression_guard_reasons(
+            &advancement,
+            min_pass_gain_yards_margin,
         ));
         reasons.extend(forward_pass_sample_reasons(
             &advancement,
@@ -1039,12 +1059,13 @@ fn main() {
     if require_forward_pass_climb {
         println!("scoreline gate: diagnostic only with forward-pass climb");
         println!(
-            "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp pass_completion_rate>{:+.1}pp pass_turnover_rate_delta<={:+.1}pp min_games={} lb9999_forward={} lb9999_completion={} lb9999_turnover={} goal_diff_floor={} -> {}",
+            "forward-pass gate: margin>{:+} net_margin>{:+} rate_margin>{:+.1}pp pass_completion_rate>{:+.1}pp pass_turnover_rate_delta<={:+.1}pp pass_gain_yards_margin>{:+.1} min_games={} lb9999_forward={} lb9999_completion={} lb9999_turnover={} goal_diff_floor={} -> {}",
             min_forward_pass_margin,
             min_net_forward_pass_margin,
             min_forward_pass_rate_margin * 100.0,
             min_pass_completion_rate_margin * 100.0,
             max_pass_turnover_rate_delta * 100.0,
+            min_pass_gain_yards_margin,
             min_forward_pass_games,
             require_forward_pass_lb9999,
             require_pass_completion_lb9999,
@@ -1265,6 +1286,32 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("pass-turnover-rate delta")),
             "candidate turnover-rate regression must fail the anti-gaming guard: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn pass_progression_guard_rejects_short_forward_pass_loops() {
+        let mut record = AdvancementRecord::default();
+        record.add(AdvancementFixture {
+            candidate_forward_passes: 20,
+            opponent_forward_passes: 12,
+            candidate_passes_attempted: 24,
+            opponent_passes_attempted: 24,
+            candidate_completed_passes: 22,
+            opponent_completed_passes: 20,
+            candidate_turnovers: 0,
+            opponent_turnovers: 0,
+            candidate_pass_gain_yards: 72.0,
+            opponent_pass_gain_yards: 96.0,
+        });
+
+        assert!(record.forward_pass_margin() > 0);
+        let reasons = pass_progression_guard_reasons(&record, 0.0);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("pass-gain-yards margin")),
+            "a higher pass count with less field progress must not pass: {reasons:?}"
         );
     }
 

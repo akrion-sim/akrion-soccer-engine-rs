@@ -1527,6 +1527,12 @@ fn neural_population_candidate_forward_pass_rate(eval: &NeuralPopulationCandidat
     neural_behavior_forward_pass_rate(&eval.behavior)
 }
 
+fn neural_population_candidate_pass_gain_yards_per_game(
+    eval: &NeuralPopulationCandidateEval,
+) -> f64 {
+    eval.behavior.completed_pass_gain_yards_for / neural_population_candidate_games(eval)
+}
+
 fn neural_population_candidate_forward_pass_rank_score(
     eval: &NeuralPopulationCandidateEval,
 ) -> f64 {
@@ -1551,6 +1557,8 @@ fn neural_population_forward_pass_climb_reasons(
         - neural_population_candidate_net_forward_passes_per_game(reference);
     let rate_margin = neural_population_candidate_forward_pass_rate(candidate)
         - neural_population_candidate_forward_pass_rate(reference);
+    let pass_gain_margin = neural_population_candidate_pass_gain_yards_per_game(candidate)
+        - neural_population_candidate_pass_gain_yards_per_game(reference);
     let goal_margin = neural_population_candidate_goal_margin(candidate);
     let mut reasons = Vec::new();
     if forward_margin <= search_config.min_forward_pass_margin {
@@ -1570,6 +1578,15 @@ fn neural_population_forward_pass_climb_reasons(
             "forward_pass_rate_margin {:+.1}pp <= required {:+.1}pp",
             rate_margin * 100.0,
             search_config.min_forward_pass_rate_margin * 100.0
+        ));
+    }
+    // A raw count can be gamed by cycling several tiny "forward" touches.  Require
+    // the candidate to move the ball farther as well as completing more forward
+    // passes, otherwise the population ladder selects possession loops rather than
+    // football progress toward goal.
+    if pass_gain_margin <= 0.0 {
+        reasons.push(format!(
+            "pass_gain_yards_per_game_margin {pass_gain_margin:+.3} <= required +0.000"
         ));
     }
     if goal_margin + 1e-12 < search_config.min_accepted_goal_margin {
@@ -4883,6 +4900,10 @@ fn push_evolution_search_samples(
     }
 }
 
+fn evolution_window_is_ready(sample_count: usize, window_games: usize) -> bool {
+    sample_count >= window_games.max(1)
+}
+
 fn push_policy_promotion_summary(
     summaries: &mut VecDeque<MatchSummary>,
     summary: &MatchSummary,
@@ -5965,6 +5986,12 @@ fn anchor_forward_pass_rate_margin(verdict: &AnchorForwardPassVerdict) -> f64 {
         - neural_behavior_forward_pass_rate(&verdict.anchor)
 }
 
+fn anchor_pass_gain_yards_per_game_margin(verdict: &AnchorForwardPassVerdict) -> f64 {
+    let games = verdict.games.max(1) as f64;
+    (verdict.candidate.completed_pass_gain_yards_for - verdict.anchor.completed_pass_gain_yards_for)
+        / games
+}
+
 fn anchor_forward_pass_reasons(
     verdict: &AnchorForwardPassVerdict,
     cfg: &AnchorPromotionGateConfig,
@@ -5995,6 +6022,12 @@ fn anchor_forward_pass_reasons(
             "forward-pass rate margin {:+.1}pp <= required {:+.1}pp",
             anchor_forward_pass_rate_margin(verdict) * 100.0,
             cfg.min_forward_pass_rate_margin * 100.0,
+        ));
+    }
+    if anchor_pass_gain_yards_per_game_margin(verdict) <= 0.0 {
+        reasons.push(format!(
+            "pass-gain-yards/game margin {:+.3} <= required +0.000",
+            anchor_pass_gain_yards_per_game_margin(verdict),
         ));
     }
     reasons
@@ -6086,6 +6119,11 @@ fn anchor_forward_pass_verdict_search_metadata(
         "candidateForwardPassRate": neural_behavior_forward_pass_rate(&verdict.candidate),
         "anchorForwardPassRate": neural_behavior_forward_pass_rate(&verdict.anchor),
         "forwardPassRateMargin": anchor_forward_pass_rate_margin(verdict),
+        "candidatePassGainYardsPerGame": verdict.candidate.completed_pass_gain_yards_for
+            / verdict.games.max(1) as f64,
+        "anchorPassGainYardsPerGame": verdict.anchor.completed_pass_gain_yards_for
+            / verdict.games.max(1) as f64,
+        "passGainYardsPerGameMargin": anchor_pass_gain_yards_per_game_margin(verdict),
         "candidateCompletedPasses": verdict.candidate.completed_passes_for,
         "anchorCompletedPasses": verdict.anchor.completed_passes_for,
         "candidateTurnovers": verdict.candidate.interceptions_for,
@@ -11222,7 +11260,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         let completed_after_batch = episode_summaries.len();
         let should_evolve = evolution_enabled
             && !completed_games.is_empty()
-            && !evolution_search_samples.is_empty()
+            // Never mutate a generation from a partial evidence window merely
+            // because a short run reached its final batch. That end-of-run path
+            // previously allowed one match to drive the whole genetic/tactical
+            // population and produced large cyclic parameter jumps.
+            && evolution_window_is_ready(evolution_search_samples.len(), evolution_window_games)
             && (completed_after_batch >= games
                 || completed_after_batch % evolution_interval_games == 0);
         if should_evolve {
@@ -14274,6 +14316,39 @@ mod tests {
             Some("threaded")
         );
         assert_eq!(
+            continuous_manifest_env_value("SOCCER_NEURAL_LEARNING_RATE"),
+            Some("0.0003")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_NEURAL_HIDDEN_UNITS"),
+            Some("128")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_NEURAL_BLEND_MODE"),
+            Some("authoritative")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_MARL_ALGORITHM"),
+            Some("mappo")
+        );
+        assert_eq!(
+            continuous_manifest_env_value("SOCCER_LEARNING_MPC_ENABLED"),
+            Some("true")
+        );
+        for threshold in [
+            "SOCCER_BATCH_CURRICULUM_BALL_SKILLS_AFTER_GAMES",
+            "SOCCER_BATCH_CURRICULUM_DUELS_AFTER_GAMES",
+            "SOCCER_BATCH_CURRICULUM_SMALL_SIDED_AFTER_GAMES",
+            "SOCCER_BATCH_CURRICULUM_TEAM_SHAPE_AFTER_GAMES",
+            "SOCCER_BATCH_CURRICULUM_FULL_MATCH_AFTER_GAMES",
+        ] {
+            assert_eq!(
+                continuous_manifest_env_value(threshold),
+                Some("0"),
+                "continuous 11v11 cycles must not restart the episode-local skill curriculum"
+            );
+        }
+        assert_eq!(
             continuous_manifest_env_value("SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES"),
             Some("1")
         );
@@ -14486,6 +14561,10 @@ mod tests {
             Some("0.0")
         );
         assert_eq!(
+            continuous_manifest_env_value("SOCCER_EVAL_MIN_PASS_GAIN_YARDS_MARGIN"),
+            Some("0")
+        );
+        assert_eq!(
             continuous_manifest_env_value("SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB"),
             Some("true")
         );
@@ -14610,6 +14689,9 @@ mod tests {
         );
         assert_continuous_manifest_contains(
             "require_value SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN 0.0",
+        );
+        assert_continuous_manifest_contains(
+            "require_value SOCCER_EVAL_MIN_PASS_GAIN_YARDS_MARGIN 0",
         );
         assert_continuous_manifest_contains(
             "require_value SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB true",
@@ -15034,6 +15116,7 @@ mod tests {
                 completed_passes_for: completed_passes,
                 completed_forward_passes_for: completed_forward_passes,
                 interceptions_for: interceptions,
+                completed_pass_gain_yards_for: f64::from(completed_forward_passes) * 5.5,
                 ..NeuralPopulationCandidateBehavior::default()
             },
             snapshot: test_neural_snapshot_with_training_steps(0),
@@ -15093,6 +15176,25 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("net_forward_pass_margin")),
             "turnovers must count against the internal population climb gate: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn population_forward_pass_gate_rejects_short_pass_count_loops() {
+        let config = neural_population_search_config_for_forward_gate_test();
+        let mut reference =
+            neural_population_eval_for_forward_gate_test(1, "anchor_baseline", 0.0, 0, 0, 24, 8, 0);
+        let mut candidate =
+            neural_population_eval_for_forward_gate_test(2, "candidate", 0.0, 0, 0, 24, 12, 0);
+        reference.behavior.completed_pass_gain_yards_for = 96.0;
+        candidate.behavior.completed_pass_gain_yards_for = 72.0;
+
+        let reasons = neural_population_forward_pass_climb_reasons(&candidate, &reference, config);
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason.contains("pass_gain_yards_per_game_margin")),
+            "more short forward touches must not beat less frequent real progression: {reasons:?}"
         );
     }
 
@@ -15362,6 +15464,15 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].policies.home.entries()[0].visits, 3);
         assert_eq!(samples[1].policies.home.entries()[0].visits, 4);
+    }
+
+    #[test]
+    fn evolution_waits_for_a_complete_evidence_window() {
+        assert!(!evolution_window_is_ready(0, 10));
+        assert!(!evolution_window_is_ready(1, 10));
+        assert!(!evolution_window_is_ready(9, 10));
+        assert!(evolution_window_is_ready(10, 10));
+        assert!(evolution_window_is_ready(11, 10));
     }
 
     #[test]

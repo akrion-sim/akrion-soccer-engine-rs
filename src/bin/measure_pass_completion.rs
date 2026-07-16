@@ -22,7 +22,14 @@ fn main() {
     let seeds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
     let mpc_on = std::env::var("SOCCER_MEASURE_MPC").ok().as_deref() == Some("1");
 
-    let (mut att, mut comp, mut fwd, mut back) = (0u64, 0u64, 0u64, 0u64);
+    let (mut att, mut comp) = (0u64, 0u64);
+    let (mut fwd_att, mut fwd_comp) = (0u64, 0u64);
+    let (mut lat_att, mut lat_comp) = (0u64, 0u64);
+    let (mut back_att, mut back_comp) = (0u64, 0u64);
+    let (mut intentional_att, mut intentional_comp) = (0u64, 0u64);
+    let (mut intentional_fwd_att, mut intentional_fwd_comp) = (0u64, 0u64);
+    let (mut intentional_lat_att, mut intentional_lat_comp) = (0u64, 0u64);
+    let (mut intentional_back_att, mut intentional_back_comp) = (0u64, 0u64);
     let mut per_match_rate: Vec<f64> = Vec::new();
 
     for s in 0..seeds {
@@ -41,10 +48,41 @@ fn main() {
         let c = (sim.stats.passes_completed_home + sim.stats.passes_completed_away) as u64;
         att += a;
         comp += c;
-        fwd += (sim.stats.passes_completed_forward_home + sim.stats.passes_completed_forward_away)
-            as u64;
-        back += (sim.stats.passes_completed_backward_home
+        fwd_att += (sim.stats.passes_attempted_forward_home
+            + sim.stats.passes_attempted_forward_away) as u64;
+        fwd_comp += (sim.stats.passes_completed_forward_home
+            + sim.stats.passes_completed_forward_away) as u64;
+        lat_att += (sim.stats.passes_attempted_lateral_home
+            + sim.stats.passes_attempted_lateral_away) as u64;
+        lat_comp += (sim.stats.passes_completed_lateral_home
+            + sim.stats.passes_completed_lateral_away) as u64;
+        back_att += (sim.stats.passes_attempted_backward_home
+            + sim.stats.passes_attempted_backward_away) as u64;
+        back_comp += (sim.stats.passes_completed_backward_home
             + sim.stats.passes_completed_backward_away) as u64;
+
+        intentional_att += (sim.stats.intentional_passes_attempted_home
+            + sim.stats.intentional_passes_attempted_away) as u64;
+        intentional_comp += (sim.stats.intentional_passes_completed_home
+            + sim.stats.intentional_passes_completed_away) as u64;
+        intentional_fwd_att += (sim.stats.intentional_passes_attempted_forward_home
+            + sim.stats.intentional_passes_attempted_forward_away)
+            as u64;
+        intentional_fwd_comp += (sim.stats.intentional_passes_completed_forward_home
+            + sim.stats.intentional_passes_completed_forward_away)
+            as u64;
+        intentional_lat_att += (sim.stats.intentional_passes_attempted_lateral_home
+            + sim.stats.intentional_passes_attempted_lateral_away)
+            as u64;
+        intentional_lat_comp += (sim.stats.intentional_passes_completed_lateral_home
+            + sim.stats.intentional_passes_completed_lateral_away)
+            as u64;
+        intentional_back_att += (sim.stats.intentional_passes_attempted_backward_home
+            + sim.stats.intentional_passes_attempted_backward_away)
+            as u64;
+        intentional_back_comp += (sim.stats.intentional_passes_completed_backward_home
+            + sim.stats.intentional_passes_completed_backward_away)
+            as u64;
         if a > 0 {
             per_match_rate.push(c as f64 / a as f64);
         }
@@ -81,8 +119,35 @@ fn main() {
         mean_pm + 1.96 * se
     );
     println!(
-        "forward completed = {fwd}  backward completed = {back}  forward-share = {:.3}",
-        fwd as f64 / comp.max(1) as f64
+        "all direction rates: forward={}/{} ({:.1}%, target 85%) lateral={}/{} ({:.1}%) backward={}/{} ({:.1}%, target 95%)",
+        fwd_comp,
+        fwd_att,
+        completion_percent(fwd_comp, fwd_att),
+        lat_comp,
+        lat_att,
+        completion_percent(lat_comp, lat_att),
+        back_comp,
+        back_att,
+        completion_percent(back_comp, back_att),
+    );
+    println!(
+        "intentional: completed={}/{} ({:.1}%, target 90%); forward={}/{} ({:.1}%, target 85%) lateral={}/{} ({:.1}%) backward={}/{} ({:.1}%, target 95%)",
+        intentional_comp,
+        intentional_att,
+        completion_percent(intentional_comp, intentional_att),
+        intentional_fwd_comp,
+        intentional_fwd_att,
+        completion_percent(intentional_fwd_comp, intentional_fwd_att),
+        intentional_lat_comp,
+        intentional_lat_att,
+        completion_percent(intentional_lat_comp, intentional_lat_att),
+        intentional_back_comp,
+        intentional_back_att,
+        completion_percent(intentional_back_comp, intentional_back_att),
     );
     println!("END");
+}
+
+fn completion_percent(completed: u64, attempted: u64) -> f64 {
+    100.0 * completed as f64 / attempted.max(1) as f64
 }

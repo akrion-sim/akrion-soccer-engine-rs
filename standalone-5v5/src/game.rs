@@ -189,7 +189,8 @@ pub const PASS_TARGET_SLOTS: usize = N - 2; // outfield teammates minus the poss
 
 // Full relational field vector (per-agent actor observation): 11 self/global +
 // 5 ball + 5 goals + 6 role/cues + (N-1)*5 teammates + N*5 opponents + 1 bias.
-pub const OBS_DIM: usize = 73;
+const PASS_CANDIDATE_FEATURES: usize = 9;
+pub const OBS_DIM: usize = 97;
 
 // Centralized-critic GLOBAL state (MAPPO / CTDE): the whole field in a single
 // canonical (Team-A attack) frame — every player's pos+vel + ball pos+vel +
@@ -738,6 +739,74 @@ impl World {
         out
     }
 
+    /// POMDP-visible semantics for the three receiver actions. A pass action is a
+    /// ranked slot, not a stable player id, so the actor must observe who that slot
+    /// currently names and whether MPC/physics can execute it. The final component
+    /// is a bounded receipt estimate from lane, endpoint space, and arrival race;
+    /// it is a feature for the neural chooser, not an analytic action override.
+    fn pass_candidate_features(
+        &self,
+        team: Team,
+        from_idx: usize,
+    ) -> [[f32; PASS_CANDIDATE_FEATURES]; PASS_TARGET_SLOTS] {
+        let candidates = self.pass_candidates(team, from_idx);
+        let roster = players(team, self);
+        let from = roster[from_idx].pos;
+        let sx = team.sx();
+        let mut features = [[0.0; PASS_CANDIDATE_FEATURES]; PASS_TARGET_SLOTS];
+        for (slot, candidate) in candidates.into_iter().enumerate() {
+            let Some((receiver_idx, _)) = candidate else {
+                features[slot][0] = -1.0;
+                continue;
+            };
+            let receiver = roster[receiver_idx];
+            let delta = receiver.pos.sub(from);
+            let (target, speed) = self.pass_target_and_speed(from, receiver);
+            let (_, endpoint_space) = self.nearest_opponent(team, target);
+            let lane = self.lane_clearness(team, from, target).clamp(0.0, 1.0);
+            let ball_eta = from.sub(target).len() / speed.max(1.0);
+            let opponent_eta = endpoint_space / PLAYER_SPEED.max(1.0);
+            let race = ((opponent_eta - ball_eta + 0.50) / 1.50).clamp(0.0, 1.0);
+            let openness = (endpoint_space / 15.0).clamp(0.0, 1.0);
+            let receipt = (lane * 0.45 + openness * 0.30 + race * 0.25).clamp(0.0, 1.0);
+            features[slot] = [
+                1.0,
+                (delta.y * sx / FIELD_L).clamp(-1.0, 1.0),
+                (delta.x / FIELD_W).clamp(-1.0, 1.0),
+                (delta.len() / FIELD_L).clamp(0.0, 1.0),
+                (receiver.vel.y * sx / 10.0).clamp(-1.0, 1.0),
+                (receiver.vel.x / 10.0).clamp(-1.0, 1.0),
+                openness,
+                lane,
+                receipt,
+            ];
+        }
+        features
+    }
+
+    /// Aim at the receiver's bounded arrival point, not an unconditional point
+    /// two yards upfield. The old bias made a stationary backward outlet run past
+    /// its own target and needlessly reduced the safest pass family's completion.
+    fn pass_target_and_speed(&self, from: V2, receiver: Player) -> (V2, f32) {
+        let distance = receiver.pos.sub(from).len();
+        let nominal_speed = PASS_SPEED * (0.85 + 0.35 * (distance / FIELD_L).clamp(0.0, 1.0));
+        let flight_seconds = (distance / nominal_speed.max(1e-3) * 1.15).clamp(0.0, 1.2);
+        let raw_lead = receiver.vel.scale(flight_seconds);
+        let lead = if raw_lead.len() > 3.0 {
+            raw_lead.unit().scale(3.0)
+        } else {
+            raw_lead
+        };
+        let target = receiver.pos.add(lead);
+        let target = V2 {
+            x: target.x.clamp(0.5, FIELD_W - 0.5),
+            y: target.y.clamp(0.5, FIELD_L - 0.5),
+        };
+        let target_distance = target.sub(from).len();
+        let speed = PASS_SPEED * (0.85 + 0.35 * (target_distance / FIELD_L).clamp(0.0, 1.0));
+        (target, speed)
+    }
+
     /// Where a defender at `from` should move to INTERCEPT the ball: simulate the
     /// ball's future trajectory (with friction) and return the earliest point the
     /// defender can physically reach — anticipation, so passes get cut out. For a
@@ -919,12 +988,10 @@ impl World {
         let opp_ball = phase == PossessionPhase::Dispossession;
         let free_ball = phase == PossessionPhase::FiftyFifty;
 
-        // derived cues kept for action semantics: shot lane + best-pass openness
+        // Derived cues kept for action semantics: shot lane plus explicit geometry
+        // and execution feasibility for each dynamically-ranked receiver action.
         let shot_clear = self.shot_clearness(team, me.pos);
-        let cands = self.pass_candidates(team, idx);
-        let open_of =
-            |c: Option<(usize, f32)>| c.map(|(_, s)| (s / 15.0).clamp(-1.0, 1.0)).unwrap_or(-1.0);
-        let (aopen, bopen, copen) = (open_of(cands[0]), open_of(cands[1]), open_of(cands[2]));
+        let pass_features = self.pass_candidate_features(team, idx);
 
         // role: is this the closest outfielder to the ball, and its ball-distance rank
         let my_ball_d = me.pos.sub(self.ball).len();
@@ -984,13 +1051,13 @@ impl World {
         f.push(goal.sub(mp).len() / nx);
         f.push((own.y - mp.y) / nx);
         f.push((own.x - mp.x) / ny);
-        // role + action cues (6)
+        // role + action cues (3 + 3 receiver slots × 9 features)
         f.push(is_closest);
         f.push(ball_rank);
         f.push(shot_clear);
-        f.push(aopen);
-        f.push(bopen);
-        f.push(copen);
+        for candidate in pass_features {
+            f.extend(candidate);
+        }
         // ALL teammates, nearest-first (N-1 = 4 × 5 = 20)
         for &k in &tm {
             let p = players(team, self)[k];
@@ -1273,8 +1340,8 @@ impl World {
 
         // 4. Advance a free ball + friction, walls, goals, capture.
         if self.owner.is_none() {
-            self.ball = self.ball.add(self.ball_vel.scale(DT));
-            if self.ball_vel.len() > 4.0 {
+            let previous_velocity = self.ball_vel;
+            if previous_velocity.len() > 4.0 {
                 self.ball_vel = self.ball_vel.add(self.ball_curl.scale(DT));
             }
             // Three-term drag (linear + air + grass), attenuated while airborne.
@@ -1283,6 +1350,12 @@ impl World {
                 let ns = ball_resistance_after(sp, self.ball_z);
                 self.ball_vel = self.ball_vel.scale(ns / sp);
             }
+            // Match the 11v11 integrator: move by the average pre/post-resistance
+            // velocity. Advancing by the old velocity alone made identical passes
+            // travel farther in this fast harness than in the full-field engine.
+            self.ball = self
+                .ball
+                .add(previous_velocity.add(self.ball_vel).scale(0.5 * DT));
             // Altitude: closed-form parabola in time; lands (z=0) when the hang time elapses.
             if self.ball_aerial {
                 self.ball_taloft += DT;
@@ -1692,20 +1765,20 @@ impl World {
                 let cands = self.pass_candidates(team, idx);
                 let pick = cands[a - A_PASS_A];
                 if let Some((ti, _)) = pick {
-                    // lead the pass slightly ahead of the receiver's forward run
-                    let tp = players(team, self)[ti].pos;
-                    let lead = tp.add(V2::new(sx * 2.0, 0.0));
+                    let receiver = players(team, self)[ti];
+                    let tp = receiver.pos;
+                    let (lead, pspeed) = self.pass_target_and_speed(me, receiver);
                     self.intended_receiver = Some(Owner { team, idx: ti });
                     // SCOOP / lofted pass: if a defender blocks the GROUND lane to the
                     // target, lift the ball OVER them (aerial) so the pass can still be
                     // made. Aerial control takes time, so it only completes if the
                     // receiver is open (checked at reception) — else it lands loose.
-                    let ground_lane = self.lane_clearness(team, me, tp);
+                    let ground_lane = self.lane_clearness(team, me, lead);
                     if ground_lane < 0.55 {
                         // Loft OVER the blocked ground lane: a closed-form projectile whose apex
                         // grows with distance, launched at the land-on-target horizontal speed so
                         // it comes down at the receiver as the arc completes (soccer.rs parity).
-                        let d = tp.sub(me).len();
+                        let d = lead.sub(me).len();
                         self.pending_aerial = true;
                         self.pending_apex = lofted_apex_yds(d);
                         self.pending_aerial_speed =
@@ -1737,9 +1810,7 @@ impl World {
                         }
                         self.ev_return_pass_a = is_return;
                     }
-                    self.pending_curl = self.kick_curl(team, me, tp);
-                    let pass_dist = tp.sub(me).len();
-                    let pspeed = PASS_SPEED * (0.85 + 0.35 * (pass_dist / FIELD_L).clamp(0.0, 1.0));
+                    self.pending_curl = self.kick_curl(team, me, lead);
                     Some((owner, lead.sub(me), pspeed, true))
                 } else {
                     // no valid target: dribble forward instead
@@ -1806,8 +1877,9 @@ impl World {
             }
             let cands = self.pass_candidates(team, GK);
             if let Some((ti, _)) = cands[0] {
-                let tp = players(team, self)[ti].pos;
-                let lead = tp.add(V2::new(sx * 2.0, 0.0));
+                let receiver = players(team, self)[ti];
+                let tp = receiver.pos;
+                let (lead, pass_speed) = self.pass_target_and_speed(me, receiver);
                 self.intended_receiver = Some(Owner { team, idx: ti });
                 self.set_vel(team, GK, V2::default());
                 if team == Team::A {
@@ -1821,7 +1893,7 @@ impl World {
                         0
                     };
                 }
-                return Some((Owner { team, idx: GK }, lead.sub(me), PASS_SPEED, true));
+                return Some((Owner { team, idx: GK }, lead.sub(me), pass_speed, true));
             }
             self.set_vel(team, GK, V2::default());
             return Some((
@@ -2600,6 +2672,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn free_ball_uses_the_same_trapezoidal_integrator_as_11v11() {
+        let mut w = World::new();
+        w.owner = None;
+        w.pending_pass = None;
+        w.ball = V2::new(FIELD_L / 2.0, FIELD_W / 2.0);
+        w.ball_vel = V2::new(18.0, 0.0);
+        w.ball_curl = V2::default();
+        w.ball_z = 0.0;
+        for player in &mut w.a {
+            player.pos = V2::new(1.0, 1.0);
+        }
+        for player in &mut w.b {
+            player.pos = V2::new(FIELD_L - 1.0, FIELD_W - 1.0);
+        }
+        let before = w.ball;
+        let speed_after = ball_resistance_after(18.0, 0.0);
+
+        w.step(&stays(), &stays(), &mut Rng::new(991));
+
+        let travelled = w.ball.sub(before).len();
+        let expected = 0.5 * (18.0 + speed_after) * DT;
+        assert!((travelled - expected).abs() < 1e-5);
+        assert!((w.ball_vel.len() - speed_after).abs() < 1e-5);
+    }
+
     fn arrange_return_pass_candidates(w: &mut World) {
         w.a[1].pos = V2::new(24.0, 14.0);
         w.a[2].pos = V2::new(30.0, 14.0);
@@ -2632,6 +2730,36 @@ mod tests {
         let global = w.global_state();
         assert_eq!(global.len(), GLOBAL_DIM);
         assert!(global.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn pass_actions_expose_receiver_geometry_and_mpc_receipt_quality() {
+        let mut w = World::new();
+        w.a[1].pos = V2::new(18.0, 14.0);
+        w.a[2].pos = V2::new(28.0, 22.0); // open forward outlet
+        w.a[3].pos = V2::new(28.0, 8.0); // same depth, tightly covered
+        w.a[4].pos = V2::new(10.0, 20.0);
+        for i in 0..N {
+            w.b[i].pos = V2::new(50.0, 2.0 + i as f32 * 5.0);
+        }
+        w.b[1].pos = w.a[1].pos.add(w.a[3].pos).scale(0.5);
+
+        let candidates = w.pass_candidates(Team::A, 1);
+        let features = w.pass_candidate_features(Team::A, 1);
+        let open_slot = candidates
+            .iter()
+            .position(|candidate| matches!(candidate, Some((2, _))))
+            .expect("open receiver slot");
+        let covered_slot = candidates
+            .iter()
+            .position(|candidate| matches!(candidate, Some((3, _))))
+            .expect("covered receiver slot");
+
+        assert_eq!(features[open_slot][0], 1.0);
+        assert!(features[open_slot][1] > 0.0, "receiver is forward");
+        assert!(features[open_slot][3] > 0.0, "distance is explicit");
+        assert!(features[open_slot][7] > features[covered_slot][7]);
+        assert!(features[open_slot][8] > features[covered_slot][8]);
     }
 
     #[test]
@@ -2790,6 +2918,24 @@ mod tests {
         assert!(limited[A_PASS_A]);
         assert!(limited[A_PASS_B]);
         assert!(!limited[A_PASS_C]);
+    }
+
+    #[test]
+    fn pass_target_tracks_receiver_motion_without_biasing_stationary_resets() {
+        let w = World::new();
+        let from = V2::new(24.0, 14.0);
+        let mut receiver = w.a[2];
+        receiver.pos = V2::new(16.0, 8.0);
+        receiver.vel = V2::default();
+
+        let (stationary_target, _) = w.pass_target_and_speed(from, receiver);
+        assert!(stationary_target.sub(receiver.pos).len() < 1e-6);
+
+        receiver.vel = V2::new(4.0, 0.0);
+        let (moving_target, _) = w.pass_target_and_speed(from, receiver);
+        let lead = moving_target.sub(receiver.pos);
+        assert!(lead.y > 0.0, "moving receiver should be led along its run");
+        assert!(lead.len() <= 3.0 + 1e-6, "lead must remain controllable");
     }
 
     #[test]

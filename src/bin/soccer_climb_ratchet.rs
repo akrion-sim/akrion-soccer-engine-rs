@@ -236,6 +236,7 @@ fn climb_neural_config(learning_rate: f64) -> SoccerNeuralLearningConfig {
     neural.target_scale = env_f64("SOCCER_NEURAL_TARGET_SCALE", 120.0);
     neural.target_clip = env_f64("SOCCER_NEURAL_TARGET_CLIP", neural.target_clip);
     neural.target_popart_enabled = env_bool("SOCCER_NEURAL_TARGET_POPART", true);
+    neural.lp_coupling_enabled = env_bool("SOCCER_NEURAL_LP_COUPLING_ENABLED", true);
     neural
 }
 
@@ -282,6 +283,21 @@ fn configure_authoritative_blend(config: &mut MatchConfig, authoritative_lambda:
         0.35,
     )
     .clamp(0.0, 1.0);
+
+    // The climb harness must evaluate the same POMDP -> neural -> QP/MPC execution
+    // stack that production serves. Previously the ratchet silently used the
+    // MatchConfig defaults, which leave tier-2 MPC off; a policy could therefore
+    // look better in the harness while bypassing the controller it must drive live.
+    let mpc_enabled = env_bool("SOCCER_CLIMB_MPC_ENABLED", true);
+    config.formation_lp_enabled = env_bool("SOCCER_CLIMB_FORMATION_LP_ENABLED", true);
+    config.mpc.tier2_player_enabled = mpc_enabled;
+    config.mpc.field_aware_enabled =
+        mpc_enabled && env_bool("SOCCER_CLIMB_MPC_FIELD_AWARE_ENABLED", true);
+    config.mpc.reconcile_enabled =
+        mpc_enabled && env_bool("SOCCER_CLIMB_MPC_RECONCILE_ENABLED", true);
+    config.mpc.latent_objective_enabled =
+        mpc_enabled && env_bool("SOCCER_CLIMB_MPC_LATENT_OBJECTIVE_ENABLED", true);
+    config.mpc.player_horizon = env_usize("SOCCER_CLIMB_MPC_PLAYER_HORIZON", 30).max(1);
 }
 
 fn analytic_opponent_game_enabled(game_index: usize, fraction: f64) -> bool {
@@ -1415,6 +1431,16 @@ fn main() {
     // Deterministic formation LP so a given seed reproduces (fair increment-to-increment comparison).
     enable_deterministic_formation_lp();
     env_default_bool("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION", true);
+    let dp_bootstrap = env_default_bool("DD_SOCCER_ENABLE_DP_BOOTSTRAP", true);
+    let dp_critic_target = env_default_bool("DD_SOCCER_ENABLE_DP_CRITIC_TARGET", true);
+    let dp_bootstrap_horizon = env_default_usize("DD_SOCCER_DP_BOOTSTRAP_HORIZON", 64).max(1);
+    let dp_bootstrap_sweeps = env_default_usize("DD_SOCCER_DP_BOOTSTRAP_SWEEPS", 200).max(1);
+    let approx_dp_replay_passes = env_default_usize("SOCCER_APPROX_DP_REPLAY_PASSES", 8).max(1);
+    let climb_mpc_enabled = env_default_bool("SOCCER_CLIMB_MPC_ENABLED", true);
+    let climb_mpc_field_aware = env_default_bool("SOCCER_CLIMB_MPC_FIELD_AWARE_ENABLED", true);
+    let climb_mpc_reconcile = env_default_bool("SOCCER_CLIMB_MPC_RECONCILE_ENABLED", true);
+    let climb_mpc_latent = env_default_bool("SOCCER_CLIMB_MPC_LATENT_OBJECTIVE_ENABLED", true);
+    let climb_mpc_horizon = env_default_usize("SOCCER_CLIMB_MPC_PLAYER_HORIZON", 30).max(1);
     env_default_bool("DD_SOCCER_ENABLE_MC_CRITIC_TARGET", true);
     env_default_bool("DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP", true);
     env_default_bool("DD_SOCCER_ENABLE_MAXA_BOOTSTRAP", true);
@@ -1678,6 +1704,16 @@ fn main() {
          chance_quality_composite={chance_quality_composite} chance_quality_k={chance_quality_k:.2} \
          chance_quality_cap={chance_quality_cap:.2}"
     );
+        println!(
+            "execution_stack dp_bootstrap={dp_bootstrap} dp_critic_target={dp_critic_target} \
+             dp_horizon={dp_bootstrap_horizon} dp_sweeps={dp_bootstrap_sweeps} \
+             approx_dp_replay_passes={approx_dp_replay_passes} lp_coupling={} \
+             mpc={climb_mpc_enabled} field_aware={} reconcile={} latent={} horizon={climb_mpc_horizon}",
+            neural.lp_coupling_enabled,
+            climb_mpc_enabled && climb_mpc_field_aware,
+            climb_mpc_enabled && climb_mpc_reconcile,
+            climb_mpc_enabled && climb_mpc_latent,
+        );
         println!(
         "(eval = frozen candidate net vs the pure-analytic engine; payoff > 0.5 ⇒ beats analytic)"
     );
