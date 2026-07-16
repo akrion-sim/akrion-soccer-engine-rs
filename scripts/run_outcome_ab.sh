@@ -9,6 +9,7 @@
 # Usage: scripts/run_outcome_ab.sh [train_games=40] [eval_games=30] [minutes=3]
 set -euo pipefail
 cd "$(dirname "$0")/.."
+ROOT="$(pwd -P)"
 
 TRAIN_GAMES="${1:-40}"
 EVAL_GAMES="${2:-30}"
@@ -18,7 +19,8 @@ OUT="$(mktemp -d -t soccer-outcome-ab.XXXXXX)"
 BIN="$TARGET/release/soccer_outcome_ab_run"
 
 echo "=== building soccer_outcome_ab_run (release) ==="
-CARGO_TARGET_DIR="$TARGET" cargo build --release --bin soccer_outcome_ab_run
+bash "$ROOT/scripts/prune_local_cargo_artifacts.sh" "$TARGET"
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" CARGO_TARGET_DIR="$TARGET" cargo build --release --bin soccer_outcome_ab_run
 
 echo "=== training both arms in parallel (train_games=$TRAIN_GAMES minutes=$MINUTES) ==="
 echo "out dir: $OUT"

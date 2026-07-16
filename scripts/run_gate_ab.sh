@@ -22,6 +22,7 @@
 #        scripts/run_gate_ab.sh [train_games=80] [eval_games=140] [minutes=3]
 set -uo pipefail
 cd "$(dirname "$0")/.."
+ROOT="$(pwd -P)"
 
 LABEL="${LABEL:?set LABEL}"
 TREATMENT_ENV="${TREATMENT_ENV:?set TREATMENT_ENV (space-separated KEY=VAL gate enables)}"
@@ -35,7 +36,9 @@ mkdir -p "$OUT"
 
 echo "=== [$(date -u +%FT%TZ)] gate A/B '$LABEL'  treatment='$TREATMENT_ENV' ==="
 echo "=== building soccer_outcome_ab_run (release) into $TARGET ==="
-CARGO_TARGET_DIR="$TARGET" nice -n 10 cargo build --release --bin soccer_outcome_ab_run \
+bash "$ROOT/scripts/prune_local_cargo_artifacts.sh" "$TARGET" \
+  > "$OUT/prune.log" 2>&1 || { echo "PRUNE FAILED — see $OUT/prune.log"; tail -20 "$OUT/prune.log"; exit 1; }
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" CARGO_TARGET_DIR="$TARGET" nice -n 10 cargo build --release --bin soccer_outcome_ab_run \
   > "$OUT/build.log" 2>&1 || { echo "BUILD FAILED — see $OUT/build.log"; tail -20 "$OUT/build.log"; exit 1; }
 echo "=== build ok ==="
 

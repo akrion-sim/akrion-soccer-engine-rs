@@ -17,7 +17,8 @@ if [[ ! -f "$SOURCE_CHECKPOINT" ]]; then
   exit 2
 fi
 
-cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
+bash "$ROOT/scripts/prune_local_cargo_artifacts.sh" "${CARGO_TARGET_DIR:-$ROOT/target}"
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
 mkdir -p "$OUT_DIR"
 
 # Isolate the runtime dose on one frozen actor. The learned checkpoint is not retrained;

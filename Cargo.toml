@@ -56,17 +56,6 @@ live-server = []
 web-bridge = []
 embedded-http-server = ["web-bridge"]
 
-# This crate is unusually large and is built under many feature/bin combinations. Rustc's
-# incremental sessions were leaving gigabytes of dep-graph.bin and object generations behind.
-# Prefer bounded disk usage; the repo's `./shell cargo ...` path also removes the prior
-# soccer_engine/des_engine package artifacts for the profile being rebuilt immediately before
-# producing replacements.
-[profile.dev]
-incremental = false
-
-[profile.test]
-incremental = false
-
 [[bin]]
 name = "main_soccer_learning_server"
 path = "src/bin/main_soccer_learning_server.rs"
@@ -133,3 +122,19 @@ path = "src/bin/measure_pass_completion.rs"
 [[bin]]
 name = "rollout_poc"
 path = "src/bin/rollout_poc.rs"
+
+[profile.dev]
+# Cargo defaults to unpacked debug info on macOS, leaving one `*.rcgu.o`
+# per codegen unit. Keep source-line backtraces without that artifact family. Incremental
+# sessions are disabled because their dep-graph.bin and object generations grew into gigabytes.
+debug = "line-tables-only"
+split-debuginfo = "off"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "off"
+incremental = false
+
+[profile.release]
+incremental = false

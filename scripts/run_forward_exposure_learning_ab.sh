@@ -13,7 +13,8 @@ TRAIN_ANALYTIC_POOL_SIZE="${TRAIN_ANALYTIC_POOL_SIZE:-4}"
 TRAIN_SEED="${TRAIN_SEED:-E1300000}"
 EVAL_SEED="${EVAL_SEED:-F5500000}"
 
-cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
+bash "$ROOT/scripts/prune_local_cargo_artifacts.sh" "${CARGO_TARGET_DIR:-$ROOT/target}"
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
 mkdir -p "$OUT_DIR"
 
 common_train_env=(

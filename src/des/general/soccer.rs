@@ -30,7 +30,7 @@ use crate::des::general::mpc_point_mass::{
 };
 use crate::des::general::neural_network::{
     ActivationName, DenseLayerConfig, FeedForwardMomentumState, FeedForwardNetwork,
-    RandomNetworkSpec,
+    MaskedPolicyGradientBatchSample, PolicyGradientBatchTrainResult, RandomNetworkSpec,
 };
 use crate::des::general::prng::{mulberry32, SeededRandom};
 // `RandomSource` brings `.next_float()` etc. into scope for `SeededRandom`; re-exported here so
@@ -5685,6 +5685,12 @@ const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 128;
 const MIN_SOCCER_POLICY_HIDDEN_UNITS: usize = 8;
 const MAX_SOCCER_POLICY_HIDDEN_UNITS: usize = 512;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
+/// Conservative actor step for accumulated PPO/MAPPO minibatches. The legacy
+/// per-sample path keeps its established `0.05` default; this lower rate is used
+/// only when `DD_SOCCER_ENABLE_MINIBATCHED_MAPPO=1`.
+const SOCCER_MINIBATCHED_MAPPO_LEARNING_RATE: f64 = 3.0e-4;
+const SOCCER_MINIBATCHED_MAPPO_DEFAULT_BATCH_SIZE: usize = 1024;
+const SOCCER_MINIBATCHED_MAPPO_MAX_BATCH_SIZE: usize = 65_536;
 /// Learnable range for the per-net forward action-selection bias WEIGHT
 /// ([`SoccerPolicyHead::forward_select_logit_weight`]): the policy-gradient update clamps the weight
 /// to `[0, MAX]` (the bias only ever nudges TOWARD forward, never away). The *applied* bias is
@@ -20770,6 +20776,36 @@ pub struct MatchStats {
     #[serde(default)]
     pub neural_mcts_distillation_weight_sum: f64,
     #[serde(default)]
+    pub policy_optimizer_minibatched: bool,
+    #[serde(default)]
+    pub policy_optimizer_effective_learning_rate: f64,
+    #[serde(default)]
+    pub policy_optimizer_ratio_samples: u32,
+    #[serde(default)]
+    pub policy_optimizer_ratio_sum: f64,
+    #[serde(default)]
+    pub policy_optimizer_clipped_surrogate_samples: u32,
+    #[serde(default)]
+    pub policy_optimizer_missing_or_invalid_old_probability: u32,
+    #[serde(default)]
+    pub policy_optimizer_minibatches: u32,
+    #[serde(default)]
+    pub policy_optimizer_batch_samples_applied: u32,
+    #[serde(default)]
+    pub policy_optimizer_batch_samples_skipped: u32,
+    #[serde(default)]
+    pub policy_optimizer_updates_applied: u32,
+    #[serde(default)]
+    pub policy_optimizer_updates_dropped: u32,
+    #[serde(default)]
+    pub policy_optimizer_entropy_sum: f64,
+    #[serde(default)]
+    pub policy_optimizer_entropy_samples: u32,
+    #[serde(default)]
+    pub policy_optimizer_role_entropy_sum: [f64; SOCCER_POLICY_ROLE_EMBEDDING_DIM],
+    #[serde(default)]
+    pub policy_optimizer_role_entropy_samples: [u32; SOCCER_POLICY_ROLE_EMBEDDING_DIM],
+    #[serde(default)]
     pub policy_entropy_sum: f64,
     #[serde(default)]
     pub learning_transitions_captured: u32,
@@ -20851,6 +20887,19 @@ pub struct SoccerPlanningValidationStats {
     pub neural_mcts_distillation_samples: u32,
     pub neural_mcts_distillation_rate: f64,
     pub mean_neural_mcts_distillation_weight: f64,
+    pub policy_optimizer_minibatched: bool,
+    pub policy_optimizer_effective_learning_rate: f64,
+    pub policy_optimizer_ratio_samples: u32,
+    pub mean_policy_optimizer_ratio: f64,
+    pub policy_optimizer_clip_fraction: f64,
+    pub policy_optimizer_missing_old_probability_rate: f64,
+    pub policy_optimizer_minibatches: u32,
+    pub policy_optimizer_batch_samples_applied: u32,
+    pub policy_optimizer_batch_samples_skipped: u32,
+    pub policy_optimizer_updates_applied: u32,
+    pub policy_optimizer_updates_dropped: u32,
+    pub mean_policy_optimizer_entropy: f64,
+    pub mean_policy_optimizer_role_entropy: [f64; SOCCER_POLICY_ROLE_EMBEDDING_DIM],
     pub mean_policy_entropy: f64,
 }
 
@@ -20946,6 +20995,54 @@ impl MatchStats {
                     self.pass_chains_net_loss_away += 1;
                 }
             }
+        }
+    }
+
+    fn record_policy_optimizer_telemetry(
+        &mut self,
+        telemetry: SoccerPolicyOptimizerTelemetry,
+        minibatched: bool,
+    ) {
+        let as_u32 = |value: usize| value.min(u32::MAX as usize) as u32;
+        self.policy_optimizer_minibatched |= minibatched;
+        self.policy_optimizer_effective_learning_rate = self
+            .policy_optimizer_effective_learning_rate
+            .max(telemetry.effective_learning_rate);
+        self.policy_optimizer_ratio_samples = self
+            .policy_optimizer_ratio_samples
+            .saturating_add(as_u32(telemetry.ratio_samples));
+        self.policy_optimizer_ratio_sum += telemetry.ratio_sum;
+        self.policy_optimizer_clipped_surrogate_samples = self
+            .policy_optimizer_clipped_surrogate_samples
+            .saturating_add(as_u32(telemetry.clipped_surrogate_samples));
+        self.policy_optimizer_missing_or_invalid_old_probability = self
+            .policy_optimizer_missing_or_invalid_old_probability
+            .saturating_add(as_u32(telemetry.missing_or_invalid_old_probability));
+        self.policy_optimizer_minibatches = self
+            .policy_optimizer_minibatches
+            .saturating_add(as_u32(telemetry.minibatches));
+        self.policy_optimizer_batch_samples_applied = self
+            .policy_optimizer_batch_samples_applied
+            .saturating_add(as_u32(telemetry.batch_samples_applied));
+        self.policy_optimizer_batch_samples_skipped = self
+            .policy_optimizer_batch_samples_skipped
+            .saturating_add(as_u32(telemetry.batch_samples_skipped));
+        self.policy_optimizer_updates_applied = self
+            .policy_optimizer_updates_applied
+            .saturating_add(as_u32(telemetry.optimizer_updates_applied));
+        self.policy_optimizer_updates_dropped = self
+            .policy_optimizer_updates_dropped
+            .saturating_add(as_u32(telemetry.optimizer_updates_dropped));
+        self.policy_optimizer_entropy_sum += telemetry.entropy_sum;
+        self.policy_optimizer_entropy_samples = self
+            .policy_optimizer_entropy_samples
+            .saturating_add(as_u32(telemetry.entropy_samples));
+        for role_index in 0..SOCCER_POLICY_ROLE_EMBEDDING_DIM {
+            self.policy_optimizer_role_entropy_sum[role_index] +=
+                telemetry.role_entropy_sum[role_index];
+            self.policy_optimizer_role_entropy_samples[role_index] = self
+                .policy_optimizer_role_entropy_samples[role_index]
+                .saturating_add(as_u32(telemetry.role_entropy_samples[role_index]));
         }
     }
 
@@ -21069,6 +21166,31 @@ impl MatchStats {
                 / decisions as f64,
             mean_neural_mcts_distillation_weight: self.neural_mcts_distillation_weight_sum
                 / self.neural_mcts_distillation_samples.max(1) as f64,
+            policy_optimizer_minibatched: self.policy_optimizer_minibatched,
+            policy_optimizer_effective_learning_rate: self.policy_optimizer_effective_learning_rate,
+            policy_optimizer_ratio_samples: self.policy_optimizer_ratio_samples,
+            mean_policy_optimizer_ratio: self.policy_optimizer_ratio_sum
+                / self.policy_optimizer_ratio_samples.max(1) as f64,
+            policy_optimizer_clip_fraction: self.policy_optimizer_clipped_surrogate_samples as f64
+                / self.policy_optimizer_ratio_samples.max(1) as f64,
+            policy_optimizer_missing_old_probability_rate: self
+                .policy_optimizer_missing_or_invalid_old_probability
+                as f64
+                / self
+                    .policy_optimizer_ratio_samples
+                    .saturating_add(self.policy_optimizer_missing_or_invalid_old_probability)
+                    .max(1) as f64,
+            policy_optimizer_minibatches: self.policy_optimizer_minibatches,
+            policy_optimizer_batch_samples_applied: self.policy_optimizer_batch_samples_applied,
+            policy_optimizer_batch_samples_skipped: self.policy_optimizer_batch_samples_skipped,
+            policy_optimizer_updates_applied: self.policy_optimizer_updates_applied,
+            policy_optimizer_updates_dropped: self.policy_optimizer_updates_dropped,
+            mean_policy_optimizer_entropy: self.policy_optimizer_entropy_sum
+                / self.policy_optimizer_entropy_samples.max(1) as f64,
+            mean_policy_optimizer_role_entropy: std::array::from_fn(|role_index| {
+                self.policy_optimizer_role_entropy_sum[role_index]
+                    / self.policy_optimizer_role_entropy_samples[role_index].max(1) as f64
+            }),
             mean_policy_entropy: self.policy_entropy_sum / decisions as f64,
         }
     }
@@ -43617,6 +43739,75 @@ struct SoccerPolicyTrainingBatch {
     planner_teacher_missed_opportunity_advantage_sum: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SoccerPolicyOptimizerTelemetry {
+    ratio_samples: usize,
+    ratio_sum: f64,
+    clipped_surrogate_samples: usize,
+    missing_or_invalid_old_probability: usize,
+    minibatches: usize,
+    batch_samples_applied: usize,
+    batch_samples_skipped: usize,
+    optimizer_updates_applied: usize,
+    optimizer_updates_dropped: usize,
+    entropy_sum: f64,
+    entropy_samples: usize,
+    role_entropy_sum: [f64; SOCCER_POLICY_ROLE_EMBEDDING_DIM],
+    role_entropy_samples: [usize; SOCCER_POLICY_ROLE_EMBEDDING_DIM],
+    effective_learning_rate: f64,
+}
+
+impl SoccerPolicyOptimizerTelemetry {
+    fn merge(&mut self, other: Self) {
+        self.ratio_samples = self.ratio_samples.saturating_add(other.ratio_samples);
+        self.ratio_sum += other.ratio_sum;
+        self.clipped_surrogate_samples = self
+            .clipped_surrogate_samples
+            .saturating_add(other.clipped_surrogate_samples);
+        self.missing_or_invalid_old_probability = self
+            .missing_or_invalid_old_probability
+            .saturating_add(other.missing_or_invalid_old_probability);
+        self.minibatches = self.minibatches.saturating_add(other.minibatches);
+        self.batch_samples_applied = self
+            .batch_samples_applied
+            .saturating_add(other.batch_samples_applied);
+        self.batch_samples_skipped = self
+            .batch_samples_skipped
+            .saturating_add(other.batch_samples_skipped);
+        self.optimizer_updates_applied = self
+            .optimizer_updates_applied
+            .saturating_add(other.optimizer_updates_applied);
+        self.optimizer_updates_dropped = self
+            .optimizer_updates_dropped
+            .saturating_add(other.optimizer_updates_dropped);
+        self.entropy_sum += other.entropy_sum;
+        self.entropy_samples = self.entropy_samples.saturating_add(other.entropy_samples);
+        for role_index in 0..SOCCER_POLICY_ROLE_EMBEDDING_DIM {
+            self.role_entropy_sum[role_index] += other.role_entropy_sum[role_index];
+            self.role_entropy_samples[role_index] = self.role_entropy_samples[role_index]
+                .saturating_add(other.role_entropy_samples[role_index]);
+        }
+        self.effective_learning_rate = self
+            .effective_learning_rate
+            .max(other.effective_learning_rate);
+    }
+
+    fn record_batch(&mut self, result: PolicyGradientBatchTrainResult) {
+        self.minibatches = self.minibatches.saturating_add(1);
+        self.batch_samples_applied = self
+            .batch_samples_applied
+            .saturating_add(result.samples_applied);
+        self.batch_samples_skipped = self
+            .batch_samples_skipped
+            .saturating_add(result.samples_skipped);
+        if result.update_applied {
+            self.optimizer_updates_applied = self.optimizer_updates_applied.saturating_add(1);
+        } else {
+            self.optimizer_updates_dropped = self.optimizer_updates_dropped.saturating_add(1);
+        }
+    }
+}
+
 impl SoccerPolicySample {
     fn effective_legal_action_mask(&self) -> &[bool] {
         if self.legal_action_mask.len() == SOCCER_POLICY_ACTIONS.len()
@@ -43775,6 +43966,15 @@ impl SoccerPolicyRoleGroup {
         }
     }
 
+    fn index(self) -> usize {
+        match self {
+            SoccerPolicyRoleGroup::Goalkeeper => 0,
+            SoccerPolicyRoleGroup::Defender => 1,
+            SoccerPolicyRoleGroup::Midfielder => 2,
+            SoccerPolicyRoleGroup::Forward => 3,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             SoccerPolicyRoleGroup::Goalkeeper => "goalkeeper",
@@ -43806,6 +44006,14 @@ impl SoccerPolicyRoleGroup {
             SoccerPolicyRoleGroup::Forward => 0x94D0_49BB,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SoccerMappoSampleUpdate {
+    coefficient: f64,
+    ratio: f64,
+    clipped: bool,
+    entropy: f64,
 }
 
 struct SoccerPolicyRoleHead {
@@ -43977,6 +44185,15 @@ impl SoccerPolicyRoleHead {
         sample: &SoccerPolicySample,
         clip_epsilon: f64,
     ) -> Option<f64> {
+        self.mappo_sample_update(sample, clip_epsilon)
+            .map(|update| update.coefficient)
+    }
+
+    fn mappo_sample_update(
+        &self,
+        sample: &SoccerPolicySample,
+        clip_epsilon: f64,
+    ) -> Option<SoccerMappoSampleUpdate> {
         let old_prob = sample.old_action_probability?;
         if !old_prob.is_finite() || old_prob <= 1e-9 {
             return None;
@@ -43990,14 +44207,49 @@ impl SoccerPolicyRoleHead {
             return None;
         }
         let ratio = (current_prob / old_prob).clamp(0.0, 10.0);
-        Some(soccer_mappo_clipped_policy_gradient_coefficient(
-            sample.advantage,
+        let epsilon = clip_epsilon.clamp(0.01, 1.0);
+        let clipped = if sample.advantage >= 0.0 {
+            ratio > 1.0 + epsilon
+        } else {
+            ratio < 1.0 - epsilon
+        };
+        let entropy = -current_probs
+            .iter()
+            .zip(sample.effective_legal_action_mask().iter())
+            .map(|(&probability, &legal)| {
+                if legal && probability > 0.0 {
+                    probability * probability.ln()
+                } else {
+                    0.0
+                }
+            })
+            .sum::<f64>();
+        entropy.is_finite().then_some(SoccerMappoSampleUpdate {
+            coefficient: soccer_mappo_clipped_policy_gradient_coefficient(
+                sample.advantage,
+                ratio,
+                epsilon,
+            ),
             ratio,
-            clip_epsilon,
-        ))
+            clipped,
+            entropy,
+        })
     }
 
     fn train(
+        &mut self,
+        samples: &[SoccerPolicySample],
+        mappo_clip_epsilon: Option<f64>,
+        minibatched: bool,
+    ) -> (usize, f64, SoccerPolicyOptimizerTelemetry) {
+        if minibatched {
+            return self.train_minibatched(samples, mappo_clip_epsilon);
+        }
+        let (applied, loss_sum) = self.train_legacy(samples, mappo_clip_epsilon);
+        (applied, loss_sum, SoccerPolicyOptimizerTelemetry::default())
+    }
+
+    fn train_legacy(
         &mut self,
         samples: &[SoccerPolicySample],
         mappo_clip_epsilon: Option<f64>,
@@ -44094,6 +44346,169 @@ impl SoccerPolicyRoleHead {
             }
         }
         (applied, loss_sum)
+    }
+
+    fn train_minibatched(
+        &mut self,
+        samples: &[SoccerPolicySample],
+        mappo_clip_epsilon: Option<f64>,
+    ) -> (usize, f64, SoccerPolicyOptimizerTelemetry) {
+        let Some(clip_epsilon) = mappo_clip_epsilon else {
+            let (applied, loss_sum) = self.train_legacy(samples, None);
+            return (applied, loss_sum, SoccerPolicyOptimizerTelemetry::default());
+        };
+        let learning_rate = soccer_minibatched_mappo_learning_rate();
+        let batch_size = soccer_minibatched_mappo_batch_size();
+        let role = self.role_group.as_player_role();
+        let mut ordered: Vec<&SoccerPolicySample> = samples
+            .iter()
+            .filter(|sample| {
+                SoccerPolicyRoleGroup::from_role(soccer_policy_role_from_features(
+                    &sample.state_features,
+                )) == self.role_group
+            })
+            .collect();
+        deterministic_policy_minibatch_shuffle(
+            &mut ordered,
+            self.role_group.seed_salt() ^ self.training_steps as u32,
+        );
+
+        let mut telemetry = SoccerPolicyOptimizerTelemetry {
+            effective_learning_rate: learning_rate,
+            ..SoccerPolicyOptimizerTelemetry::default()
+        };
+        let mut applied = 0usize;
+        let mut loss_sum = 0.0;
+        for chunk in ordered.chunks(batch_size) {
+            let prepared: Vec<(&SoccerPolicySample, SoccerMappoSampleUpdate)> = chunk
+                .iter()
+                .filter_map(
+                    |&sample| match self.mappo_sample_update(sample, clip_epsilon) {
+                        Some(update) => Some((sample, update)),
+                        None => {
+                            telemetry.missing_or_invalid_old_probability = telemetry
+                                .missing_or_invalid_old_probability
+                                .saturating_add(1);
+                            None
+                        }
+                    },
+                )
+                .collect();
+            if prepared.is_empty() {
+                continue;
+            }
+            let role_index = self.role_group.index();
+            for (_, update) in &prepared {
+                telemetry.ratio_samples = telemetry.ratio_samples.saturating_add(1);
+                telemetry.ratio_sum += update.ratio;
+                telemetry.clipped_surrogate_samples = telemetry
+                    .clipped_surrogate_samples
+                    .saturating_add(usize::from(update.clipped));
+                telemetry.entropy_sum += update.entropy;
+                telemetry.entropy_samples = telemetry.entropy_samples.saturating_add(1);
+                telemetry.role_entropy_sum[role_index] += update.entropy;
+                telemetry.role_entropy_samples[role_index] =
+                    telemetry.role_entropy_samples[role_index].saturating_add(1);
+            }
+            let result = self.network.train_policy_gradient_batch_masked(
+                prepared
+                    .iter()
+                    .map(|(sample, update)| MaskedPolicyGradientBatchSample {
+                        input: &sample.state_features[..],
+                        action: sample.action_index,
+                        legal_action_mask: sample.effective_legal_action_mask(),
+                        advantage: sample.weighted_advantage(update.coefficient),
+                    }),
+                soccer_policy_entropy_coeff(),
+                learning_rate,
+                SOCCER_POLICY_GRAD_CLIP_NORM,
+            );
+            telemetry.record_batch(result);
+            if result.update_applied {
+                applied = applied.saturating_add(result.samples_applied);
+                loss_sum += result.loss * result.samples_applied as f64;
+            }
+        }
+        if applied > 0 {
+            self.training_steps = self.training_steps.saturating_add(applied);
+            self.last_loss = Some(loss_sum / applied as f64);
+        }
+
+        // Specialists use the same frozen behavior-policy denominator as the
+        // role head. Recompute the PPO coefficient after the role update, then
+        // accumulate each technical family in deterministic minibatches too.
+        let specialist_coefficients: Vec<(&SoccerPolicySample, f64)> = ordered
+            .iter()
+            .filter_map(|&sample| {
+                self.mappo_sample_update(sample, clip_epsilon)
+                    .map(|update| (sample, update.coefficient))
+            })
+            .collect();
+        for specialist in &mut self.specialist_heads {
+            if !specialist.kind.applies_to_role(role) {
+                continue;
+            }
+            let specialist_rows: Vec<(&SoccerPolicySample, usize, Vec<bool>, f64)> =
+                specialist_coefficients
+                    .iter()
+                    .filter_map(|(sample, coefficient)| {
+                        let sample = *sample;
+                        let coefficient = *coefficient;
+                        let local_action_index =
+                            specialist.local_action_index(sample.action_index)?;
+                        let specialist_mask = specialist
+                            .kind
+                            .actions()
+                            .iter()
+                            .map(|action| {
+                                SOCCER_POLICY_ACTIONS
+                                    .iter()
+                                    .position(|candidate| candidate == action)
+                                    .and_then(|index| {
+                                        sample.effective_legal_action_mask().get(index)
+                                    })
+                                    .copied()
+                                    .unwrap_or(false)
+                            })
+                            .collect::<Vec<_>>();
+                        specialist_mask
+                            .get(local_action_index)
+                            .copied()
+                            .unwrap_or(false)
+                            .then_some((sample, local_action_index, specialist_mask, coefficient))
+                    })
+                    .collect();
+            let mut specialist_applied = 0usize;
+            let mut specialist_loss_sum = 0.0;
+            for chunk in specialist_rows.chunks(batch_size) {
+                let result = specialist.network.train_policy_gradient_batch_masked(
+                    chunk.iter().map(
+                        |(sample, local_action_index, specialist_mask, coefficient)| {
+                            MaskedPolicyGradientBatchSample {
+                                input: &sample.state_features[..],
+                                action: *local_action_index,
+                                legal_action_mask: specialist_mask,
+                                advantage: sample.weighted_advantage(*coefficient),
+                            }
+                        },
+                    ),
+                    soccer_policy_entropy_coeff(),
+                    learning_rate,
+                    SOCCER_POLICY_GRAD_CLIP_NORM,
+                );
+                telemetry.record_batch(result);
+                if result.update_applied {
+                    specialist_applied = specialist_applied.saturating_add(result.samples_applied);
+                    specialist_loss_sum += result.loss * result.samples_applied as f64;
+                }
+            }
+            if specialist_applied > 0 {
+                specialist.training_steps =
+                    specialist.training_steps.saturating_add(specialist_applied);
+                specialist.last_loss = Some(specialist_loss_sum / specialist_applied as f64);
+            }
+        }
+        (applied, loss_sum, telemetry)
     }
 }
 
@@ -44196,19 +44611,40 @@ impl SoccerPolicyHead {
     }
 
     /// One advantage policy-gradient pass over a batch of samples.
-    fn train(&mut self, samples: &[SoccerPolicySample], mappo_clip_epsilon: Option<f64>) {
+    fn train(
+        &mut self,
+        samples: &[SoccerPolicySample],
+        mappo_clip_epsilon: Option<f64>,
+    ) -> SoccerPolicyOptimizerTelemetry {
+        self.train_with_optimizer(
+            samples,
+            mappo_clip_epsilon,
+            mappo_clip_epsilon.is_some() && dd_soccer_enable_minibatched_mappo(),
+        )
+    }
+
+    fn train_with_optimizer(
+        &mut self,
+        samples: &[SoccerPolicySample],
+        mappo_clip_epsilon: Option<f64>,
+        minibatched: bool,
+    ) -> SoccerPolicyOptimizerTelemetry {
         let mut loss_sum = 0.0;
         let mut applied = 0usize;
+        let mut telemetry = SoccerPolicyOptimizerTelemetry::default();
         for head in &mut self.role_heads {
-            let (role_applied, role_loss_sum) = head.train(samples, mappo_clip_epsilon);
+            let (role_applied, role_loss_sum, role_telemetry) =
+                head.train(samples, mappo_clip_epsilon, minibatched);
             applied += role_applied;
             loss_sum += role_loss_sum;
+            telemetry.merge(role_telemetry);
         }
         if applied > 0 {
             self.training_steps = self.training_steps.saturating_add(applied);
             self.last_loss = Some(loss_sum / applied as f64);
         }
         self.train_forward_select_logit_weight(samples);
+        telemetry
     }
 
     /// Policy-gradient update for the per-net FORWARD action-selection bias scalar. Accumulates an
@@ -44279,6 +44715,45 @@ fn soccer_policy_learning_rate() -> f64 {
     )
 }
 
+fn dd_soccer_enable_minibatched_mappo() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_MINIBATCHED_MAPPO")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MINIBATCHED_MAPPO"))
+    }
+}
+
+fn soccer_minibatched_mappo_learning_rate() -> f64 {
+    soccer_planner_teacher_env_f64(
+        "SOCCER_MAPPO_ACTOR_LEARNING_RATE",
+        SOCCER_MINIBATCHED_MAPPO_LEARNING_RATE,
+        0.0,
+        MAX_SOCCER_NEURAL_LEARNING_RATE,
+    )
+}
+
+fn soccer_minibatched_mappo_batch_size() -> usize {
+    std::env::var("SOCCER_MAPPO_MINIBATCH_SIZE")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(SOCCER_MINIBATCHED_MAPPO_DEFAULT_BATCH_SIZE)
+        .clamp(1, SOCCER_MINIBATCHED_MAPPO_MAX_BATCH_SIZE)
+}
+
+fn deterministic_policy_minibatch_shuffle<T>(values: &mut [T], seed: u32) {
+    let mut rng = mulberry32(seed ^ 0xA511_E9B3);
+    for upper in (1..values.len()).rev() {
+        let draw = rng.next_float().clamp(0.0, 1.0 - f64::EPSILON);
+        let index = ((upper + 1) as f64 * draw).floor() as usize;
+        values.swap(upper, index.min(upper));
+    }
+}
+
 fn soccer_forward_select_logit_weight_override_on_restore() -> bool {
     soccer_planner_teacher_env_bool(
         "DD_SOCCER_FORWARD_SELECT_LOGIT_WEIGHT_OVERRIDE_ON_RESTORE",
@@ -44322,6 +44797,45 @@ mod soccer_policy_actor_capacity_tests {
         LOCK.lock().expect("test poison soccer policy env lock")
     }
 
+    fn assert_policy_heads_have_identical_parameters(
+        left: &SoccerPolicyHead,
+        right: &SoccerPolicyHead,
+    ) {
+        assert_eq!(left.role_heads.len(), right.role_heads.len());
+        for (left_role, right_role) in left.role_heads.iter().zip(&right.role_heads) {
+            assert_eq!(left_role.role_group, right_role.role_group);
+            for (left_layer, right_layer) in left_role
+                .network
+                .layers
+                .iter()
+                .zip(&right_role.network.layers)
+            {
+                assert_eq!(left_layer.weights, right_layer.weights);
+                assert_eq!(left_layer.biases, right_layer.biases);
+            }
+            assert_eq!(
+                left_role.specialist_heads.len(),
+                right_role.specialist_heads.len()
+            );
+            for (left_specialist, right_specialist) in left_role
+                .specialist_heads
+                .iter()
+                .zip(&right_role.specialist_heads)
+            {
+                assert_eq!(left_specialist.kind, right_specialist.kind);
+                for (left_layer, right_layer) in left_specialist
+                    .network
+                    .layers
+                    .iter()
+                    .zip(&right_specialist.network.layers)
+                {
+                    assert_eq!(left_layer.weights, right_layer.weights);
+                    assert_eq!(left_layer.biases, right_layer.biases);
+                }
+            }
+        }
+    }
+
     #[test]
     fn mappo_clip_has_zero_gradient_on_saturated_branch() {
         let epsilon = 0.20;
@@ -44342,6 +44856,188 @@ mod soccer_policy_actor_capacity_tests {
         );
         assert!(
             (soccer_mappo_clipped_policy_gradient_coefficient(-2.0, 0.90, epsilon) + 1.80).abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn minibatched_mappo_gate_off_matches_legacy_actor_snapshot() {
+        let _lock = env_lock();
+        let _gate = clear_test_env_var("DD_SOCCER_ENABLE_MINIBATCHED_MAPPO");
+        let _legacy_rate = clear_test_env_var("DD_SOCCER_POLICY_LEARNING_RATE");
+        let mut routed = SoccerPolicyHead::new(0xA11C_E001);
+        let mut explicit_legacy = SoccerPolicyHead::new(0xA11C_E001);
+        let mut critic_state = [0.0; SOCCER_NEURAL_FEATURE_DIM];
+        critic_state[0] = 0.35;
+        critic_state[8] = 0.65;
+        let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Midfielder, None);
+        let action_index = soccer_policy_action_index("pass").expect("pass policy action");
+        let old_action_probability = routed
+            .action_distribution(&state)
+            .expect("finite initial policy")[action_index];
+        let sample = SoccerPolicySample {
+            state_features: state,
+            action_index,
+            advantage: 0.75,
+            old_action_probability: Some(old_action_probability),
+            legal_action_mask: Vec::new(),
+            sample_weight: 1.0,
+            mcts_distillation: false,
+            forward_select_eligible: false,
+        };
+        let samples = vec![sample; 4];
+
+        let routed_telemetry = routed.train(&samples, Some(0.20));
+        let explicit_telemetry = explicit_legacy.train_with_optimizer(&samples, Some(0.20), false);
+
+        assert_eq!(routed_telemetry.minibatches, 0);
+        assert_eq!(explicit_telemetry.minibatches, 0);
+        assert_policy_heads_have_identical_parameters(&routed, &explicit_legacy);
+    }
+
+    #[test]
+    fn minibatched_mappo_preserves_role_and_specialist_isolation() {
+        let _lock = env_lock();
+        let _batch_size = set_test_env_var("SOCCER_MAPPO_MINIBATCH_SIZE", "2");
+        let _learning_rate = set_test_env_var("SOCCER_MAPPO_ACTOR_LEARNING_RATE", "0.0003");
+        let mut head = SoccerPolicyHead::new(0xA11C_E002);
+        let mut critic_state = [0.0; SOCCER_NEURAL_FEATURE_DIM];
+        critic_state[0] = 0.55;
+        critic_state[8] = 0.80;
+        let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Forward, None);
+        let action_index = soccer_policy_action_index("shoot").expect("shoot policy action");
+        let old_action_probability = head
+            .action_distribution(&state)
+            .expect("finite initial policy")[action_index];
+        let sample = SoccerPolicySample {
+            state_features: state,
+            action_index,
+            advantage: 0.8,
+            old_action_probability: Some(old_action_probability),
+            legal_action_mask: Vec::new(),
+            sample_weight: 1.0,
+            mcts_distillation: false,
+            forward_select_eligible: false,
+        };
+        let samples = vec![sample.clone(); 4];
+        let defender_before = head
+            .role_head_for_role(PlayerRole::Defender)
+            .expect("defender role head")
+            .network
+            .layers
+            .clone();
+
+        let telemetry = head.train_with_optimizer(&samples, Some(0.20), true);
+
+        let defender_after = &head
+            .role_head_for_role(PlayerRole::Defender)
+            .expect("defender role head")
+            .network
+            .layers;
+        for (before, after) in defender_before.iter().zip(defender_after) {
+            assert_eq!(before.weights, after.weights);
+            assert_eq!(before.biases, after.biases);
+        }
+        let forward = head
+            .role_head_for_role(PlayerRole::Forward)
+            .expect("forward role head");
+        assert_eq!(forward.training_steps, samples.len());
+        assert!(forward
+            .specialist_heads
+            .iter()
+            .find(|specialist| specialist.kind == SoccerPolicySpecialistKind::Shooting)
+            .is_some_and(|specialist| specialist.training_steps == samples.len()));
+        assert_eq!(telemetry.ratio_samples, samples.len());
+        assert_eq!(telemetry.missing_or_invalid_old_probability, 0);
+        assert_eq!(
+            telemetry.role_entropy_samples[SoccerPolicyRoleGroup::Forward.index()],
+            4
+        );
+        assert_eq!(telemetry.minibatches, 4);
+        assert_eq!(telemetry.optimizer_updates_applied, 4);
+        assert_eq!(telemetry.optimizer_updates_dropped, 0);
+        assert_eq!(telemetry.effective_learning_rate, 0.0003);
+        assert_eq!(sample.old_action_probability, Some(old_action_probability));
+    }
+
+    #[test]
+    fn minibatched_mappo_reports_saturated_clip_and_missing_old_probability() {
+        let _lock = env_lock();
+        let _batch_size = set_test_env_var("SOCCER_MAPPO_MINIBATCH_SIZE", "8");
+        let mut head = SoccerPolicyHead::new(0xA11C_E003);
+        let mut critic_state = [0.0; SOCCER_NEURAL_FEATURE_DIM];
+        critic_state[0] = 0.45;
+        critic_state[8] = 0.70;
+        let state = soccer_policy_features_for_role(&critic_state, PlayerRole::Midfielder, None);
+        let action_index = soccer_policy_action_index("pass").expect("pass policy action");
+        let current_probability = head
+            .action_distribution(&state)
+            .expect("finite initial policy")[action_index];
+        let sample = |old_action_probability| SoccerPolicySample {
+            state_features: state,
+            action_index,
+            advantage: 1.0,
+            old_action_probability,
+            legal_action_mask: Vec::new(),
+            sample_weight: 1.0,
+            mcts_distillation: false,
+            forward_select_eligible: false,
+        };
+
+        let telemetry = head.train_with_optimizer(
+            &[sample(Some(current_probability / 10.0)), sample(None)],
+            Some(0.20),
+            true,
+        );
+
+        assert_eq!(telemetry.ratio_samples, 1);
+        assert!((telemetry.ratio_sum - 10.0).abs() < 1e-12);
+        assert_eq!(telemetry.clipped_surrogate_samples, 1);
+        assert_eq!(telemetry.missing_or_invalid_old_probability, 1);
+        assert_eq!(telemetry.batch_samples_applied, 2);
+        assert_eq!(telemetry.batch_samples_skipped, 0);
+    }
+
+    #[test]
+    fn minibatched_mappo_telemetry_round_trips_to_planning_stats() {
+        let mut stats = MatchStats::default();
+        let mut telemetry = SoccerPolicyOptimizerTelemetry {
+            ratio_samples: 4,
+            ratio_sum: 4.8,
+            clipped_surrogate_samples: 1,
+            missing_or_invalid_old_probability: 1,
+            minibatches: 2,
+            batch_samples_applied: 7,
+            batch_samples_skipped: 1,
+            optimizer_updates_applied: 2,
+            optimizer_updates_dropped: 0,
+            entropy_sum: 3.2,
+            entropy_samples: 4,
+            effective_learning_rate: 0.0003,
+            ..SoccerPolicyOptimizerTelemetry::default()
+        };
+        telemetry.role_entropy_sum[SoccerPolicyRoleGroup::Midfielder.index()] = 1.8;
+        telemetry.role_entropy_samples[SoccerPolicyRoleGroup::Midfielder.index()] = 2;
+
+        stats.record_policy_optimizer_telemetry(telemetry, true);
+        let planning = stats.planning_validation_stats();
+
+        assert!(planning.policy_optimizer_minibatched);
+        assert_eq!(planning.policy_optimizer_ratio_samples, 4);
+        assert!((planning.mean_policy_optimizer_ratio - 1.2).abs() < 1e-12);
+        assert!((planning.policy_optimizer_clip_fraction - 0.25).abs() < 1e-12);
+        assert!((planning.policy_optimizer_missing_old_probability_rate - 0.2).abs() < 1e-12);
+        assert_eq!(planning.policy_optimizer_minibatches, 2);
+        assert_eq!(planning.policy_optimizer_batch_samples_applied, 7);
+        assert_eq!(planning.policy_optimizer_batch_samples_skipped, 1);
+        assert_eq!(planning.policy_optimizer_updates_applied, 2);
+        assert_eq!(planning.policy_optimizer_updates_dropped, 0);
+        assert!((planning.mean_policy_optimizer_entropy - 0.8).abs() < 1e-12);
+        assert!(
+            (planning.mean_policy_optimizer_role_entropy
+                [SoccerPolicyRoleGroup::Midfielder.index()]
+                - 0.9)
+                .abs()
                 < 1e-12
         );
     }

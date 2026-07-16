@@ -89,12 +89,27 @@ fn set_env_default(name: &str, value: &str) {
 /// Per-episode outcome measured for BOTH modes. `goal` drives the finishing metric; `shots`,
 /// `sot` and `best_xg` drive the chance-CREATION metrics (does the possession manufacture a
 /// high-quality shot from open play).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct EpMetrics {
     goal: bool,
     shots: u32,
     sot: u32,
     best_xg: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EvalScenarioPlan {
+    episode_seeds: Vec<u64>,
+}
+
+impl EvalScenarioPlan {
+    fn new(eval_base: u64, n: usize) -> Self {
+        Self {
+            episode_seeds: (0..n)
+                .map(|index| eval_base.wrapping_add(index as u64))
+                .collect(),
+        }
+    }
 }
 
 /// Transparent GEOMETRIC xG proxy for a shot taken from `origin` at the goal on line `goal_y`
@@ -380,17 +395,17 @@ fn play_episode(
 /// Run `n` held-out episodes on `sim` (net already installed & frozen) and collect their metrics.
 fn eval_arm(
     sim: &mut SoccerMatch,
-    eval_base: u64,
-    n: usize,
+    plan: &EvalScenarioPlan,
     creation: bool,
     num_defenders: usize,
     max_ticks: usize,
     width: f64,
     length: f64,
 ) -> Vec<EpMetrics> {
-    (0..n)
-        .map(|i| {
-            let mut rng = Rng::new(eval_base.wrapping_add(i as u64));
+    plan.episode_seeds
+        .iter()
+        .map(|episode_seed| {
+            let mut rng = Rng::new(*episode_seed);
             play_episode(
                 sim,
                 &mut rng,
@@ -402,6 +417,79 @@ fn eval_arm(
             )
         })
         .collect()
+}
+
+fn frozen_eval_sim(config: MatchConfig, snapshot: SoccerNeuralNetworkSnapshot) -> SoccerMatch {
+    let options = SoccerQPolicyOptions::default();
+    let policies = SoccerTeamQPolicies {
+        home: SoccerQPolicy::from_entries_with_targets(options.clone(), &[], &[])
+            .expect("build eval home policy"),
+        away: SoccerQPolicy::from_entries_with_targets(options, &[], &[])
+            .expect("build eval away policy"),
+    };
+    let mut sim = SoccerMatch::default_11v11(config).with_team_policies(policies);
+    sim.set_team_neural_brain(Team::Home, Some(snapshot), true)
+        .expect("freeze eval home net");
+    sim.set_team_neural_brain(Team::Away, None, true)
+        .expect("freeze eval away analytic policy");
+    sim
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paired_eval_fresh_arms_replay_identical_scenarios() {
+        enable_deterministic_formation_lp();
+        let mut config = MatchConfig {
+            seed: 0xF111_D055,
+            learning_enabled: true,
+            full_game_learning_enabled: true,
+            duration_seconds: 1e9,
+            ..MatchConfig::default()
+        };
+        config.neural_learning.enabled = true;
+
+        let mut source = SoccerMatch::default_11v11(config.clone());
+        source
+            .set_team_neural_brain(Team::Home, None, false)
+            .expect("create source network");
+        let snapshot = source
+            .neural_network_snapshot_for(Team::Home)
+            .expect("source network snapshot");
+        let plan = EvalScenarioPlan::new(u64::MAX, 2);
+        assert_eq!(plan.episode_seeds, vec![u64::MAX, 0]);
+
+        let mut first = frozen_eval_sim(config.clone(), snapshot.clone());
+        let mut second = frozen_eval_sim(config.clone(), snapshot);
+        let first_outcomes = eval_arm(
+            &mut first,
+            &plan,
+            false,
+            0,
+            20,
+            config.field_width_yards,
+            config.field_length_yards,
+        );
+        let second_outcomes = eval_arm(
+            &mut second,
+            &plan,
+            false,
+            0,
+            20,
+            config.field_width_yards,
+            config.field_length_yards,
+        );
+
+        assert_eq!(first_outcomes, second_outcomes);
+        assert_eq!(first.tick, second.tick);
+        assert_eq!(first.stats.shots_home, second.stats.shots_home);
+        assert_eq!(
+            first.stats.shots_on_target_home,
+            second.stats.shots_on_target_home
+        );
+    }
 }
 
 fn main() {
@@ -552,7 +640,9 @@ fn main() {
 
     // Snapshot the net BEFORE training — the paired-eval baseline (a fresh net for finishing-from-
     // scratch, or the warm-start league net for creation). Eval then isolates what TRAINING added.
-    let baseline_snap = sim.neural_network_snapshot_for(Team::Home);
+    let baseline_snap = sim
+        .neural_network_snapshot_for(Team::Home)
+        .expect("pre-training baseline network snapshot");
 
     let field_length = sim.config.field_length_yards;
     let field_width = sim.config.field_width_yards;
@@ -745,67 +835,24 @@ fn main() {
         .unwrap_or(200);
     if eval_n > 0 && !frozen {
         let eval_base = base_seed ^ 0xE7A1_0000_0000_0000;
-        // (a) TUNED arm: freeze the just-trained net in the existing sim (save data already captured).
-        sim.set_team_neural_brain(Team::Home, Some(snap.clone()), true)
-            .expect("freeze tuned net for eval");
+        let eval_plan = EvalScenarioPlan::new(eval_base, eval_n);
+        let eval_config = sim.config.clone();
+        // Both arms start from fresh matches with empty Q policies and the same scenario plan. This
+        // prevents the trained arm's advanced tick/runtime/Q state from leaking into the comparison.
+        let mut tuned_sim = frozen_eval_sim(eval_config.clone(), snap.clone());
         let tuned = eval_arm(
-            &mut sim,
-            eval_base,
-            eval_n,
+            &mut tuned_sim,
+            &eval_plan,
             creation,
             num_defenders,
             max_ticks,
             field_width,
             field_length,
         );
-        // (b) BASELINE arm: a fresh sim serving the PRE-TRAINING net frozen, identical machinery.
-        let mut base_config = MatchConfig {
-            seed,
-            learning_enabled: true,
-            full_game_learning_enabled: true,
-            duration_seconds: 1e9,
-            ..MatchConfig::default()
-        };
-        base_config.neural_learning.enabled = true;
-        let base_policies = SoccerTeamQPolicies {
-            home: SoccerQPolicy::from_entries_with_targets(
-                SoccerQPolicyOptions::default(),
-                &[],
-                &[],
-            )
-            .expect("base home policy"),
-            away: SoccerQPolicy::from_entries_with_targets(
-                SoccerQPolicyOptions::default(),
-                &[],
-                &[],
-            )
-            .expect("base away policy"),
-        };
-        let mut base_sim =
-            SoccerMatch::default_11v11(base_config).with_team_policies(base_policies);
-        match baseline_snap.clone() {
-            Some(b) => {
-                base_sim
-                    .set_team_neural_brain(Team::Home, Some(b), true)
-                    .expect("freeze baseline net");
-            }
-            None => {
-                base_sim
-                    .set_team_neural_brain(Team::Home, None, false)
-                    .expect("fresh baseline learner");
-                let fs = base_sim.neural_network_snapshot_for(Team::Home);
-                base_sim
-                    .set_team_neural_brain(Team::Home, fs, true)
-                    .expect("freeze fresh baseline");
-            }
-        }
-        base_sim
-            .set_team_neural_brain(Team::Away, None, true)
-            .expect("base away analytic");
+        let mut base_sim = frozen_eval_sim(eval_config, baseline_snap.clone());
         let baseline = eval_arm(
             &mut base_sim,
-            eval_base,
-            eval_n,
+            &eval_plan,
             creation,
             num_defenders,
             max_ticks,

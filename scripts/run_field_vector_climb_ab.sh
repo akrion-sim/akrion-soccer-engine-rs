@@ -18,7 +18,8 @@ EVAL_POOL="${FIELD_VECTOR_AB_EVAL_POOL:-3}"
 mkdir -p "$RUN_DIR/legacy/champions" "$RUN_DIR/v2/champions" "$RUN_DIR/logs"
 cd "$ROOT"
 
-cargo build --release --bin soccer_league_train --bin soccer_eval_gate_run \
+bash "$ROOT/scripts/prune_local_cargo_artifacts.sh" "${CARGO_TARGET_DIR:-$ROOT/target}"
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" cargo build --release --bin soccer_league_train --bin soccer_eval_gate_run \
   >"$RUN_DIR/logs/build.log" 2>&1
 
 run_arm() {

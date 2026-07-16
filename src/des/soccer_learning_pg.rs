@@ -92,6 +92,8 @@ pub struct SoccerLearningPgCompletedRunRetentionPrune {
 pub struct SoccerLearningPgMomentVectorRetentionPrune {
     pub soft_deleted_moment_embeddings: u64,
     pub soft_deleted_config_moments: u64,
+    pub hard_deleted_moment_embeddings: u64,
+    pub hard_deleted_config_moments: u64,
 }
 
 const POSTGRES_MAX_QUERY_PARAMETERS: usize = 65_535;
@@ -120,7 +122,9 @@ const SOCCER_POLICY_RETAIN_ARCHIVED_NEURAL_ENV: &str =
 const SOCCER_POLICY_VERSION_FULL_ENTRIES_ENV: &str = "SOCCER_PG_POLICY_VERSION_FULL_ENTRIES";
 const SOCCER_PG_PERSIST_RUN_DELTAS_ENV: &str = "SOCCER_PG_PERSIST_RUN_DELTAS";
 const SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV: &str = "SOCCER_PG_RESUME_MAX_POLICY_ENTRIES";
-/// Rows deleted per statement when explicitly draining a superseded generation's entries.
+/// Rows deleted per statement only when explicitly draining a superseded generation's entries.
+/// Remote/RDS writers use a much smaller bounded automatic batch; the full drain remains an
+/// explicit maintenance mode so policy promotion cannot stall on a large delete.
 const SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE: i64 = 50_000;
 /// Every durable policy write reclaims at most this many provably superseded entry rows. The
 /// small batch plus local timeouts bounds write-path latency; the explicit inline maintenance
@@ -209,33 +213,36 @@ const SOCCER_CONFIG_MOMENT_SOFT_DELETE_SQL: &str = "\
 update des_soccer_config_moments \
 set deleted_at = now() \
 where ctid in ( \
-  select ctid from des_soccer_config_moments \
-  where deleted_at is null \
-    and created_at < now() - ($2::bigint * interval '1 day') \
-    and ($1::text is null or experiment_id = $1::text::uuid) \
-  order by created_at asc \
+  select stale.ctid \
+  from des_soccer_config_moments stale \
+  where stale.deleted_at is null \
+    and stale.created_at < now() - ($2::bigint * interval '1 day') \
+    and ($1::text is null or stale.experiment_id = $1::text::uuid) \
+  order by stale.created_at asc, stale.ctid \
   limit $3 \
   for update skip locked \
 )";
 const SOCCER_MOMENT_EMBEDDING_HARD_DELETE_SQL: &str = "\
-delete from des_soccer_moment_embeddings \
-where ctid in ( \
-  select ctid from des_soccer_moment_embeddings \
-  where deleted_at is not null \
-    and deleted_at < now() - ($2::bigint * interval '1 day') \
-    and ($1::text is null or experiment_id = $1::text::uuid) \
-  order by deleted_at asc \
+delete from des_soccer_moment_embeddings victim \
+where victim.ctid in ( \
+  select stale.ctid \
+  from des_soccer_moment_embeddings stale \
+  where stale.deleted_at is not null \
+    and stale.deleted_at < now() - ($2::bigint * interval '1 day') \
+    and ($1::text is null or stale.experiment_id = $1::text::uuid) \
+  order by stale.deleted_at, stale.ctid \
   limit $3 \
   for update skip locked \
 )";
 const SOCCER_CONFIG_MOMENT_HARD_DELETE_SQL: &str = "\
-delete from des_soccer_config_moments \
-where ctid in ( \
-  select ctid from des_soccer_config_moments \
-  where deleted_at is not null \
-    and deleted_at < now() - ($2::bigint * interval '1 day') \
-    and ($1::text is null or experiment_id = $1::text::uuid) \
-  order by deleted_at asc \
+delete from des_soccer_config_moments victim \
+where victim.ctid in ( \
+  select stale.ctid \
+  from des_soccer_config_moments stale \
+  where stale.deleted_at is not null \
+    and stale.deleted_at < now() - ($2::bigint * interval '1 day') \
+    and ($1::text is null or stale.experiment_id = $1::text::uuid) \
+  order by stale.deleted_at, stale.ctid \
   limit $3 \
   for update skip locked \
 )";
@@ -3184,9 +3191,9 @@ impl SoccerLearningPgStore {
         })
     }
 
-    /// Retire old pgvector soccer moments. Retrieval stops seeing a row after the
-    /// initial soft delete; rows are physically removed only after the additional
-    /// hard-delete grace period has elapsed.
+    /// Retire old pgvector soccer moment rows. Retrieval paths immediately stop
+    /// seeing rows marked with `deleted_at`; rows that remain deleted past the
+    /// conservative recovery grace are then physically removed in bounded batches.
     pub fn soft_delete_old_moment_vectors(
         &mut self,
         experiment_id: Option<&str>,
@@ -5362,7 +5369,7 @@ fn soft_delete_old_moment_vectors_in_transaction(
         .map_err(|err| format!("soft-delete old soccer config moments: {err}"))?;
     let hard_delete_grace_days = SOCCER_MOMENT_VECTOR_HARD_DELETE_GRACE_DAYS;
     let hard_delete_batch_size = SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE;
-    let _hard_deleted_moment_embeddings = tx
+    let hard_deleted_moment_embeddings = tx
         .execute(
             SOCCER_MOMENT_EMBEDDING_HARD_DELETE_SQL,
             &[
@@ -5372,7 +5379,7 @@ fn soft_delete_old_moment_vectors_in_transaction(
             ],
         )
         .map_err(|err| format!("hard-delete retired soccer moment embeddings: {err}"))?;
-    let _hard_deleted_config_moments = tx
+    let hard_deleted_config_moments = tx
         .execute(
             SOCCER_CONFIG_MOMENT_HARD_DELETE_SQL,
             &[
@@ -5385,6 +5392,8 @@ fn soft_delete_old_moment_vectors_in_transaction(
     Ok(SoccerLearningPgMomentVectorRetentionPrune {
         soft_deleted_moment_embeddings,
         soft_deleted_config_moments,
+        hard_deleted_moment_embeddings,
+        hard_deleted_config_moments,
     })
 }
 
@@ -5992,11 +6001,18 @@ fn soccer_learning_pg_statement_timeout() -> String {
 
 fn soccer_policy_inline_prune_enabled() -> bool {
     let raw = std::env::var(SOCCER_POLICY_INLINE_PRUNE_ENV).ok();
-    soccer_policy_inline_prune_enabled_from_env_value(raw.as_deref())
+    let database_url = soccer_learning_database_url();
+    soccer_policy_inline_prune_enabled_from_env_value(raw.as_deref(), database_url.as_deref())
 }
 
-fn soccer_policy_inline_prune_enabled_from_env_value(raw: Option<&str>) -> bool {
+fn soccer_policy_inline_prune_enabled_from_env_value(
+    raw: Option<&str>,
+    database_url: Option<&str>,
+) -> bool {
     let value = raw.unwrap_or("").trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return soccer_learning_database_url_targets_localhost(database_url);
+    }
     value == "1"
         || value.eq_ignore_ascii_case("true")
         || value.eq_ignore_ascii_case("yes")
@@ -6072,6 +6088,45 @@ fn soccer_learning_pg_env_flag(name: &str) -> bool {
             ) && !value.is_empty()
         })
         .unwrap_or(false)
+}
+
+fn soccer_learning_database_url_targets_localhost(raw: Option<&str>) -> bool {
+    let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    if value
+        .split_whitespace()
+        .filter_map(|token| token.split_once('='))
+        .any(|(key, host)| {
+            (key.eq_ignore_ascii_case("host") || key.eq_ignore_ascii_case("hostaddr"))
+                && soccer_learning_pg_host_is_local(host)
+        })
+    {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    let Some(after_scheme) = lower
+        .strip_prefix("postgres://")
+        .or_else(|| lower.strip_prefix("postgresql://"))
+    else {
+        return false;
+    };
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    soccer_learning_pg_host_is_local(host)
+}
+
+fn soccer_learning_pg_host_is_local(host: &str) -> bool {
+    let host = host.trim().trim_matches('\'').trim_matches('"');
+    host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.starts_with('/')
 }
 
 // Optional CA bundle (PEM, one or more certificates) used to authenticate the
@@ -6317,6 +6372,7 @@ mod tests {
     fn default_moment_vector_retention_uses_soft_delete_plus_grace_period() {
         assert_eq!(SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS, 10);
         assert_eq!(SOCCER_MOMENT_VECTOR_HARD_DELETE_GRACE_DAYS, 30);
+        assert_eq!(SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE, 1_000);
         assert_eq!(soccer_moment_vector_retention_limit_days(10), Some(10));
         assert_eq!(soccer_moment_vector_retention_limit_days(0), None);
         assert_eq!(soccer_moment_vector_retention_limit_days(-1), None);
@@ -6349,10 +6405,10 @@ mod tests {
             assert!(normalized.starts_with("update "));
             assert!(!normalized.contains("delete from"));
             assert!(normalized.contains("set deleted_at = now()"));
-            assert!(normalized.contains("where deleted_at is null"));
+            assert!(normalized.contains("deleted_at is null"));
             assert!(normalized.contains("created_at < now() - ($2::bigint * interval '1 day')"));
             assert!(normalized.contains("experiment_id = $1::text::uuid"));
-            assert!(normalized.contains("order by created_at asc"));
+            assert!(normalized.contains("created_at asc"));
             assert!(normalized.contains("limit $3"));
             assert!(normalized.contains("for update skip locked"));
         }
@@ -6367,14 +6423,32 @@ mod tests {
         ] {
             let normalized = sql.to_ascii_lowercase();
             assert!(normalized.starts_with("delete from "));
-            assert!(normalized.contains("where deleted_at is not null"));
+            assert!(normalized.contains("deleted_at is not null"));
             assert!(normalized.contains("deleted_at < now() - ($2::bigint * interval '1 day')"));
             assert!(normalized.contains("experiment_id = $1::text::uuid"));
             assert!(normalized.contains("limit $3"));
-            assert!(normalized.contains("order by deleted_at asc"));
+            assert!(normalized.contains("order by") && normalized.contains("deleted_at"));
             assert!(normalized.contains("for update skip locked"));
         }
         assert!(SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE > 0);
+    }
+
+    #[test]
+    fn moment_vector_retention_hard_deletes_only_retired_rows_in_bounded_batches() {
+        for sql in [
+            SOCCER_MOMENT_EMBEDDING_HARD_DELETE_SQL,
+            SOCCER_CONFIG_MOMENT_HARD_DELETE_SQL,
+        ] {
+            let normalized = sql.to_ascii_lowercase();
+            assert!(normalized.starts_with("delete from"));
+            assert!(normalized.contains("stale.deleted_at < now()"));
+            assert!(normalized.contains("$2::bigint * interval '1 day'"));
+            assert!(normalized.contains("stale.experiment_id = $1::text::uuid"));
+            assert!(normalized.contains("order by stale.deleted_at, stale.ctid"));
+            assert!(normalized.contains("limit $3"));
+            assert!(normalized.contains("for update skip locked"));
+            assert!(!normalized.contains("deleted_at is null"));
+        }
     }
 
     #[test]
@@ -7174,25 +7248,62 @@ mod tests {
     }
 
     #[test]
-    fn inline_policy_prune_is_opt_in_for_learning_jobs() {
-        assert!(!soccer_policy_inline_prune_enabled_from_env_value(None));
-        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some("")));
-        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some(
-            "0"
-        )));
-        assert!(!soccer_policy_inline_prune_enabled_from_env_value(Some(
-            "false"
-        )));
-        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some("1")));
-        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(
-            "true"
-        )));
-        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(
-            "YES"
-        )));
-        assert!(soccer_policy_inline_prune_enabled_from_env_value(Some(
-            " on "
-        )));
+    fn inline_policy_prune_defaults_to_local_postgres_only() {
+        let local_url = Some("postgres://soccer@localhost:5432/soccer");
+        let local_upper_host = Some("host=LOCALHOST dbname=soccer");
+        let local_hostaddr = Some("hostaddr=127.0.0.1 dbname=soccer");
+        let local_socket = Some("host=/var/run/postgresql dbname=soccer");
+        let remote_url = Some("postgres://soccer@akrion-rds.example.com:5432/soccer");
+
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(
+            None, None
+        ));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(
+            None, local_url
+        ));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(
+            None,
+            local_upper_host
+        ));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(
+            Some(""),
+            local_hostaddr
+        ));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(
+            Some("auto"),
+            local_socket
+        ));
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(
+            None, remote_url
+        ));
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(
+            Some("auto"),
+            remote_url
+        ));
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(
+            Some("0"),
+            local_url
+        ));
+        assert!(!soccer_policy_inline_prune_enabled_from_env_value(
+            Some("false"),
+            local_url
+        ));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(
+            Some("1"),
+            remote_url
+        ));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(
+            Some("true"),
+            remote_url
+        ));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(
+            Some("YES"),
+            remote_url
+        ));
+        assert!(soccer_policy_inline_prune_enabled_from_env_value(
+            Some(" on "),
+            remote_url
+        ));
     }
 
     #[test]

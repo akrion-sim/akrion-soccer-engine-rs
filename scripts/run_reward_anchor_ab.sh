@@ -20,7 +20,8 @@ if [[ ! "$WIN_REWARD_A" =~ ^[0-9]+([.][0-9]+)?$ ]] \
   printf 'WIN_REWARD_A and WIN_REWARD_B must be non-negative numbers\n' >&2
   exit 2
 fi
-cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
+bash "$ROOT/scripts/prune_local_cargo_artifacts.sh" "${CARGO_TARGET_DIR:-$ROOT/target}"
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" cargo build --release --manifest-path "$ROOT/Cargo.toml" --bin soccer_outcome_ab_run
 
 effective_a="$(env SOCCER_DYNAMIC_REWARD_WEIGHTS=1 DD_SOCCER_MATCH_WIN_REWARD_POINTS="$WIN_REWARD_A" \
   "$BIN" effective-win-reward)"

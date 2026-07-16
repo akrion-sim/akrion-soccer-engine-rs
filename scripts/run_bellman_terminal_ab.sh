@@ -77,7 +77,8 @@ log_setup "shared_frontier=$SHARED_DIR/learned-params.json"
 
 (
     printf '[%s] release build start\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    cargo build --release --bin soccer_league_train --bin soccer_eval_gate_run
+    bash "$ROOT/scripts/prune_local_cargo_artifacts.sh" "${CARGO_TARGET_DIR:-$ROOT/target}"
+    CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" cargo build --release --bin soccer_league_train --bin soccer_eval_gate_run
     status="$?"
     if [ "$status" -eq 0 ]; then
         printf '[%s] release build ok\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$BUILD_OK"
