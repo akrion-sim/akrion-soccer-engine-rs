@@ -143,7 +143,9 @@ const SOCCER_MOMENT_VECTOR_SOFT_DELETE_BATCH_SIZE: i64 = 100;
 /// A vector must first spend this long explicitly soft-deleted before physical removal. Together
 /// with the live-row window above, the default minimum age at hard deletion is forty days.
 pub const SOCCER_MOMENT_VECTOR_HARD_DELETE_GRACE_DAYS: i64 = 30;
-const SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE: i64 = 1_000;
+/// Physical removal also maintains both HNSW indexes. Keep this much smaller than the soft
+/// retirement batch so the whole best-effort transaction stays inside its remote timeout.
+const SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE: i64 = 10;
 
 const SOCCER_PG_CONNECT_DEFAULT_MAX_ATTEMPTS: u32 = 5;
 const SOCCER_PG_CONNECT_BASE_BACKOFF_MILLIS: u64 = 200;
@@ -2451,7 +2453,7 @@ impl SoccerLearningPgStore {
             .client
             .transaction()
             .map_err(|err| format!("begin bounded soccer policy retention transaction: {err}"))?;
-        tx.batch_execute("set local lock_timeout = '250ms'; set local statement_timeout = '5s'")
+        tx.batch_execute("set local lock_timeout = '250ms'; set local statement_timeout = '20s'")
             .map_err(|err| format!("bound soccer policy retention transaction: {err}"))?;
 
         // Resolve ids from the small versions table first. The entry-table join form previously
@@ -5421,13 +5423,23 @@ fn soft_delete_old_moment_vectors_in_transaction(
             SOCCER_MOMENT_EMBEDDING_SOFT_DELETE_SQL,
             &[&experiment_id, &older_than_days, &soft_delete_batch_size],
         )
-        .map_err(|err| format!("soft-delete old soccer moment embeddings: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "soft-delete old soccer moment embeddings: {}",
+                soccer_learning_pg_error_context(&err)
+            )
+        })?;
     let soft_deleted_config_moments = tx
         .execute(
             SOCCER_CONFIG_MOMENT_SOFT_DELETE_SQL,
             &[&experiment_id, &older_than_days, &soft_delete_batch_size],
         )
-        .map_err(|err| format!("soft-delete old soccer config moments: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "soft-delete old soccer config moments: {}",
+                soccer_learning_pg_error_context(&err)
+            )
+        })?;
     let hard_delete_grace_days = SOCCER_MOMENT_VECTOR_HARD_DELETE_GRACE_DAYS;
     let hard_delete_batch_size = SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE;
     let hard_deleted_moment_embeddings = tx
@@ -5439,7 +5451,12 @@ fn soft_delete_old_moment_vectors_in_transaction(
                 &hard_delete_batch_size,
             ],
         )
-        .map_err(|err| format!("hard-delete retired soccer moment embeddings: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "hard-delete retired soccer moment embeddings: {}",
+                soccer_learning_pg_error_context(&err)
+            )
+        })?;
     let hard_deleted_config_moments = tx
         .execute(
             SOCCER_CONFIG_MOMENT_HARD_DELETE_SQL,
@@ -5449,7 +5466,12 @@ fn soft_delete_old_moment_vectors_in_transaction(
                 &hard_delete_batch_size,
             ],
         )
-        .map_err(|err| format!("hard-delete retired soccer config moments: {err}"))?;
+        .map_err(|err| {
+            format!(
+                "hard-delete retired soccer config moments: {}",
+                soccer_learning_pg_error_context(&err)
+            )
+        })?;
     Ok(SoccerLearningPgMomentVectorRetentionPrune {
         soft_deleted_moment_embeddings,
         soft_deleted_config_moments,
@@ -6528,7 +6550,7 @@ mod tests {
     fn default_moment_vector_retention_uses_soft_delete_plus_grace_period() {
         assert_eq!(SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS, 10);
         assert_eq!(SOCCER_MOMENT_VECTOR_HARD_DELETE_GRACE_DAYS, 30);
-        assert_eq!(SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE, 1_000);
+        assert_eq!(SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE, 10);
         assert_eq!(soccer_moment_vector_retention_limit_days(10), Some(10));
         assert_eq!(soccer_moment_vector_retention_limit_days(0), None);
         assert_eq!(soccer_moment_vector_retention_limit_days(-1), None);
