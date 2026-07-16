@@ -74494,4 +74494,6 @@ mod discretized_kick_scaffold_tests {
 }
 
 #[cfg(test)]
+mod des_engine_integration_tests;
+#[cfg(test)]
 mod tests;
