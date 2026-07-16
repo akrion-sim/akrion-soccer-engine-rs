@@ -125,7 +125,8 @@ path = "src/bin/rollout_poc.rs"
 
 [profile.dev]
 # Cargo defaults to unpacked debug info on macOS, leaving one `*.rcgu.o`
-# per codegen unit. Keep source-line backtraces without that artifact family.
+# per codegen unit. Keep source-line backtraces without that artifact family. Incremental
+# sessions are disabled because their dep-graph.bin and object generations grew into gigabytes.
 debug = "line-tables-only"
 split-debuginfo = "off"
 incremental = false

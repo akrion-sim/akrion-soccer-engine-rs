@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+subcommand=""
+profile=""
+args=("$@")
+
+# Cargo accepts global flags before the subcommand, so find the first build-producing command
+# instead of assuming it is argv[1]. At the same time, resolve the profile that command will
+# replace. Cleaning only that profile preserves the latest release executables during ordinary
+# `check`/`test` work (important when a trainer is already running from target/release).
+for ((index = 0; index < ${#args[@]}; index += 1)); do
+  arg="${args[$index]}"
+  case "$arg" in
+    bench|build|check|clippy|doc|fix|run|rustc|rustdoc|test)
+      if [[ -z "$subcommand" ]]; then
+        subcommand="$arg"
+      fi
+      ;;
+    --release)
+      profile="release"
+      ;;
+    --profile=*)
+      profile="${arg#--profile=}"
+      ;;
+    --profile)
+      if ((index + 1 < ${#args[@]})); then
+        profile="${args[$((index + 1))]}"
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$profile" ]]; then
+  case "$subcommand" in
+    bench) profile="bench" ;;
+    test) profile="test" ;;
+    *) profile="dev" ;;
+  esac
+fi
+
+if [[ "${SOCCER_CARGO_FRESH_PRINT_PLAN:-}" == "1" ]]; then
+  printf 'subcommand=%s profile=%s\n' "${subcommand:-none}" "$profile"
+  exit 0
+fi
+
+# Cargo/rustc do not garbage-collect a workspace target directory. Before a command that will
+# write a genuinely new compiler generation, remove only the two local packages that this
+# repository owns. Cargo performs the deletion using its own package/artifact metadata, so
+# registry dependencies and unrelated packages sharing the target directory remain intact.
+case "$subcommand" in
+  bench|build|check|clippy|doc|fix|run|rustc|rustdoc|test)
+    des_root="$repo_root/../discrete-event-system.rs"
+    target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+    if [[ "$target_dir" != /* ]]; then
+      target_dir="$repo_root/$target_dir"
+    fi
+
+    fingerprint_tree() {
+      local root="$1"
+      local path
+      local paths=()
+      for path in "$root/Cargo.toml" "$root/Cargo.lock" "$root/build.rs"; do
+        if [[ -f "$path" ]]; then
+          paths+=("$path")
+        fi
+      done
+      if [[ -d "$root/src" ]]; then
+        while IFS= read -r path; do
+          paths+=("$path")
+        done < <(rg --files "$root/src" -g '*.rs' | sort)
+      fi
+      if ((${#paths[@]} > 0)); then
+        shasum -a 256 "${paths[@]}"
+      fi
+    }
+
+    source_fingerprint="$({
+      cargo --version
+      rustc --version
+      printf 'cargo-args\0'
+      printf '%s\0' "${args[@]}"
+      fingerprint_tree "$repo_root"
+      fingerprint_tree "$des_root"
+    } | shasum -a 256 | awk '{print $1}')"
+    stamp_path="$target_dir/.akrion-source-fingerprint-$profile"
+    case "$profile" in
+      dev|test) profile_dir="debug" ;;
+      release|bench) profile_dir="release" ;;
+      *) profile_dir="$profile" ;;
+    esac
+    previous_fingerprint=""
+    if [[ -f "$stamp_path" ]]; then
+      previous_fingerprint="$(<"$stamp_path")"
+    fi
+    write_fingerprint=1
+
+    if [[ "$source_fingerprint" != "$previous_fingerprint" ]]; then
+      if pgrep -f "$target_dir/$profile_dir/" >/dev/null 2>&1; then
+        echo "cargo-fresh: preserving active target profile $target_dir/$profile_dir" >&2
+        # Do not bless the new fingerprint: once the running executable exits, the next matching
+        # invocation must still clean the generations we deliberately preserved here.
+        write_fingerprint=0
+      else
+        clean_args=(
+          clean
+          --manifest-path "$repo_root/Cargo.toml"
+          --package soccer_engine
+          --package des_engine
+          --profile "$profile"
+        )
+        if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+          clean_args+=(--target-dir "$CARGO_TARGET_DIR")
+        fi
+        cargo "${clean_args[@]}"
+      fi
+    fi
+    ;;
+esac
+
+export CARGO_INCREMENTAL=0
+cd "$repo_root"
+if cargo "$@"; then
+  if [[ -n "${source_fingerprint:-}" && "${write_fingerprint:-0}" == "1" ]]; then
+    mkdir -p "$target_dir"
+    printf '%s\n' "$source_fingerprint" >"$stamp_path"
+  fi
+else
+  exit $?
+fi

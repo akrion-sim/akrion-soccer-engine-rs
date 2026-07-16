@@ -139,6 +139,17 @@ Rails: back up first (`pg_dump -t … --where`); ~500-row batches, short `statem
 3. **Index (already applied to RDS).** `des_soccer_learning_policy_versions_neural_gen_idx` on
    `(experiment_id, generation DESC)` → `:5055` neural probe 2 min → 2 ms. Viewer also runs with
    `SOCCER_POLICY_PROMOTION_BASELINE_LOOKBACK_GENERATIONS=0`.
+4. **Superseded entry reclamation (IMPLEMENTED).** After a new branch tip commits, normal writers
+   delete one 5,000-row batch from older **archived** versions under transaction-local 250 ms lock /
+   5 s statement timeouts. Active and candidate siblings are never eligible, version metadata is
+   retained, and `full_entries_retained` changes only when that version has no entry rows. Cleanup
+   also runs after neural-only writes whose new version has no tabular entries, so an existing
+   backlog cannot become stranded. Setting `SOCCER_PG_INLINE_POLICY_PRUNE=true` retains the explicit
+   full-backlog drain mode.
+5. **Completed-run reclamation (IMPLEMENTED).** The configured recent-run window is enforced in
+   repeatable batches of at most 5,000 delta rows and 25 fully drained runs per writer pass. Locked
+   rows are skipped, and an old run is not deleted until none of its delta rows remain. This replaces
+   the former unbounded transaction that timed out against the production delta backlog.
 
 ### §6.1 loader-safety audit (2026-07-09)
 
