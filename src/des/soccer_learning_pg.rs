@@ -3201,6 +3201,8 @@ impl SoccerLearningPgStore {
             .client
             .transaction()
             .map_err(|err| format!("begin soccer moment-vector retention transaction: {err}"))?;
+        tx.batch_execute("set local lock_timeout = '250ms'; set local statement_timeout = '5s'")
+            .map_err(|err| format!("bound soccer moment-vector retention transaction: {err}"))?;
         let prune =
             soft_delete_old_moment_vectors_in_transaction(&mut tx, experiment_id, older_than_days)?;
         tx.commit()
@@ -3208,11 +3210,12 @@ impl SoccerLearningPgStore {
         Ok(prune)
     }
 
-    /// Run retention only after the caller's learning data is durable. Remote stores defer this
-    /// potentially expensive maintenance by default; an explicit maintenance job can call
-    /// [`Self::soft_delete_old_moment_vectors`] or opt in with
-    /// [`SOCCER_MOMENT_VECTOR_INLINE_PRUNE_ENV`]. Retention is best-effort here because cleanup
-    /// must never invalidate a completed game, policy delta, or retrieval moment.
+    /// Run retention only after the caller's learning data is durable. Each automatic pass is
+    /// timeout-bounded and batch-bounded, including on remote stores; operators can explicitly
+    /// disable it with [`SOCCER_MOMENT_VECTOR_INLINE_PRUNE_ENV`] and invoke
+    /// [`Self::soft_delete_old_moment_vectors`] from a dedicated maintenance job instead.
+    /// Retention is best-effort here because cleanup must never invalidate a completed game,
+    /// policy delta, or retrieval moment.
     fn prune_moment_vectors_after_commit_best_effort(&mut self, experiment_id: Option<&str>) {
         if !soccer_moment_vector_inline_prune_enabled() {
             return;
@@ -6017,9 +6020,13 @@ fn soccer_moment_vector_inline_prune_enabled() -> bool {
 
 fn soccer_moment_vector_inline_prune_enabled_from_env_value(
     raw: Option<&str>,
-    database_url: Option<&str>,
+    _database_url: Option<&str>,
 ) -> bool {
-    soccer_policy_inline_prune_enabled_from_env_value(raw, database_url)
+    let value = raw.unwrap_or("").trim();
+    !(value == "0"
+        || value.eq_ignore_ascii_case("false")
+        || value.eq_ignore_ascii_case("no")
+        || value.eq_ignore_ascii_case("off"))
 }
 
 fn soccer_policy_inline_prune_enabled_from_env_value(
@@ -7324,17 +7331,17 @@ mod tests {
     }
 
     #[test]
-    fn inline_moment_vector_prune_defaults_to_local_postgres_only() {
+    fn bounded_moment_vector_prune_defaults_on_for_local_and_remote_postgres() {
         let local_url = Some("postgres://soccer@localhost:5432/soccer");
         let remote_url = Some("postgres://soccer@akrion-rds.example.com:5432/soccer");
 
         assert!(soccer_moment_vector_inline_prune_enabled_from_env_value(
             None, local_url
         ));
-        assert!(!soccer_moment_vector_inline_prune_enabled_from_env_value(
+        assert!(soccer_moment_vector_inline_prune_enabled_from_env_value(
             None, remote_url
         ));
-        assert!(!soccer_moment_vector_inline_prune_enabled_from_env_value(
+        assert!(soccer_moment_vector_inline_prune_enabled_from_env_value(
             Some("auto"),
             remote_url
         ));
