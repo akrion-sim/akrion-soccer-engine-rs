@@ -248,6 +248,52 @@ where victim.ctid in ( \
   for update skip locked \
 )";
 
+/// Fast-path probes used before schema bootstrap. Steady-state writers must not execute even
+/// idempotent `ALTER TABLE` / `CREATE INDEX` statements: those statements still request strong
+/// relation locks and concurrent learners can deadlock or time out while persisting a game.
+const SOCCER_CONFIG_MOMENT_SCHEMA_READY_SQL: &str = r#"
+select
+  to_regclass('des_soccer_config_moments') is not null
+  and to_regclass('des_soccer_config_moments_hnsw') is not null
+  and to_regclass('des_soccer_config_moments_hnsw_assigned') is not null
+  and to_regclass('des_soccer_config_moments_run_idx') is not null
+  and to_regclass('des_soccer_config_moments_live_created_idx') is not null
+  and to_regclass('des_soccer_config_moments_deleted_idx') is not null
+  and 3 = (
+    select count(*)
+    from pg_attribute
+    where attrelid = to_regclass('des_soccer_config_moments')
+      and attname in ('deleted_at', 'embedding_assigned', 'features_assigned')
+      and not attisdropped
+  )
+  and 2 = (
+    select count(*)
+    from pg_constraint
+    where conrelid = to_regclass('des_soccer_config_moments')
+      and conname in (
+        'des_soccer_config_moments_features_len_chk',
+        'des_soccer_config_moments_features_assigned_len_chk'
+      )
+  )
+"#;
+const SOCCER_MOMENT_EMBEDDING_SCHEMA_READY_SQL: &str = r#"
+select
+  to_regclass('des_soccer_moment_embeddings') is not null
+  and to_regclass('des_soccer_moment_embeddings_hnsw') is not null
+  and to_regclass('des_soccer_moment_embeddings_run_idx') is not null
+  and to_regclass('des_soccer_moment_embeddings_live_created_idx') is not null
+  and to_regclass('des_soccer_moment_embeddings_deleted_idx') is not null
+  and exists (
+    select 1
+    from pg_attribute
+    where attrelid = to_regclass('des_soccer_moment_embeddings')
+      and attname = 'deleted_at'
+      and not attisdropped
+  )
+"#;
+const SOCCER_CONFIG_MOMENT_SCHEMA_LOCK_KEY: i64 = 0x534f_4343_4647;
+const SOCCER_MOMENT_EMBEDDING_SCHEMA_LOCK_KEY: i64 = 0x534f_4343_454d;
+
 const _: () = {
     assert!(
         SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE * SOCCER_COMPLETED_RUN_HEADER_PARAMETER_COUNT
@@ -5417,6 +5463,24 @@ fn soft_delete_old_moment_vectors_in_transaction(
 /// raw `features real[]` (the canonical per-player floats kept for an exact
 /// permutation re-score). `vector(dim)` width is [`SOCCER_MOMENT_EMBEDDING_DIM`].
 fn ensure_soccer_config_moment_tables(tx: &mut postgres::Transaction<'_>) -> Result<(), String> {
+    if soccer_config_moment_schema_ready(tx)? {
+        return Ok(());
+    }
+    tx.query_one(
+        "select pg_advisory_xact_lock($1)",
+        &[&SOCCER_CONFIG_MOMENT_SCHEMA_LOCK_KEY],
+    )
+    .map_err(|err| {
+        format!(
+            "lock soccer config moment schema bootstrap: {}",
+            soccer_learning_pg_error_context(&err)
+        )
+    })?;
+    // Another learner may have completed the migration while this transaction waited for the
+    // advisory lock. Recheck before requesting any relation lock.
+    if soccer_config_moment_schema_ready(tx)? {
+        return Ok(());
+    }
     tx.batch_execute(&format!(
         r#"
         create extension if not exists pgcrypto;
@@ -5477,10 +5541,31 @@ fn ensure_soccer_config_moment_tables(tx: &mut postgres::Transaction<'_>) -> Res
         legacy_features = CONFIG_FEATURE_DIM_V1,
         features = CONFIG_FEATURE_DIM
     ))
-    .map_err(|err| format!("ensure soccer config moment tables: {err}"))
+    .map_err(|err| {
+        format!(
+            "ensure soccer config moment tables: {}",
+            soccer_learning_pg_error_context(&err)
+        )
+    })
 }
 
 fn ensure_soccer_moment_embedding_tables(tx: &mut postgres::Transaction<'_>) -> Result<(), String> {
+    if soccer_moment_embedding_schema_ready(tx)? {
+        return Ok(());
+    }
+    tx.query_one(
+        "select pg_advisory_xact_lock($1)",
+        &[&SOCCER_MOMENT_EMBEDDING_SCHEMA_LOCK_KEY],
+    )
+    .map_err(|err| {
+        format!(
+            "lock soccer moment embedding schema bootstrap: {}",
+            soccer_learning_pg_error_context(&err)
+        )
+    })?;
+    if soccer_moment_embedding_schema_ready(tx)? {
+        return Ok(());
+    }
     tx.batch_execute(&format!(
         r#"
         create extension if not exists pgcrypto;
@@ -5514,7 +5599,36 @@ fn ensure_soccer_moment_embedding_tables(tx: &mut postgres::Transaction<'_>) -> 
         "#,
         dim = SOCCER_MOMENT_EMBEDDING_DIM
     ))
-    .map_err(|err| format!("ensure soccer moment embedding tables: {err}"))
+    .map_err(|err| {
+        format!(
+            "ensure soccer moment embedding tables: {}",
+            soccer_learning_pg_error_context(&err)
+        )
+    })
+}
+
+fn soccer_config_moment_schema_ready(tx: &mut postgres::Transaction<'_>) -> Result<bool, String> {
+    tx.query_one(SOCCER_CONFIG_MOMENT_SCHEMA_READY_SQL, &[])
+        .map(|row| row.get(0))
+        .map_err(|err| {
+            format!(
+                "probe soccer config moment schema: {}",
+                soccer_learning_pg_error_context(&err)
+            )
+        })
+}
+
+fn soccer_moment_embedding_schema_ready(
+    tx: &mut postgres::Transaction<'_>,
+) -> Result<bool, String> {
+    tx.query_one(SOCCER_MOMENT_EMBEDDING_SCHEMA_READY_SQL, &[])
+        .map(|row| row.get(0))
+        .map_err(|err| {
+            format!(
+                "probe soccer moment embedding schema: {}",
+                soccer_learning_pg_error_context(&err)
+            )
+        })
 }
 
 fn ensure_soccer_learning_pass_metrics_table(
@@ -6491,6 +6605,36 @@ mod tests {
             assert!(normalized.contains("for update skip locked"));
             assert!(!normalized.contains("deleted_at is null"));
         }
+    }
+
+    #[test]
+    fn moment_schema_fast_paths_require_every_current_column_index_and_constraint() {
+        for required in [
+            "des_soccer_config_moments_hnsw",
+            "des_soccer_config_moments_hnsw_assigned",
+            "des_soccer_config_moments_run_idx",
+            "des_soccer_config_moments_live_created_idx",
+            "des_soccer_config_moments_deleted_idx",
+            "embedding_assigned",
+            "features_assigned",
+            "des_soccer_config_moments_features_len_chk",
+            "des_soccer_config_moments_features_assigned_len_chk",
+        ] {
+            assert!(SOCCER_CONFIG_MOMENT_SCHEMA_READY_SQL.contains(required));
+        }
+        for required in [
+            "des_soccer_moment_embeddings_hnsw",
+            "des_soccer_moment_embeddings_run_idx",
+            "des_soccer_moment_embeddings_live_created_idx",
+            "des_soccer_moment_embeddings_deleted_idx",
+            "deleted_at",
+        ] {
+            assert!(SOCCER_MOMENT_EMBEDDING_SCHEMA_READY_SQL.contains(required));
+        }
+        assert_ne!(
+            SOCCER_CONFIG_MOMENT_SCHEMA_LOCK_KEY,
+            SOCCER_MOMENT_EMBEDDING_SCHEMA_LOCK_KEY
+        );
     }
 
     #[test]

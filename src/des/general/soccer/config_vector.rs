@@ -1143,6 +1143,14 @@ mod tests {
     fn feature_width_is_stable() {
         let snap = sample_snapshot();
         let cfg = SoccerConfigVector::from_snapshot(&snap, Team::Home);
+        assert_eq!(cfg.own.len(), CONFIG_PLAYERS_PER_TEAM);
+        assert_eq!(cfg.opponents.len(), CONFIG_PLAYERS_PER_TEAM);
+        assert_eq!(CONFIG_PLAYERS_PER_TEAM, 11);
+        assert_eq!(CONFIG_PER_PLAYER_FLOATS, 9);
+        assert_eq!(CONFIG_BALL_FLOATS, 9);
+        assert_eq!(CONFIG_SCALAR_FLOATS, 3);
+        assert_eq!(CONFIG_FEATURE_DIM, 22 * 9 + 9 + 3);
+        assert_eq!(CONFIG_FEATURE_DIM, 210);
         assert_eq!(cfg.to_features().len(), CONFIG_FEATURE_DIM);
         assert_eq!(CONFIG_FEATURE_DIM_V1, 142);
         assert_eq!(CONFIG_FEATURE_DIM_V2, 164);
