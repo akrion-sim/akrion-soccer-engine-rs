@@ -1277,12 +1277,54 @@ fn learned_mpc_replan_thresholds() -> LearnedMpcReplanThresholds {
 /// decisive learned preference lowers the boundary (give the preferred idea more execution
 /// latitude); a competitive second/third choice raises it. Policy learning therefore moves the
 /// rejection boundary from match outcomes, while the env knobs keep the calibration A/B-tunable.
+/// Whether the policy-competition contextual adjustment to the MPC reject bar is
+/// active this process. Off (unset) by default so the reject/replan gate stays exactly
+/// at the field-vector bar — byte-identical to the pre-contextual engine. Opt in with
+/// `DD_SOCCER_ENABLE_MPC_CONTEXT_THRESHOLD`, then tune via the `*_BLEND` / `*_MAX_DELTA`
+/// knobs.
+fn learned_mpc_context_threshold_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_MPC_CONTEXT_THRESHOLD")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_MPC_CONTEXT_THRESHOLD"))
+    }
+}
+
+/// Blend the field-vector reject bar toward/away from `base` by how much the POMDP's
+/// best legal ALTERNATIVE out-scores the ORIGINAL action: a clearly-better alternative
+/// raises the bar (reject the marginal original more readily), a comparably-ranked
+/// field barely moves it. Pure — the gate + candidate extraction live in the wrapper,
+/// so this is unit-testable without touching process env.
+fn contextual_rejection_threshold_blend(base: f64, original: f64, alternative: f64) -> f64 {
+    let blend = learned_mpc_probability_env(
+        "SOCCER_LEARNED_MPC_CONTEXT_THRESHOLD_BLEND",
+        LEARNED_MPC_CONTEXT_THRESHOLD_BLEND,
+    );
+    let max_delta = learned_mpc_probability_env(
+        "SOCCER_LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA",
+        LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA,
+    );
+    let learned_competition = (alternative - original).clamp(-1.0, 1.0);
+    (base + learned_competition * blend * max_delta).clamp(0.0, 1.0)
+}
+
+/// The MPC reject bar after the optional policy-competition adjustment. Gated off by
+/// default (`DD_SOCCER_ENABLE_MPC_CONTEXT_THRESHOLD`) ⇒ returns the field-vector bar
+/// unchanged, so the hard-replan decision is byte-identical to the pre-contextual gate.
 fn learned_mpc_contextual_rejection_threshold(
     base_threshold: f64,
     original_action: &str,
     ranked: &[SoccerLearnedActionTrace],
 ) -> f64 {
     let base = finite_unit_interval(base_threshold);
+    if !learned_mpc_context_threshold_enabled() {
+        return base;
+    }
     let original = ranked
         .iter()
         .find(|entry| entry.legal && learned_mpc_action_labels_match(&entry.label, original_action))
@@ -1297,16 +1339,7 @@ fn learned_mpc_contextual_rejection_threshold(
     let (Some(original), Some(alternative)) = (original, alternative) else {
         return base;
     };
-    let blend = learned_mpc_probability_env(
-        "SOCCER_LEARNED_MPC_CONTEXT_THRESHOLD_BLEND",
-        LEARNED_MPC_CONTEXT_THRESHOLD_BLEND,
-    );
-    let max_delta = learned_mpc_probability_env(
-        "SOCCER_LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA",
-        LEARNED_MPC_CONTEXT_THRESHOLD_MAX_DELTA,
-    );
-    let learned_competition = (alternative - original).clamp(-1.0, 1.0);
-    (base + learned_competition * blend * max_delta).clamp(0.0, 1.0)
+    contextual_rejection_threshold_blend(base, original, alternative)
 }
 
 /// The analytic per-family base MPC reject bar — the constant the global path uses,
