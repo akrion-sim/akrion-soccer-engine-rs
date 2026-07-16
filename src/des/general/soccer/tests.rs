@@ -17660,6 +17660,74 @@ fn whole_field_motion_block_feeds_all_players_into_the_neural_input() {
 }
 
 #[test]
+fn short_handed_field_vectors_preserve_team_slot_boundaries() {
+    let sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_212,
+        ..Default::default()
+    });
+    let actor_id = sim
+        .players
+        .iter()
+        .find(|player| player.team == Team::Home)
+        .expect("home actor")
+        .id;
+    let full_snapshot = WorldSnapshot::from_match(&sim);
+    let full_actor = soccer_field_player_motion_block(&full_snapshot, actor_id, Team::Home);
+    let full_central = soccer_central_critic_state(&full_snapshot);
+
+    let removed_home_id = full_snapshot
+        .players
+        .iter()
+        .filter(|player| player.team == Team::Home && player.id != actor_id)
+        .map(|player| player.id)
+        .max()
+        .expect("removable home player");
+    let mut short_handed = full_snapshot.clone();
+    short_handed
+        .players
+        .retain(|player| player.id != removed_home_id);
+
+    let reduced_actor = soccer_field_player_motion_block(&short_handed, actor_id, Team::Home);
+    let reduced_central = soccer_central_critic_state(&short_handed);
+    let per = SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+    let last_home = SOCCER_NEURAL_FIELD_MOTION_PLAYERS_PER_TEAM - 1;
+    let first_away = SOCCER_NEURAL_FIELD_MOTION_PLAYERS_PER_TEAM;
+    let slot = |values: &[f32], index: usize| values[index * per..(index + 1) * per].to_vec();
+
+    assert!(
+        slot(&reduced_actor, last_home)
+            .iter()
+            .all(|value| *value == 0.0),
+        "missing teammate must pad inside the teammate region"
+    );
+    assert_eq!(
+        slot(&reduced_actor, first_away),
+        slot(&full_actor, first_away),
+        "the first opponent must not slide into a teammate slot"
+    );
+    assert!(
+        slot(&reduced_central, last_home)
+            .iter()
+            .all(|value| *value == 0.0),
+        "central state must pad the short-handed Home region independently"
+    );
+    assert_eq!(
+        slot(&reduced_central, first_away),
+        slot(&full_central, first_away),
+        "central Away slots must stay fixed when Home is short-handed"
+    );
+
+    let full_relational = soccer_relational_attention_readout(&full_actor);
+    let reduced_relational = soccer_relational_attention_readout(&reduced_actor);
+    assert_eq!(
+        &reduced_relational[4..],
+        &full_relational[4..],
+        "unchanged opponents must produce the same opponent readout"
+    );
+}
+
+#[test]
 fn pomdp_q_state_and_player_decision_use_front_behind_field_context() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
@@ -98556,6 +98624,27 @@ fn relational_attention_readout_excludes_self_and_separates_teams() {
     // Opponent depth is negative (behind), and the opponent moving toward the actor closes in.
     assert!(r[4] < 0.0, "opponent depth {} should be behind", r[4]);
     assert!(r[6] > 0.0, "opponent closing {} should be positive", r[6]);
+}
+
+#[test]
+fn relational_attention_readout_ignores_zero_padded_entities() {
+    let teammates = [(0.0, 0.0, 0.0, 0.0), (0.4, 0.1, 0.0, 0.0)];
+    let opponents = [(-0.3, 0.0, 0.4, 0.0)];
+    let motion = relational_test_motion_block(&teammates, &opponents);
+    let readout = soccer_relational_attention_readout(&motion);
+
+    assert!(
+        (readout[0] - 0.4).abs() < 1e-6,
+        "padding must not pull teammate depth toward the actor: {}",
+        readout[0]
+    );
+    assert!(
+        (readout[4] + 0.3).abs() < 1e-6,
+        "padding must not pull opponent depth toward the actor: {}",
+        readout[4]
+    );
+    assert_eq!(readout[3], 0.0, "one real teammate has zero entropy");
+    assert_eq!(readout[7], 0.0, "one real opponent has zero entropy");
 }
 
 // --- Isolated attacking carrier: drive / hold-up instead of a panic backward pass --------------

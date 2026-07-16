@@ -4933,6 +4933,21 @@ fn push_policy_promotion_summary(
     }
 }
 
+fn policy_promotion_window_in_progress(
+    sample_games: usize,
+    gate: SoccerPolicyPromotionGateConfig,
+) -> bool {
+    gate.enabled && sample_games > 0
+}
+
+fn should_write_policy_version_for_promotion_window(
+    write_due: bool,
+    sample_games: usize,
+    gate: SoccerPolicyPromotionGateConfig,
+) -> bool {
+    write_due && (!gate.enabled || sample_games >= gate.min_sample_games)
+}
+
 fn clear_evolution_search_samples_after_postgres_refresh(
     event_label: &str,
     next_episode: usize,
@@ -10033,6 +10048,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         for offset in 0..batch_size {
             let episode = batch_start_episode + offset;
             if pg_refresh_for_new_sims {
+                // A promotion result is meaningful only when every summary in the evidence
+                // window belongs to one continuous local candidate. Refreshing the incumbent
+                // from Postgres between those games discards the candidate's learned state and
+                // resets evolutionary trials before they can reach the configured sample floor.
+                let preserve_local_promotion_candidate = local_evolution_trial_active
+                    || policy_promotion_window_in_progress(
+                        policy_promotion_summaries.len(),
+                        policy_promotion_gate,
+                    );
                 let mut pending_async_pg_batches = 0usize;
                 let mut pending_async_policy_version_batches = 0usize;
                 if let Some(writer) = pg_completed_writer.as_mut() {
@@ -10071,6 +10095,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                         }
                     }
                     if new_sim_refresh_plan.refresh_from_postgres
+                        && preserve_local_promotion_candidate
+                    {
+                        println!(
+                            "postgres_refresh_deferred_for_policy_trial next_episode={} sample_games={} min_sample_games={} local_evolution_trial_active={}",
+                            episode + 1,
+                            policy_promotion_summaries.len(),
+                            policy_promotion_gate.min_sample_games,
+                            local_evolution_trial_active,
+                        );
+                    }
+                    if new_sim_refresh_plan.refresh_from_postgres
+                        && !preserve_local_promotion_candidate
                         && refresh_postgres_policy_for_next_sim(
                             store,
                             experiment_id,
@@ -10694,7 +10730,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             if pg_experiment_id.is_some() {
                 let pg_game_base_policy_version_id = game.starting_policy_version_id.clone();
                 let completed_episode = game.episode_summary.episode + 1;
-                let should_write_policy_version = pg_policy_version_interval_games <= 1
+                let policy_version_write_due = pg_policy_version_interval_games <= 1
                     || completed_episode >= games
                     || completed_episode % pg_policy_version_interval_games == 0;
                 let curriculum_stage = soccer_learning_curriculum_stage_for_completed_games(
@@ -10744,6 +10780,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                         policy_promotion_min_mean_fitness_delta,
                         policy_promotion_max_mean_fitness_regression,
                         policy_promotion_max_play_quality_regression,
+                    );
+                }
+                let should_write_policy_version = should_write_policy_version_for_promotion_window(
+                    policy_version_write_due,
+                    policy_promotion_evaluation.sample_games,
+                    policy_promotion_gate,
+                );
+                if policy_version_write_due && !should_write_policy_version {
+                    println!(
+                        "policy_promotion_window_accumulating completed_games={} curriculum_stage={} sample_games={} min_sample_games={} write_deferred=true",
+                        completed_episode,
+                        curriculum_stage_label,
+                        policy_promotion_evaluation.sample_games,
+                        policy_promotion_gate.min_sample_games,
                     );
                 }
                 // Frozen-anchor gate (HEAD): the incumbent-adjusted status is then run through the
@@ -14808,7 +14858,7 @@ mod tests {
     fn continuous_manifest_uses_restart_safe_source_checkout() {
         assert_eq!(
             continuous_manifest_env_value("SOCCER_SOURCE_REPO"),
-            Some("https://github.com/akrion-sim/akrion-soccer-engine-rs.git")
+            Some("https://github.com/ORESoftware/soccer-sim-game-engine.rs.git")
         );
         assert_eq!(
             continuous_manifest_env_value("SOCCER_SOURCE_REF"),
@@ -15046,6 +15096,7 @@ mod tests {
             average_loss: Some(0.1),
             target_popart: None,
             policy_head: None,
+            central_critic_head: None,
             skill_policy_heads: None,
             keeper_policy_head: None,
             line_depth_head: None,
@@ -15537,6 +15588,62 @@ mod tests {
     }
 
     #[test]
+    fn promotion_window_defers_per_game_writes_until_the_sample_floor() {
+        let gate = SoccerPolicyPromotionGateConfig {
+            min_sample_games: 8,
+            ..Default::default()
+        };
+        let mut summaries = std::collections::VecDeque::new();
+        let mut writes = Vec::new();
+
+        for completed_games in 1..=8 {
+            push_policy_promotion_summary(
+                &mut summaries,
+                &MatchSummary {
+                    score_home: 1,
+                    score_away: 0,
+                    ticks: 10,
+                    simulated_seconds: 1.0,
+                    stats: Default::default(),
+                },
+                gate.min_sample_games,
+            );
+            let write =
+                should_write_policy_version_for_promotion_window(true, summaries.len(), gate);
+            if write {
+                writes.push(completed_games);
+                summaries.clear();
+            }
+        }
+
+        assert_eq!(writes, vec![8]);
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn promotion_window_preserves_candidate_continuity_until_evaluation() {
+        let gate = SoccerPolicyPromotionGateConfig {
+            min_sample_games: 8,
+            ..Default::default()
+        };
+
+        assert!(!policy_promotion_window_in_progress(0, gate));
+        assert!(policy_promotion_window_in_progress(1, gate));
+        assert!(policy_promotion_window_in_progress(7, gate));
+        assert!(policy_promotion_window_in_progress(8, gate));
+        assert!(policy_promotion_window_in_progress(16, gate));
+
+        let disabled = SoccerPolicyPromotionGateConfig {
+            enabled: false,
+            ..gate
+        };
+        assert!(!policy_promotion_window_in_progress(1, disabled));
+        assert!(should_write_policy_version_for_promotion_window(
+            true, 1, disabled
+        ));
+    }
+
+    #[test]
     fn policy_promotion_incumbent_baseline_decodes_metadata() {
         let metadata = serde_json::json!({
             "promotion": {
@@ -15971,6 +16078,7 @@ mod tests {
             average_loss: None,
             target_popart: None,
             policy_head: None,
+            central_critic_head: None,
             skill_policy_heads: None,
             keeper_policy_head: None,
             line_depth_head: None,

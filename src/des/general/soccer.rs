@@ -4545,6 +4545,7 @@ const SOCCER_NEURAL_BASE_FEATURE_DIM: usize = 192;
 /// 12-lane/24-row grid plus the smooth motion vector of all field entities, not
 /// just local aggregates.
 const SOCCER_NEURAL_FIELD_MOTION_PLAYERS: usize = 22;
+const SOCCER_NEURAL_FIELD_MOTION_PLAYERS_PER_TEAM: usize = SOCCER_NEURAL_FIELD_MOTION_PLAYERS / 2;
 const SOCCER_NEURAL_FIELD_MOTION_BALLS: usize = 1;
 const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER_V1: usize = 6;
 const SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER: usize = 8;
@@ -26617,56 +26618,61 @@ fn soccer_field_player_motion_block(
         .player_acceleration(actor_id)
         .unwrap_or_else(Vec2::zero);
     let actor_jerk = snapshot.player_jerk(actor_id).unwrap_or_else(Vec2::zero);
-    let mut ordered: Vec<(usize, bool)> = snapshot
-        .players
-        .iter()
-        .map(|player| (player.id, player.team == actor_team))
-        .collect();
-    // Own team (true) first, then opponents; each by ascending id for a stable layout.
-    ordered.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut block = Vec::with_capacity(SOCCER_NEURAL_FIELD_MOTION_DIM);
-    let mut player_slots = 0usize;
-    for (id, _own) in ordered {
-        if player_slots >= SOCCER_NEURAL_FIELD_MOTION_PLAYERS {
-            break;
+    // Own team first, then opponents, with each team independently sorted and padded into
+    // an immutable 11-slot region. Padding only the combined 22-player list lets the first
+    // opponent slide into a teammate slot in short-handed/tracking snapshots, corrupting both
+    // the flat neural input and the relational teammate/opponent split.
+    for team in [actor_team, actor_team.other()] {
+        let mut ids = snapshot
+            .players
+            .iter()
+            .filter(|player| player.team == team)
+            .map(|player| player.id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        let populated_slots = ids.len().min(SOCCER_NEURAL_FIELD_MOTION_PLAYERS_PER_TEAM);
+        for id in ids
+            .into_iter()
+            .take(SOCCER_NEURAL_FIELD_MOTION_PLAYERS_PER_TEAM)
+        {
+            // POMDP hardening: feed the actor's PERCEIVED position of each other player
+            // (mislocated for low-confidence / occluded targets via the Kalman perception
+            // model) rather than ground truth, so the neural policy/value condition on what
+            // the actor can actually see — not a privileged god-view of all 22. Gated by the
+            // existing `DD_SOCCER_ENABLE_PERCEPTION_NOISE`; OFF (default) keeps the exact true
+            // position (byte-identical). The actor sees itself exactly (the method returns the
+            // true position for `observer == target`); motion (vel/acc/jerk) stays exact, as
+            // the perception model only estimates position.
+            let pos = if perception_noise_enabled() {
+                snapshot
+                    .perceived_player_position(actor_id, id)
+                    .unwrap_or(actor_pos)
+            } else {
+                snapshot.player_position(id).unwrap_or(actor_pos)
+            };
+            let vel = snapshot.player_velocity(id).unwrap_or_else(Vec2::zero);
+            let acc = snapshot.player_acceleration(id).unwrap_or_else(Vec2::zero);
+            let jerk = snapshot.player_jerk(id).unwrap_or_else(Vec2::zero);
+            push_soccer_field_motion_entity(
+                &mut block,
+                pos,
+                vel,
+                acc,
+                jerk,
+                actor_pos,
+                actor_velocity,
+                actor_acceleration,
+                actor_jerk,
+                snapshot.field_length,
+                snapshot.field_width,
+                dir,
+                relative_kinematics,
+            );
         }
-        // POMDP hardening: feed the actor's PERCEIVED position of each other player
-        // (mislocated for low-confidence / occluded targets via the Kalman perception
-        // model) rather than ground truth, so the neural policy/value condition on what
-        // the actor can actually see — not a privileged god-view of all 22. Gated by the
-        // existing `DD_SOCCER_ENABLE_PERCEPTION_NOISE`; OFF (default) keeps the exact true
-        // position (byte-identical). The actor sees itself exactly (the method returns the
-        // true position for `observer == target`); motion (vel/acc/jerk) stays exact, as
-        // the perception model only estimates position.
-        let pos = if perception_noise_enabled() {
-            snapshot
-                .perceived_player_position(actor_id, id)
-                .unwrap_or(actor_pos)
-        } else {
-            snapshot.player_position(id).unwrap_or(actor_pos)
-        };
-        let vel = snapshot.player_velocity(id).unwrap_or_else(Vec2::zero);
-        let acc = snapshot.player_acceleration(id).unwrap_or_else(Vec2::zero);
-        let jerk = snapshot.player_jerk(id).unwrap_or_else(Vec2::zero);
-        push_soccer_field_motion_entity(
-            &mut block,
-            pos,
-            vel,
-            acc,
-            jerk,
-            actor_pos,
-            actor_velocity,
-            actor_acceleration,
-            actor_jerk,
-            snapshot.field_length,
-            snapshot.field_width,
-            dir,
-            relative_kinematics,
-        );
-        player_slots += 1;
-    }
-    for _ in player_slots..SOCCER_NEURAL_FIELD_MOTION_PLAYERS {
-        block.extend([0.0; SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER]);
+        for _ in populated_slots..SOCCER_NEURAL_FIELD_MOTION_PLAYERS_PER_TEAM {
+            block.extend([0.0; SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER]);
+        }
     }
     push_soccer_field_motion_entity(
         &mut block,
@@ -26765,16 +26771,6 @@ pub(crate) fn dd_soccer_enable_central_critic_v2() -> bool {
 /// in a single fixed Home-attacking pitch frame. Unlike the POMDP block this is
 /// intentionally privileged and must never be appended to actor features.
 fn soccer_central_critic_state(snapshot: &WorldSnapshot) -> Vec<f32> {
-    let mut players = snapshot.players.iter().collect::<Vec<_>>();
-    players.sort_by(|left, right| {
-        let team_key = |team: Team| match team {
-            Team::Home => 0usize,
-            Team::Away => 1usize,
-        };
-        team_key(left.team)
-            .cmp(&team_key(right.team))
-            .then(left.id.cmp(&right.id))
-    });
     let mut out = Vec::with_capacity(SOCCER_CENTRAL_CRITIC_FEATURE_DIM);
     let push_entity =
         |out: &mut Vec<f32>, position: Vec2, velocity: Vec2, acceleration: Vec2, jerk: Vec2| {
@@ -26789,23 +26785,39 @@ fn soccer_central_critic_state(snapshot: &WorldSnapshot) -> Vec<f32> {
             out.push(soccer_neural_scaled(jerk.x, 40.0) as f32);
             out.push(soccer_neural_scaled(jerk.y, 40.0) as f32);
         };
-    for player in players.into_iter().take(SOCCER_NEURAL_FIELD_MOTION_PLAYERS) {
-        push_entity(
-            &mut out,
-            snapshot
-                .player_position(player.id)
-                .unwrap_or(player.position),
-            snapshot
-                .player_velocity(player.id)
-                .unwrap_or(player.velocity),
-            snapshot
-                .player_acceleration(player.id)
-                .unwrap_or(player.acceleration),
-            snapshot.player_jerk(player.id).unwrap_or(player.jerk),
-        );
-    }
-    while out.len() < SOCCER_NEURAL_FIELD_MOTION_PLAYERS * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER {
-        out.extend([0.0; SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER]);
+    // Preserve the Home/Away boundary even when a captured state is short-handed. This is the
+    // centralized analogue of the actor-relative block's independent per-team padding.
+    for team in [Team::Home, Team::Away] {
+        let mut players = snapshot
+            .players
+            .iter()
+            .filter(|player| player.team == team)
+            .collect::<Vec<_>>();
+        players.sort_by_key(|player| player.id);
+        let populated_slots = players
+            .len()
+            .min(SOCCER_NEURAL_FIELD_MOTION_PLAYERS_PER_TEAM);
+        for player in players
+            .into_iter()
+            .take(SOCCER_NEURAL_FIELD_MOTION_PLAYERS_PER_TEAM)
+        {
+            push_entity(
+                &mut out,
+                snapshot
+                    .player_position(player.id)
+                    .unwrap_or(player.position),
+                snapshot
+                    .player_velocity(player.id)
+                    .unwrap_or(player.velocity),
+                snapshot
+                    .player_acceleration(player.id)
+                    .unwrap_or(player.acceleration),
+                snapshot.player_jerk(player.id).unwrap_or(player.jerk),
+            );
+        }
+        for _ in populated_slots..SOCCER_NEURAL_FIELD_MOTION_PLAYERS_PER_TEAM {
+            out.extend([0.0; SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER]);
+        }
     }
     push_entity(
         &mut out,
@@ -46892,6 +46904,12 @@ fn soccer_relational_attention_readout(
             f64::from(motion[base + 3]),
         )
     };
+    let is_padding = |slot: usize| {
+        let base = slot * per;
+        motion[base..base + per]
+            .iter()
+            .all(|value| value.abs() <= f32::EPSILON)
+    };
     // Identify the actor's own slot (nearest the origin among teammates) to exclude it.
     let mut self_slot = 0usize;
     let mut self_dist = f64::INFINITY;
@@ -46903,9 +46921,12 @@ fn soccer_relational_attention_readout(
             self_slot = slot;
         }
     }
-    let teammates: Vec<(f64, f64, f64, f64)> =
-        (0..half).filter(|&s| s != self_slot).map(entity).collect();
+    let teammates: Vec<(f64, f64, f64, f64)> = (0..half)
+        .filter(|&slot| slot != self_slot && !is_padding(slot))
+        .map(entity)
+        .collect();
     let opponents: Vec<(f64, f64, f64, f64)> = (half..SOCCER_NEURAL_FIELD_MOTION_PLAYERS)
+        .filter(|&slot| !is_padding(slot))
         .map(entity)
         .collect();
     let (td, tw, tc, te) = soccer_relational_attention_group(&teammates);
