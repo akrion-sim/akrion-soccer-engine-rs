@@ -718,7 +718,6 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     );
 
     for round in 1..=generations {
-        let round_start = challenger.clone();
         // MIXED OPPONENT: most iterations train against the current champion
         // (self-play), but every `anchor_every`-th iteration trains against the
         // scripted baseline (champion = None) so the challenger keeps practising
