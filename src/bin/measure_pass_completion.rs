@@ -22,9 +22,15 @@ fn main() {
     let seeds: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
     let mpc_on = std::env::var("SOCCER_MEASURE_MPC").ok().as_deref() == Some("1");
 
-    let (mut att, mut comp, mut fwd, mut back) = (0u64, 0u64, 0u64, 0u64);
-    let (mut att_fwd, mut att_back) = (0u64, 0u64);
-    let (mut comp_fwd_intent, mut comp_back_intent) = (0u64, 0u64);
+    let (mut att, mut comp) = (0u64, 0u64);
+    let (mut fwd_att, mut fwd_comp) = (0u64, 0u64);
+    let (mut lat_att, mut lat_comp) = (0u64, 0u64);
+    let (mut back_att, mut back_comp) = (0u64, 0u64);
+    let (mut fwd_intent_comp, mut back_intent_comp) = (0u64, 0u64);
+    let (mut intentional_att, mut intentional_comp) = (0u64, 0u64);
+    let (mut intentional_fwd_att, mut intentional_fwd_comp) = (0u64, 0u64);
+    let (mut intentional_lat_att, mut intentional_lat_comp) = (0u64, 0u64);
+    let (mut intentional_back_att, mut intentional_back_comp) = (0u64, 0u64);
     let mut per_match_rate: Vec<f64> = Vec::new();
 
     for s in 0..seeds {
@@ -43,17 +49,43 @@ fn main() {
         let c = (sim.stats.passes_completed_home + sim.stats.passes_completed_away) as u64;
         att += a;
         comp += c;
-        fwd += (sim.stats.passes_completed_forward_home + sim.stats.passes_completed_forward_away)
-            as u64;
-        back += (sim.stats.passes_completed_backward_home
-            + sim.stats.passes_completed_backward_away) as u64;
-        att_fwd += (sim.stats.passes_attempted_forward_home
+        fwd_att += (sim.stats.passes_attempted_forward_home
             + sim.stats.passes_attempted_forward_away) as u64;
-        att_back += (sim.stats.passes_attempted_backward_home
+        fwd_comp += (sim.stats.passes_completed_forward_home
+            + sim.stats.passes_completed_forward_away) as u64;
+        lat_att += (sim.stats.passes_attempted_lateral_home
+            + sim.stats.passes_attempted_lateral_away) as u64;
+        lat_comp += (sim.stats.passes_completed_lateral_home
+            + sim.stats.passes_completed_lateral_away) as u64;
+        back_att += (sim.stats.passes_attempted_backward_home
             + sim.stats.passes_attempted_backward_away) as u64;
-        comp_fwd_intent += (sim.stats.passes_completed_forward_intent_home
+        back_comp += (sim.stats.passes_completed_backward_home
+            + sim.stats.passes_completed_backward_away) as u64;
+        intentional_att += (sim.stats.intentional_passes_attempted_home
+            + sim.stats.intentional_passes_attempted_away) as u64;
+        intentional_comp += (sim.stats.intentional_passes_completed_home
+            + sim.stats.intentional_passes_completed_away) as u64;
+        intentional_fwd_att += (sim.stats.intentional_passes_attempted_forward_home
+            + sim.stats.intentional_passes_attempted_forward_away)
+            as u64;
+        intentional_fwd_comp += (sim.stats.intentional_passes_completed_forward_home
+            + sim.stats.intentional_passes_completed_forward_away)
+            as u64;
+        intentional_lat_att += (sim.stats.intentional_passes_attempted_lateral_home
+            + sim.stats.intentional_passes_attempted_lateral_away)
+            as u64;
+        intentional_lat_comp += (sim.stats.intentional_passes_completed_lateral_home
+            + sim.stats.intentional_passes_completed_lateral_away)
+            as u64;
+        intentional_back_att += (sim.stats.intentional_passes_attempted_backward_home
+            + sim.stats.intentional_passes_attempted_backward_away)
+            as u64;
+        intentional_back_comp += (sim.stats.intentional_passes_completed_backward_home
+            + sim.stats.intentional_passes_completed_backward_away)
+            as u64;
+        fwd_intent_comp += (sim.stats.passes_completed_forward_intent_home
             + sim.stats.passes_completed_forward_intent_away) as u64;
-        comp_back_intent += (sim.stats.passes_completed_backward_intent_home
+        back_intent_comp += (sim.stats.passes_completed_backward_intent_home
             + sim.stats.passes_completed_backward_intent_away) as u64;
         if a > 0 {
             per_match_rate.push(c as f64 / a as f64);
@@ -91,32 +123,47 @@ fn main() {
         mean_pm + 1.96 * se
     );
     println!(
-        "forward completed = {fwd}  backward completed = {back}  forward-share = {:.3}",
-        fwd as f64 / comp.max(1) as f64
+        "realized completion direction: forward={} lateral={} backward={} (forward-gain share {:.3})",
+        fwd_comp,
+        lat_comp,
+        back_comp,
+        fwd_comp as f64 / comp.max(1) as f64,
     );
-    // Per-direction completion RATES against the training targets
-    // (~85% forward / ~95% backward / ~90% overall). BOTH sides of each rate
-    // use the LAUNCH-intent classifier (intended target vs origin), so the
-    // ratio is a true rate. The realized-direction line below re-buckets the
-    // same completions by actual reception — the gap between "forward intent"
-    // and "realized forward gain" is the under-hit-forward-ball diagnostic
-    // (receivers checking back to collect shrink realized gain to lateral).
     println!(
-        "DIRECTION RATES (launch-intent): forward {}/{} = {:.4} (target 0.85)  backward {}/{} = {:.4} (target 0.95)  overall {:.4} (target 0.90)",
-        comp_fwd_intent,
-        att_fwd,
-        comp_fwd_intent as f64 / att_fwd.max(1) as f64,
-        comp_back_intent,
-        att_back,
-        comp_back_intent as f64 / att_back.max(1) as f64,
+        "intentional: completed={}/{} ({:.1}%, target 90%); forward={}/{} ({:.1}%, target 85%) lateral={}/{} ({:.1}%) backward={}/{} ({:.1}%, target 95%)",
+        intentional_comp,
+        intentional_att,
+        completion_percent(intentional_comp, intentional_att),
+        intentional_fwd_comp,
+        intentional_fwd_att,
+        completion_percent(intentional_fwd_comp, intentional_fwd_att),
+        intentional_lat_comp,
+        intentional_lat_att,
+        completion_percent(intentional_lat_comp, intentional_lat_att),
+        intentional_back_comp,
+        intentional_back_att,
+        completion_percent(intentional_back_comp, intentional_back_att),
+    );
+    // Per-direction completion rates use the launch-intent classifier on both
+    // sides. Realized reception direction stays separate above, so the gap is
+    // an under-hit/receiver-checking-back diagnostic rather than a bad ratio.
+    let lateral_intent_comp = comp.saturating_sub(fwd_intent_comp + back_intent_comp);
+    println!(
+        "DIRECTION RATES (launch-intent): forward {}/{} = {:.4} (target 0.85)  lateral {}/{} = {:.4}  backward {}/{} = {:.4} (target 0.95)  overall {:.4} (target 0.90)",
+        fwd_intent_comp,
+        fwd_att,
+        fwd_intent_comp as f64 / fwd_att.max(1) as f64,
+        lateral_intent_comp,
+        lat_att,
+        lateral_intent_comp as f64 / lat_att.max(1) as f64,
+        back_intent_comp,
+        back_att,
+        back_intent_comp as f64 / back_att.max(1) as f64,
         rate
     );
-    println!(
-        "REALIZED direction of completions: forward {} backward {} lateral {} (forward-gain share {:.3})",
-        fwd,
-        back,
-        comp.saturating_sub(fwd + back),
-        fwd as f64 / comp.max(1) as f64
-    );
     println!("END");
+}
+
+fn completion_percent(completed: u64, attempted: u64) -> f64 {
+    100.0 * completed as f64 / attempted.max(1) as f64
 }

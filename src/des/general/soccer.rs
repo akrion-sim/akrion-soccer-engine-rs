@@ -1170,12 +1170,10 @@ const TEAMWORK_PROGRESS_MIN_CREDIT: f64 = 0.024;
 /// search may tune contextual pass/shot/movement weights, but a conversion is
 /// always worth exactly 500 base points.
 const GOAL_REWARD_POINTS: f64 = 500.0;
-/// Reduced reward pool for a goal scored directly off a turnover — a single
-/// scoring-team player touched the ball between winning it from the opponent and
-/// finishing. There is no build-up play to credit, only the steal-and-finish, so
-/// the goal distributes less than the full [`GOAL_REWARD_POINTS`] while still
-/// staying above any non-goal outcome.
-const DIRECT_TURNOVER_GOAL_REWARD_POINTS: f64 = 250.0;
+/// A conversion keeps the same sparse anchor even when it follows a direct
+/// turnover. Context determines who receives the pool, never whether the goal
+/// itself is worth less.
+const DIRECT_TURNOVER_GOAL_REWARD_POINTS: f64 = GOAL_REWARD_POINTS;
 const GOAL_CONTEXT_CREDIT_MIN_PLAYERS: usize = 3;
 const GOAL_CONTEXT_CREDIT_MAX_PLAYERS: usize = 5;
 const GOAL_CONTEXT_CREDIT_SCAN_ACTIONS: usize = 48;
@@ -1634,7 +1632,9 @@ const PRESSURED_CONTESTED_PASS_DAMP: f64 = 0.40;
 // clears it instead).
 const BACKWARD_PASS_MIN_FORWARD_YARDS: f64 = 1.0;
 // ~openness 0.2 on the (distance-2.5)/7.5 openness curve: a backward ball is only safe
-// to a teammate with at least this much space from the nearest opponent.
+// to a teammate with at least this much space from the nearest opponent. Deeper safety
+// comes from the lane/race vetoes; strict learned-receiver fallback prevents an all-covered
+// target set from forcing the ball into one of those marked receivers.
 const BACKWARD_PASS_COVERED_RADIUS_YARDS: f64 = 4.0;
 // A short backward drop (≤5yd) keeps the ball safe and recyclable; a LONG backward pass
 // (>5yd) concedes territory and should be a last resort. The escalating per-yard demerit for
@@ -20496,9 +20496,34 @@ pub struct MatchStats {
     pub intentional_passes_completed_home: u32,
     #[serde(default)]
     pub intentional_passes_completed_away: u32,
-    // Completed passes split by direction (forward vs backward relative to the
-    // attacking goal). Lets us see how much of the high completion rate is safe
-    // backward/square recycling vs genuine forward progression.
+    // Attempts and completions split by intended direction relative to the attacking
+    // goal. The same launch-time category is retained through reception, which makes
+    // forward/backward completion rates valid denominators instead of mixing an
+    // intended forward pass with a receiver's later movement.
+    #[serde(default)]
+    pub passes_attempted_forward_home: u32,
+    #[serde(default)]
+    pub passes_attempted_forward_away: u32,
+    #[serde(default)]
+    pub passes_attempted_lateral_home: u32,
+    #[serde(default)]
+    pub passes_attempted_lateral_away: u32,
+    #[serde(default)]
+    pub passes_attempted_backward_home: u32,
+    #[serde(default)]
+    pub passes_attempted_backward_away: u32,
+    #[serde(default)]
+    pub intentional_passes_attempted_forward_home: u32,
+    #[serde(default)]
+    pub intentional_passes_attempted_forward_away: u32,
+    #[serde(default)]
+    pub intentional_passes_attempted_lateral_home: u32,
+    #[serde(default)]
+    pub intentional_passes_attempted_lateral_away: u32,
+    #[serde(default)]
+    pub intentional_passes_attempted_backward_home: u32,
+    #[serde(default)]
+    pub intentional_passes_attempted_backward_away: u32,
     #[serde(default)]
     pub passes_completed_forward_home: u32,
     #[serde(default)]
@@ -20508,6 +20533,10 @@ pub struct MatchStats {
     #[serde(default)]
     pub passes_completed_backward_away: u32,
     #[serde(default)]
+    pub passes_completed_lateral_home: u32,
+    #[serde(default)]
+    pub passes_completed_lateral_away: u32,
+    #[serde(default)]
     pub intentional_passes_completed_forward_home: u32,
     #[serde(default)]
     pub intentional_passes_completed_forward_away: u32,
@@ -20515,20 +20544,10 @@ pub struct MatchStats {
     pub intentional_passes_completed_backward_home: u32,
     #[serde(default)]
     pub intentional_passes_completed_backward_away: u32,
-    // Attempted passes split by direction AT LAUNCH (intended target vs origin,
-    // same ±1.25yd lateral deadband as the completion split). Together with the
-    // completed-by-direction counters these give per-direction completion
-    // RATES — the training targets are ~85% forward / ~95% backward (~90%
-    // overall). A deflected ball may complete in a different direction than it
-    // was attempted; rates are therefore approximate at the margin.
     #[serde(default)]
-    pub passes_attempted_forward_home: u32,
+    pub intentional_passes_completed_lateral_home: u32,
     #[serde(default)]
-    pub passes_attempted_forward_away: u32,
-    #[serde(default)]
-    pub passes_attempted_backward_home: u32,
-    #[serde(default)]
-    pub passes_attempted_backward_away: u32,
+    pub intentional_passes_completed_lateral_away: u32,
     // Completed passes bucketed by the SAME launch-intent classifier as the
     // attempted-by-direction counters, so completed/attempted per direction is
     // a true rate. The reception-based completed_forward/backward counters
@@ -21807,10 +21826,14 @@ fn parse_reward_kind_scales(raw: &str) -> std::collections::HashMap<String, f64>
     raw.split(',')
         .filter_map(|entry| {
             let (name, value) = entry.split_once('=')?;
+            let name = name.trim();
+            if name == "Goal" {
+                return None;
+            }
             let scale = value.trim().parse::<f64>().ok()?;
             scale
                 .is_finite()
-                .then(|| (name.trim().to_string(), scale.clamp(0.0001, 4.0)))
+                .then(|| (name.to_string(), scale.clamp(0.0001, 4.0)))
         })
         .collect()
 }
@@ -21824,7 +21847,7 @@ mod reward_kind_calibration_tests {
         let scales = parse_reward_kind_scales(
             "Goal=9,BadPassChainPenalty=1.25,CompletedForwardPass=-2,bad,KeeperSave=NaN",
         );
-        assert_eq!(scales.get("Goal"), Some(&4.0));
+        assert!(!scales.contains_key("Goal"));
         assert_eq!(scales.get("BadPassChainPenalty"), Some(&1.25));
         assert_eq!(scales.get("CompletedForwardPass"), Some(&0.0001));
         assert!(!scales.contains_key("KeeperSave"));
@@ -73239,8 +73262,8 @@ mod reward_priority_tests {
             "any goal reward should outrank a shot on target"
         );
         assert!(
-            DIRECT_TURNOVER_GOAL_REWARD_POINTS < GOAL_REWARD_POINTS,
-            "full goal reward should outrank direct-turnover goal pool"
+            (DIRECT_TURNOVER_GOAL_REWARD_POINTS - GOAL_REWARD_POINTS).abs() <= f64::EPSILON,
+            "every conversion should preserve the fixed goal reward"
         );
         assert!(
             BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS

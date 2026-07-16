@@ -6226,6 +6226,89 @@ mod tests {
     }
 
     #[test]
+    fn learned_receiver_never_falls_back_to_an_all_conceded_target_set() {
+        let _env_lock = soccer_world_env_lock();
+        let _strict_gate = set_test_env_var(
+            "DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER_STRICT_FALLBACK",
+            "0",
+        );
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let actor_index = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let actor_id = sim.players[actor_index].id;
+        let target_indices = sim
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, player)| {
+                player.team == Team::Home
+                    && player.id != actor_id
+                    && player.role != PlayerRole::Goalkeeper
+            })
+            .map(|(index, _)| index)
+            .take(2)
+            .collect::<Vec<_>>();
+        let marker_indices = sim
+            .players
+            .iter()
+            .enumerate()
+            .filter(|(_, player)| player.team == Team::Away)
+            .map(|(index, _)| index)
+            .take(2)
+            .collect::<Vec<_>>();
+        let target_positions = [Vec2::new(38.0, 45.0), Vec2::new(42.0, 45.0)];
+        sim.players[actor_index].position = Vec2::new(40.0, 50.0);
+        sim.ball.holder = Some(actor_id);
+        sim.ball.position = sim.players[actor_index].position;
+        for player in &mut sim.players {
+            player.velocity = Vec2::zero();
+            if player.team == Team::Away {
+                player.position = Vec2::new(75.0, 10.0);
+            }
+        }
+        for ((target_index, marker_index), position) in target_indices
+            .iter()
+            .zip(&marker_indices)
+            .zip(target_positions)
+        {
+            sim.players[*target_index].position = position;
+            sim.players[*marker_index].position = position;
+        }
+        let targets = target_indices
+            .iter()
+            .map(|index| sim.players[*index].id)
+            .collect::<Vec<_>>();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let policy = SoccerQPolicy::default();
+        let ranked = policy.ranked_pass_teammates_for_snapshot(
+            &snapshot,
+            actor_id,
+            "pass",
+            PassFlight::Floor,
+            &targets,
+        );
+        assert!(ranked.iter().all(|entry| entry.concedes));
+
+        let (target_player, target_point, replan) = SoccerMatch::learned_pass_receiver_selection(
+            &policy,
+            &snapshot,
+            actor_id,
+            "pass",
+            PassFlight::Floor,
+            &targets,
+        );
+        assert_eq!(target_player, None);
+        assert_eq!(target_point, None);
+        assert!(
+            replan.is_some(),
+            "the unsafe choice must remain a learning counterexample"
+        );
+    }
+
+    #[test]
     fn learned_space_pass_has_mpc_probability_when_runner_can_reach_it() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
         let actor = sim
@@ -21463,6 +21546,11 @@ impl SoccerMatch {
         let mut rejected_count = 0usize;
         let mut first_rejected_probability: Option<f64> = None;
         for entry in &ranked {
+            if entry.concedes {
+                rejected_count = rejected_count.saturating_add(1);
+                first_rejected_probability.get_or_insert(0.0);
+                continue;
+            }
             let position = snapshot.player_position(entry.player_id);
             let probability = acceptance_probability(Some(entry.player_id), position);
             if probability >= net_forward_quality_threshold {
@@ -21538,7 +21626,10 @@ impl SoccerMatch {
         // Nothing MPC-feasible: hand back the head's top choice so the action-level replan can
         // decide whether to keep passing or switch families, but keep the rejection trace so the
         // learner sees a real negative counterexample even if no replacement family is available.
-        let fallback = ranked.first().map(|entry| entry.player_id);
+        let fallback = ranked
+            .iter()
+            .find(|entry| !entry.concedes)
+            .map(|entry| entry.player_id);
         let fallback_point = fallback.and_then(|id| snapshot.player_position(id));
         let replan = first_rejected_probability.map(|rejected_probability| {
             receiver_kickback_trace(rejected_probability, rejected_count)
@@ -29395,6 +29486,10 @@ impl SoccerMatch {
                 SoccerRewardEventKind::Goal,
             );
         }
+        // The typed Goal event above is the one authoritative 500-point conversion
+        // signal. GAE propagates it backward through the episode; adding separate
+        // direct-shot and contextual deferred copies here silently counted the same
+        // goal two or three times and made its effective value depend on history.
         self.update_mpc_latent_objective(scoring_team, None, Some(1.0), Some(1.0));
         self.record_recent_defensive_goal_penalties(scoring_team.other());
     }
@@ -33365,6 +33460,15 @@ impl SoccerMatch {
                     if intentional_distinct_target {
                         self.stat_intentional_pass_attempt(player_team);
                     }
+                    let pass_forward_yards =
+                        (release_target.y - player_pos.y) * player_team.attack_dir();
+                    self.stat_pass_attempt_direction(player_team, pass_forward_yards);
+                    if intentional_distinct_target {
+                        self.stat_intentional_pass_attempt_direction(
+                            player_team,
+                            pass_forward_yards,
+                        );
+                    }
                     let attempt_own_half = self.pass_from_own_half(player_team, player_pos);
                     self.stat_pass_attempt_half(attempt_own_half);
                     // PENALTY: an isolated attacking carrier who panicked a backward/square ball
@@ -33388,8 +33492,6 @@ impl SoccerMatch {
                     // `record_progressive_carry_outcome_reward` (on pass completion); the live carry
                     // tracker here only feeds the per-tick SUSTAINED-dribble reward and resets itself
                     // when the ball leaves the carrier.
-                    let pass_forward_yards =
-                        (release_target.y - player_pos.y) * player_team.attack_dir();
                     // BACKWARD-PASS DISCIPLINE (penalty): a pass played backward (toward our own
                     // goal) is only justified under genuine high pressure — an opponent within
                     // BACKWARD_PASS_HIGH_PRESSURE_RADIUS of the passer (the case near the
@@ -36885,7 +36987,12 @@ impl SoccerMatch {
                                 (pass.intended_target.y - pass.origin.y) * team.attack_dir();
                             self.stat_pass_completed_intent_direction(team, launch_forward_yards);
                             if pass.target.is_some_and(|target| target != pass.from) {
-                                self.stat_intentional_pass_completed_direction(team, forward_yards);
+                                self.stat_intentional_pass_completed_direction(
+                                    team,
+                                    (pass.intended_target.y - pass.origin.y)
+                                        * pass.team.attack_dir(),
+                                    forward_yards,
+                                );
                                 self.stat_intentional_pass_completed(team);
                             }
                             let own_half = self.pass_from_own_half(pass.team, pass.origin);
@@ -39308,24 +39415,6 @@ impl SoccerMatch {
         }
     }
 
-    /// Record the direction of a pass ATTEMPT at launch (intended target vs
-    /// origin, ±1.25yd lateral deadband — mirrors
-    /// `stat_pass_completed_direction`) so per-direction completion RATES are
-    /// measurable, not only the completed-pass direction mix.
-    fn stat_pass_attempt_direction(&mut self, team: Team, forward_yards: f64) {
-        if forward_yards > 1.25 {
-            match team {
-                Team::Home => self.stats.passes_attempted_forward_home += 1,
-                Team::Away => self.stats.passes_attempted_forward_away += 1,
-            }
-        } else if forward_yards < -1.25 {
-            match team {
-                Team::Home => self.stats.passes_attempted_backward_home += 1,
-                Team::Away => self.stats.passes_attempted_backward_away += 1,
-            }
-        }
-    }
-
     /// Completion counted under the LAUNCH-intent classifier (see the
     /// `passes_completed_*_intent_*` field docs): completed/attempted per
     /// direction is only a true rate when both sides use the same bucketing.
@@ -39350,6 +39439,44 @@ impl SoccerMatch {
         }
     }
 
+    fn stat_pass_attempt_direction(&mut self, team: Team, intended_forward_yards: f64) {
+        if intended_forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.passes_attempted_forward_home += 1,
+                Team::Away => self.stats.passes_attempted_forward_away += 1,
+            }
+        } else if intended_forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.passes_attempted_backward_home += 1,
+                Team::Away => self.stats.passes_attempted_backward_away += 1,
+            }
+        } else {
+            match team {
+                Team::Home => self.stats.passes_attempted_lateral_home += 1,
+                Team::Away => self.stats.passes_attempted_lateral_away += 1,
+            }
+        }
+    }
+
+    fn stat_intentional_pass_attempt_direction(&mut self, team: Team, intended_forward_yards: f64) {
+        if intended_forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.intentional_passes_attempted_forward_home += 1,
+                Team::Away => self.stats.intentional_passes_attempted_forward_away += 1,
+            }
+        } else if intended_forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.intentional_passes_attempted_backward_home += 1,
+                Team::Away => self.stats.intentional_passes_attempted_backward_away += 1,
+            }
+        } else {
+            match team {
+                Team::Home => self.stats.intentional_passes_attempted_lateral_home += 1,
+                Team::Away => self.stats.intentional_passes_attempted_lateral_away += 1,
+            }
+        }
+    }
+
     fn stat_pass_completed(&mut self, team: Team) {
         match team {
             Team::Home => self.stats.passes_completed_home += 1,
@@ -39364,39 +39491,58 @@ impl SoccerMatch {
         }
     }
 
-    /// Record the direction of a completed pass (forward/backward along the attacking
-    /// axis). Lateral balls (within the ±1.25yd deadband used by pass scoring) count as
-    /// neither. Diagnostic only — surfaces how much completion is forward progression.
-    fn stat_pass_completed_direction(&mut self, team: Team, forward_yards: f64) {
-        if forward_yards > 1.25 {
+    /// Record the realized reception direction separately from launch intent.
+    /// This exposes under-hit forward balls while the dedicated intent counters
+    /// retain a valid completed/attempted rate for each launch direction.
+    fn stat_pass_completed_direction(&mut self, team: Team, completed_forward_yards: f64) {
+        if completed_forward_yards > 1.25 {
             match team {
                 Team::Home => self.stats.passes_completed_forward_home += 1,
                 Team::Away => self.stats.passes_completed_forward_away += 1,
             }
-        } else if forward_yards < -1.25 {
+        } else if completed_forward_yards < -1.25 {
             match team {
                 Team::Home => self.stats.passes_completed_backward_home += 1,
                 Team::Away => self.stats.passes_completed_backward_away += 1,
             }
+        } else {
+            match team {
+                Team::Home => self.stats.passes_completed_lateral_home += 1,
+                Team::Away => self.stats.passes_completed_lateral_away += 1,
+            }
         }
-        self.accumulate_pass_chain_metrics(team, forward_yards);
+        self.accumulate_pass_chain_metrics(team, completed_forward_yards);
     }
 
-    fn stat_intentional_pass_completed_direction(&mut self, team: Team, forward_yards: f64) {
-        if forward_yards > 1.25 {
+    fn stat_intentional_pass_completed_direction(
+        &mut self,
+        team: Team,
+        intended_forward_yards: f64,
+        completed_forward_yards: f64,
+    ) {
+        if intended_forward_yards > 1.25 {
             match team {
                 Team::Home => self.stats.intentional_passes_completed_forward_home += 1,
                 Team::Away => self.stats.intentional_passes_completed_forward_away += 1,
             }
-        } else if forward_yards < -1.25 {
+        } else if intended_forward_yards < -1.25 {
             match team {
                 Team::Home => self.stats.intentional_passes_completed_backward_home += 1,
                 Team::Away => self.stats.intentional_passes_completed_backward_away += 1,
             }
+        } else {
+            match team {
+                Team::Home => self.stats.intentional_passes_completed_lateral_home += 1,
+                Team::Away => self.stats.intentional_passes_completed_lateral_away += 1,
+            }
         }
         match team {
-            Team::Home => self.stats.intentional_completed_pass_gain_yards_home += forward_yards,
-            Team::Away => self.stats.intentional_completed_pass_gain_yards_away += forward_yards,
+            Team::Home => {
+                self.stats.intentional_completed_pass_gain_yards_home += completed_forward_yards
+            }
+            Team::Away => {
+                self.stats.intentional_completed_pass_gain_yards_away += completed_forward_yards
+            }
         }
     }
 
@@ -46952,14 +47098,19 @@ impl WorldSnapshot {
             .anticipated_pass_reception_point(passer_id, target_id, flight, speed)
             .unwrap_or(target_position);
         let passer_pressure = self.attacker_pressure_on_point(passer.team, passer_position);
-        if !self.pass_reception_conceded_to_opponent(
+        let target_forward_yards = (reception.y - passer_position.y) * passer.team.attack_dir();
+        let backward_receiver_covered = target_forward_yards < -BACKWARD_PASS_MIN_FORWARD_YARDS
+            && self.nearest_opponent_distance_at(passer.team, reception)
+                <= BACKWARD_PASS_COVERED_RADIUS_YARDS;
+        let reception_conceded = self.pass_reception_conceded_to_opponent(
             passer.team,
             target_position,
             passer_position,
             reception,
             speed,
             passer_pressure,
-        ) {
+        );
+        if !reception_conceded && !backward_receiver_covered {
             return false;
         }
         // The ball to an opponent's FEET is always a concession (no perception gate). A marked
@@ -69608,6 +69759,8 @@ impl WorldSnapshot {
             * if flight.is_aerial() { 0.78 } else { 0.62 };
         let max_run = receiver_speed * flight_time;
         let team_has_possession = self.possession_team() == Some(target.team);
+        let backward_outlet =
+            (target_position.y - passer_position.y) * target.team.attack_dir() < -1.25;
         // How much space remains between the receiver and the attacking goal line. Near the
         // byline a constant forward lead would project the reception point PAST the goal line
         // (where the keeper/last defenders trivially win the race), wrongly hiding a runner as
@@ -69618,24 +69771,25 @@ impl WorldSnapshot {
             ((attacking_goal_y - target_position.y) * target.team.attack_dir()).max(0.0);
         let forward_bias_taper =
             (space_to_goal / RECEPTION_FORWARD_BIAS_TAPER_YARDS).clamp(0.0, 1.0);
-        let forward_bias = if team_has_possession && target.role != PlayerRole::Goalkeeper {
-            let base = match target.role {
-                PlayerRole::Forward => 10.0,
-                PlayerRole::Midfielder => 7.5,
-                PlayerRole::Defender => 4.0,
-                PlayerRole::Goalkeeper => 0.0,
+        let forward_bias =
+            if team_has_possession && !backward_outlet && target.role != PlayerRole::Goalkeeper {
+                let base = match target.role {
+                    PlayerRole::Forward => 10.0,
+                    PlayerRole::Midfielder => 7.5,
+                    PlayerRole::Defender => 4.0,
+                    PlayerRole::Goalkeeper => 0.0,
+                };
+                base * forward_bias_taper
+            } else {
+                0.0
             };
-            base * forward_bias_taper
-        } else {
-            0.0
-        };
         let center_x = self.field_width * 0.5;
         let wide_receiver = self.is_wide_attacker(target)
             || (team_has_possession
                 && target.role == PlayerRole::Defender
                 && self.is_wide_defender(target)
                 && self.wingback_covered_attack_fit(target) > 0.0);
-        let wide_bias = if team_has_possession && wide_receiver {
+        let wide_bias = if team_has_possession && wide_receiver && !backward_outlet {
             let touchline_x = if target.home_position.x <= center_x {
                 (WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS * 0.72)
                     .clamp(2.8, WIDE_OUTLET_TOUCHLINE_BUFFER_YARDS)
