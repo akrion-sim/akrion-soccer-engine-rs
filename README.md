@@ -91,5 +91,14 @@ See `docs/observability.md` for the collector manifest and CockroachDB TTL schem
 ## Tests
 
 ```sh
-cargo test --lib
+./shell cargo test --lib
 ```
+
+The repository shell routes build-producing Cargo commands through
+`scripts/cargo-fresh`. When the soccer/DES source fingerprint changes, it uses package- and
+profile-aware `cargo clean` for only `soccer_engine` and its local `des_engine` dependency
+before compiling the replacement. Unchanged sources reuse the current cache, a debug check
+cannot remove release executables, and a target profile backing a running executable is never
+cleaned. Incremental compilation is disabled, preventing superseded `dep-graph.bin`,
+`libsoccer_engine-*`, `des_engine*`, and related compiler generations from accumulating
+indefinitely. Direct `cargo ...` remains available when bypassing this lifecycle is intentional.

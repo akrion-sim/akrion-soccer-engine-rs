@@ -116,11 +116,25 @@ const SOCCER_POLICY_RETAIN_ARCHIVED_NEURAL_ENV: &str =
 const SOCCER_POLICY_VERSION_FULL_ENTRIES_ENV: &str = "SOCCER_PG_POLICY_VERSION_FULL_ENTRIES";
 const SOCCER_PG_PERSIST_RUN_DELTAS_ENV: &str = "SOCCER_PG_PERSIST_RUN_DELTAS";
 const SOCCER_PG_RESUME_MAX_POLICY_ENTRIES_ENV: &str = "SOCCER_PG_RESUME_MAX_POLICY_ENTRIES";
-/// Rows deleted per statement when cleaning up a superseded generation's entries.
-/// Inline pruning is opt-in via [`SOCCER_POLICY_INLINE_PRUNE_ENV`]; live learners defer this
-/// heavyweight maintenance so policy promotion cannot stall on a large delete.
+/// Rows deleted per statement when explicitly draining a superseded generation's entries.
 const SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE: i64 = 50_000;
+/// Every durable policy write reclaims at most this many provably superseded entry rows. The
+/// small batch plus local timeouts bounds write-path latency; the explicit inline maintenance
+/// mode can still drain the entire backlog.
+const SOCCER_POLICY_AUTO_PRUNE_DELETE_BATCH_SIZE: i64 = 5_000;
+/// A non-tip version is not sufficient evidence that its entries are obsolete: a candidate can
+/// share a branch with the active incumbent. Only rows already archived by the persistence state
+/// machine are eligible for physical entry deletion.
+const SOCCER_POLICY_PRUNABLE_VERSION_STATUS: &str = SOCCER_POLICY_STATUS_ARCHIVED;
 pub const SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS: i64 = 10;
+/// Limit retirement work performed by any one writer transaction. Updating vector-bearing rows
+/// can be expensive even though only `deleted_at` changes, so never scan/update the whole backlog
+/// while a game or policy write is waiting to commit.
+const SOCCER_MOMENT_VECTOR_SOFT_DELETE_BATCH_SIZE: i64 = 100;
+/// A vector must first spend this long explicitly soft-deleted before physical removal. Together
+/// with the live-row window above, the default minimum age at hard deletion is forty days.
+pub const SOCCER_MOMENT_VECTOR_HARD_DELETE_GRACE_DAYS: i64 = 30;
+const SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE: i64 = 1_000;
 
 const SOCCER_PG_CONNECT_DEFAULT_MAX_ATTEMPTS: u32 = 5;
 const SOCCER_PG_CONNECT_BASE_BACKOFF_MILLIS: u64 = 200;
@@ -178,15 +192,49 @@ limit $3";
 const SOCCER_MOMENT_EMBEDDING_SOFT_DELETE_SQL: &str = "\
 update des_soccer_moment_embeddings \
 set deleted_at = now() \
-where deleted_at is null \
-  and created_at < now() - ($2::bigint * interval '1 day') \
-  and ($1::text is null or experiment_id = $1::text::uuid)";
+where ctid in ( \
+  select ctid from des_soccer_moment_embeddings \
+  where deleted_at is null \
+    and created_at < now() - ($2::bigint * interval '1 day') \
+    and ($1::text is null or experiment_id = $1::text::uuid) \
+  order by created_at asc \
+  limit $3 \
+  for update skip locked \
+)";
 const SOCCER_CONFIG_MOMENT_SOFT_DELETE_SQL: &str = "\
 update des_soccer_config_moments \
 set deleted_at = now() \
-where deleted_at is null \
-  and created_at < now() - ($2::bigint * interval '1 day') \
-  and ($1::text is null or experiment_id = $1::text::uuid)";
+where ctid in ( \
+  select ctid from des_soccer_config_moments \
+  where deleted_at is null \
+    and created_at < now() - ($2::bigint * interval '1 day') \
+    and ($1::text is null or experiment_id = $1::text::uuid) \
+  order by created_at asc \
+  limit $3 \
+  for update skip locked \
+)";
+const SOCCER_MOMENT_EMBEDDING_HARD_DELETE_SQL: &str = "\
+delete from des_soccer_moment_embeddings \
+where ctid in ( \
+  select ctid from des_soccer_moment_embeddings \
+  where deleted_at is not null \
+    and deleted_at < now() - ($2::bigint * interval '1 day') \
+    and ($1::text is null or experiment_id = $1::text::uuid) \
+  order by deleted_at asc \
+  limit $3 \
+  for update skip locked \
+)";
+const SOCCER_CONFIG_MOMENT_HARD_DELETE_SQL: &str = "\
+delete from des_soccer_config_moments \
+where ctid in ( \
+  select ctid from des_soccer_config_moments \
+  where deleted_at is not null \
+    and deleted_at < now() - ($2::bigint * interval '1 day') \
+    and ($1::text is null or experiment_id = $1::text::uuid) \
+  order by deleted_at asc \
+  limit $3 \
+  for update skip locked \
+)";
 
 const _: () = {
     assert!(
@@ -2298,31 +2346,142 @@ impl SoccerLearningPgStore {
         tx.commit()
             .map_err(|err| format!("commit soccer policy version: {err}"))?;
 
-        // The promotion is now durable. Cleanup is deliberately out-of-band by default: on the
-        // production policy table, even LIMIT-bounded deletes can block learners for minutes while
-        // autovacuum and heap reads churn. Operators can opt in for a dedicated maintenance run.
-        if full_entries_retained {
-            if soccer_policy_inline_prune_enabled() {
-                if let Err(err) = self.prune_superseded_branch_entries_batched(
-                    experiment_id,
-                    &branch_key,
-                    policy_version_id,
-                ) {
-                    eprintln!(
-                        "soccer policy retention: superseded-entry cleanup deferred (best-effort) for {policy_version_id}: {err}"
-                    );
-                }
-            } else {
+        // The write is now durable. Only older versions the persistence state machine has already
+        // archived are eligible for reclamation; active and candidate siblings can share this
+        // branch key and must remain intact. Never put a large delete in the promotion transaction:
+        // a previous implementation let maintenance failures roll back newly learned weights.
+        // Reclaim one small timeout-bounded batch by default, or drain the safe archived backlog
+        // when the operator explicitly enables inline maintenance.
+        // Run maintenance even when this write intentionally persisted no tabular entries. Live
+        // neural-only heads commonly set `full_entries_retained = false`; tying reclamation to the
+        // new row's storage mode left the historical archived backlog permanently stranded.
+        if soccer_policy_inline_prune_enabled() {
+            if let Err(err) = self.prune_superseded_branch_entries_batched(
+                experiment_id,
+                &branch_key,
+                policy_version_id,
+            ) {
                 eprintln!(
-                    "soccer policy retention: superseded-entry cleanup deferred for {policy_version_id}; set {SOCCER_POLICY_INLINE_PRUNE_ENV}=true for dedicated inline maintenance"
+                    "soccer policy retention: superseded-entry cleanup deferred (best-effort) for {policy_version_id}: {err}"
                 );
             }
+        } else if let Err(err) = self.prune_one_superseded_branch_entry_batch(
+            experiment_id,
+            &branch_key,
+            policy_version_id,
+        ) {
+            eprintln!(
+                "soccer policy retention: bounded superseded-entry cleanup deferred (best-effort) for {policy_version_id}: {err}; set {SOCCER_POLICY_INLINE_PRUNE_ENV}=true for dedicated inline maintenance"
+            );
         }
         Ok(())
     }
 
-    /// Best-effort, timeout-bounded cleanup of every NON-tip version's entries on a branch, run
-    /// AFTER a promotion has committed (see [`Self::insert_policy_version_with_id_inner`]).
+    /// Reclaim one small batch from versions that the just-committed branch tip supersedes.
+    ///
+    /// Both timeouts are transaction-local, so contention makes this best-effort maintenance
+    /// fail quickly without weakening the connection's normal query guard. Version metadata is
+    /// retained, and `full_entries_retained` flips only after a version has no entry rows left.
+    fn prune_one_superseded_branch_entry_batch(
+        &mut self,
+        experiment_id: &str,
+        branch_key: &str,
+        tip_policy_version_id: &str,
+    ) -> Result<u64, String> {
+        self.ensure_connected()?;
+        let mut tx = self
+            .client
+            .transaction()
+            .map_err(|err| format!("begin bounded soccer policy retention transaction: {err}"))?;
+        tx.batch_execute("set local lock_timeout = '250ms'; set local statement_timeout = '5s'")
+            .map_err(|err| format!("bound soccer policy retention transaction: {err}"))?;
+
+        // Resolve ids from the small versions table first. The entry-table join form previously
+        // caused large scans; deleting by policy_version_id lets Postgres drive the existing
+        // policy-entry index directly.
+        let superseded: Vec<String> = tx
+            .query(
+                r#"
+                select id::text
+                from des_soccer_learning_policy_versions
+                where experiment_id = $1::text::uuid
+                  and branch_key = $2::text::uuid
+                  and id <> $3::text::uuid
+                  and status = $4
+                  and full_entries_retained = true
+                "#,
+                &[
+                    &experiment_id,
+                    &branch_key,
+                    &tip_policy_version_id,
+                    &SOCCER_POLICY_PRUNABLE_VERSION_STATUS,
+                ],
+            )
+            .map_err(|err| format!("list bounded superseded branch versions: {err}"))?
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        if superseded.is_empty() {
+            tx.commit()
+                .map_err(|err| format!("commit empty bounded soccer policy retention: {err}"))?;
+            return Ok(0);
+        }
+
+        let deleted = tx
+            .execute(
+                r#"
+                with stale_entries as (
+                  select ctid
+                  from des_soccer_learning_policy_entries
+                  where policy_version_id = any($1::text[]::uuid[])
+                  limit $2
+                  for update skip locked
+                )
+                delete from des_soccer_learning_policy_entries entries
+                using stale_entries
+                where entries.ctid = stale_entries.ctid
+                "#,
+                &[&superseded, &SOCCER_POLICY_AUTO_PRUNE_DELETE_BATCH_SIZE],
+            )
+            .map_err(|err| format!("prune bounded superseded branch entries: {err}"))?;
+
+        tx.execute(
+            r#"
+            update des_soccer_learning_policy_versions versions
+            set
+              full_entries_retained = false,
+              full_entries_pruned_at = now(),
+              updated_at = now(),
+              metrics = jsonb_set(
+                metrics,
+                '{postgresRetention}',
+                coalesce(metrics->'postgresRetention', '{}'::jsonb)
+                  || jsonb_build_object(
+                    'fullEntriesRetained', false,
+                    'prunedByPolicyVersionId', $2,
+                    'retentionKind', 'branch_tip'
+                  ),
+                true
+              )
+            where versions.id = any($1::text[]::uuid[])
+              and versions.full_entries_retained = true
+              and not exists (
+                select 1
+                from des_soccer_learning_policy_entries entries
+                where entries.policy_version_id = versions.id
+              )
+            "#,
+            &[&superseded, &tip_policy_version_id],
+        )
+        .map_err(|err| format!("mark bounded superseded branch versions pruned: {err}"))?;
+        tx.commit()
+            .map_err(|err| format!("commit bounded soccer policy retention: {err}"))?;
+        Ok(deleted)
+    }
+
+    /// Best-effort, timeout-bounded cleanup of every archived NON-tip version's entries on a
+    /// branch, run AFTER a promotion has committed (see
+    /// [`Self::insert_policy_version_with_id_inner`]).
     /// Deletes in [`SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE`] chunks — each its own statement,
     /// comfortably under the session `statement_timeout`, so a multi-million-row cleanup never
     /// trips it — then flips the drained versions to `full_entries_retained = false`. Safe to
@@ -2349,9 +2508,15 @@ impl SoccerLearningPgStore {
                 where experiment_id = $1::text::uuid
                   and branch_key = $2::text::uuid
                   and id <> $3::text::uuid
+                  and status = $4
                   and full_entries_retained = true
                 "#,
-                &[&experiment_id, &branch_key, &tip_policy_version_id],
+                &[
+                    &experiment_id,
+                    &branch_key,
+                    &tip_policy_version_id,
+                    &SOCCER_POLICY_PRUNABLE_VERSION_STATUS,
+                ],
             )
             .map_err(|err| format!("list superseded branch versions: {err}"))?
             .iter()
@@ -2377,6 +2542,7 @@ impl SoccerLearningPgStore {
                       from des_soccer_learning_policy_entries
                       where policy_version_id = any($1::text[]::uuid[])
                       limit $2
+                      for update skip locked
                     )
                     "#,
                 &[&superseded, &SOCCER_POLICY_PRUNE_DELETE_BATCH_SIZE],
@@ -2384,6 +2550,9 @@ impl SoccerLearningPgStore {
                 Ok(deleted) => {
                     total += deleted;
                     if deleted == 0 {
+                        // Either the versions are drained or every remaining row is currently
+                        // locked. The guarded metadata update below distinguishes those cases;
+                        // locked rows stay retained and are retried by a later maintenance pass.
                         break;
                     }
                 }
@@ -2398,7 +2567,7 @@ impl SoccerLearningPgStore {
             // policy-versions table is tiny). Mirrors the old in-transaction prune's bookkeeping.
             if let Err(err) = self.client.execute(
                 r#"
-                update des_soccer_learning_policy_versions
+                update des_soccer_learning_policy_versions versions
                 set
                   full_entries_retained = false,
                   full_entries_pruned_at = now(),
@@ -2414,7 +2583,12 @@ impl SoccerLearningPgStore {
                       ),
                     true
                   )
-                where id = any($1::text[]::uuid[])
+                where versions.id = any($1::text[]::uuid[])
+                  and not exists (
+                    select 1
+                    from des_soccer_learning_policy_entries entries
+                    where entries.policy_version_id = versions.id
+                  )
                 "#,
                 &[&superseded, &tip_policy_version_id],
             ) {
@@ -2983,9 +3157,9 @@ impl SoccerLearningPgStore {
         })
     }
 
-    /// Mark old pgvector soccer moment rows as deleted without removing the raw
-    /// rows. Retrieval paths filter `deleted_at is null`, while operators can
-    /// inspect or hard-purge these rows later if needed.
+    /// Retire old pgvector soccer moments. Retrieval stops seeing a row after the
+    /// initial soft delete; rows are physically removed only after the additional
+    /// hard-delete grace period has elapsed.
     pub fn soft_delete_old_moment_vectors(
         &mut self,
         experiment_id: Option<&str>,
@@ -4657,6 +4831,7 @@ fn prune_old_policy_entries_for_branch_tip(
           where experiment_id = $1::text::uuid
             and branch_key = $2::text::uuid
             and id <> $3::text::uuid
+            and status = $4
             and full_entries_retained = true
           returning id
         )
@@ -4664,7 +4839,12 @@ fn prune_old_policy_entries_for_branch_tip(
         using pruned_versions
         where entries.policy_version_id = pruned_versions.id
         "#,
-        &[&experiment_id, &branch_key, &policy_version_id],
+        &[
+            &experiment_id,
+            &branch_key,
+            &policy_version_id,
+            &SOCCER_POLICY_PRUNABLE_VERSION_STATUS,
+        ],
     )
     .map_err(|err| format!("prune old soccer policy branch entries: {err}"))
 }
@@ -5140,18 +5320,41 @@ fn soft_delete_old_moment_vectors_in_transaction(
     };
     ensure_soccer_moment_embedding_tables(tx)?;
     ensure_soccer_config_moment_tables(tx)?;
+    let soft_delete_batch_size = SOCCER_MOMENT_VECTOR_SOFT_DELETE_BATCH_SIZE;
     let soft_deleted_moment_embeddings = tx
         .execute(
             SOCCER_MOMENT_EMBEDDING_SOFT_DELETE_SQL,
-            &[&experiment_id, &older_than_days],
+            &[&experiment_id, &older_than_days, &soft_delete_batch_size],
         )
         .map_err(|err| format!("soft-delete old soccer moment embeddings: {err}"))?;
     let soft_deleted_config_moments = tx
         .execute(
             SOCCER_CONFIG_MOMENT_SOFT_DELETE_SQL,
-            &[&experiment_id, &older_than_days],
+            &[&experiment_id, &older_than_days, &soft_delete_batch_size],
         )
         .map_err(|err| format!("soft-delete old soccer config moments: {err}"))?;
+    let hard_delete_grace_days = SOCCER_MOMENT_VECTOR_HARD_DELETE_GRACE_DAYS;
+    let hard_delete_batch_size = SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE;
+    let _hard_deleted_moment_embeddings = tx
+        .execute(
+            SOCCER_MOMENT_EMBEDDING_HARD_DELETE_SQL,
+            &[
+                &experiment_id,
+                &hard_delete_grace_days,
+                &hard_delete_batch_size,
+            ],
+        )
+        .map_err(|err| format!("hard-delete retired soccer moment embeddings: {err}"))?;
+    let _hard_deleted_config_moments = tx
+        .execute(
+            SOCCER_CONFIG_MOMENT_HARD_DELETE_SQL,
+            &[
+                &experiment_id,
+                &hard_delete_grace_days,
+                &hard_delete_batch_size,
+            ],
+        )
+        .map_err(|err| format!("hard-delete retired soccer config moments: {err}"))?;
     Ok(SoccerLearningPgMomentVectorRetentionPrune {
         soft_deleted_moment_embeddings,
         soft_deleted_config_moments,
@@ -6084,8 +6287,9 @@ mod tests {
     }
 
     #[test]
-    fn default_moment_vector_retention_soft_deletes_after_ten_days() {
+    fn default_moment_vector_retention_uses_soft_delete_plus_grace_period() {
         assert_eq!(SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS, 10);
+        assert_eq!(SOCCER_MOMENT_VECTOR_HARD_DELETE_GRACE_DAYS, 30);
         assert_eq!(soccer_moment_vector_retention_limit_days(10), Some(10));
         assert_eq!(soccer_moment_vector_retention_limit_days(0), None);
         assert_eq!(soccer_moment_vector_retention_limit_days(-1), None);
@@ -6121,7 +6325,29 @@ mod tests {
             assert!(normalized.contains("where deleted_at is null"));
             assert!(normalized.contains("created_at < now() - ($2::bigint * interval '1 day')"));
             assert!(normalized.contains("experiment_id = $1::text::uuid"));
+            assert!(normalized.contains("order by created_at asc"));
+            assert!(normalized.contains("limit $3"));
+            assert!(normalized.contains("for update skip locked"));
         }
+        assert!(SOCCER_MOMENT_VECTOR_SOFT_DELETE_BATCH_SIZE > 0);
+    }
+
+    #[test]
+    fn moment_vector_retention_hard_deletes_only_old_soft_deleted_rows_in_batches() {
+        for sql in [
+            SOCCER_MOMENT_EMBEDDING_HARD_DELETE_SQL,
+            SOCCER_CONFIG_MOMENT_HARD_DELETE_SQL,
+        ] {
+            let normalized = sql.to_ascii_lowercase();
+            assert!(normalized.starts_with("delete from "));
+            assert!(normalized.contains("where deleted_at is not null"));
+            assert!(normalized.contains("deleted_at < now() - ($2::bigint * interval '1 day')"));
+            assert!(normalized.contains("experiment_id = $1::text::uuid"));
+            assert!(normalized.contains("limit $3"));
+            assert!(normalized.contains("order by deleted_at asc"));
+            assert!(normalized.contains("for update skip locked"));
+        }
+        assert!(SOCCER_MOMENT_VECTOR_HARD_DELETE_BATCH_SIZE > 0);
     }
 
     #[test]
@@ -6718,6 +6944,16 @@ mod tests {
         assert!(!soccer_policy_version_retains_full_entries_with_override(
             "rejected", true
         ));
+    }
+
+    #[test]
+    fn physical_policy_entry_pruning_requires_archived_version_status() {
+        assert_eq!(
+            SOCCER_POLICY_PRUNABLE_VERSION_STATUS,
+            SOCCER_POLICY_STATUS_ARCHIVED
+        );
+        assert_ne!(SOCCER_POLICY_PRUNABLE_VERSION_STATUS, "active");
+        assert_ne!(SOCCER_POLICY_PRUNABLE_VERSION_STATUS, "candidate");
     }
 
     #[test]
