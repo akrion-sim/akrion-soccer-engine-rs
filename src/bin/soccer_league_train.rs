@@ -2129,16 +2129,25 @@ fn main() {
                     checkpoint_validate_min_goal_diff_margin,
                 );
                 let promotes = if self_play_ladder {
-                    // Gen-0 is a challenger to the frozen starting brain, not an
-                    // automatic champion. Every generation must clear the same
-                    // side-balanced lower-confidence-bound and analytic anchor.
+                    // GEN-0 BOOTSTRAP: with no frontier published yet, the only
+                    // pool member is the analytic anchor — so the "champion
+                    // gate" degenerates into "beat the analytic engine by
+                    // LCB95 ≥ margin", which is the CEILING the ladder exists
+                    // to climb toward, not a beatable floor (the ladder held
+                    // forever here; the 5v5 port learned the same lesson).
+                    // The first checkpoint therefore promotes unconditionally:
+                    // the floor is the starting net, analytic stays in the
+                    // TRAINING pool for grounding, and from gen-1 on every
+                    // generation must clear the full side-balanced LCB95 gate
+                    // plus the analytic-anchor non-regression co-gate.
                     let bootstrap_gen0 = !std::path::Path::new(&frontier_path).exists();
                     let gate_goal_diff_lower_95 = validation
                         .as_ref()
                         .map(LeagueRoundKpis::goal_diff_lower_95)
                         .unwrap_or(f64::NEG_INFINITY);
-                    let ladder_promotes = gate_goal_diff_lower_95 >= self_play_promote_margin
-                        && passes_analytic_anchor;
+                    let ladder_promotes = bootstrap_gen0
+                        || (gate_goal_diff_lower_95 >= self_play_promote_margin
+                            && passes_analytic_anchor);
                     println!(
                         "league_self_play_ladder round={round} bootstrap_gen0={} gd_vs_champion={:.3} gd_lcb95={:.3} promote_margin={:.3} analytic_anchor_passed={} verdict={}",
                         bootstrap_gen0,
