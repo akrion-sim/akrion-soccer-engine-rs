@@ -164,6 +164,13 @@ fn wenv(name: &str, default: f32, lo: f32, hi: f32) -> f32 {
     bounded_weight(raw.as_deref(), default, lo, hi)
 }
 
+pub fn ppo_learning_rates() -> (f32, f32, f32) {
+    let actor = wenv("FIVEASIDE_ACTOR_LR", LR_ACTOR, 1.0e-6, 1.0e-2);
+    let critic = wenv("FIVEASIDE_CRITIC_LR", LR_CRITIC, 1.0e-6, 1.0e-2);
+    let speed = wenv("FIVEASIDE_SPEED_LR", actor * 0.3, 1.0e-6, 1.0e-2);
+    (actor, critic, speed)
+}
+
 /// Anchored on-frame shot points (docs/reward-anchoring.md §2): floor 50 no
 /// matter where from; the field-vector context (position xg) sets the CEILING,
 /// and MPC placement quality interpolates inside the [floor, cap(x)] band. The
@@ -232,8 +239,14 @@ fn rw() -> &'static Rw {
     // the same RELATIVE region that trained well, now expressed in points.
     static R: std::sync::OnceLock<Rw> = std::sync::OnceLock::new();
     R.get_or_init(|| Rw {
-        concede_frac: wenv("REW_CONCEDE_FRAC", 0.67, 0.25, 1.0),
-        loss_frac: wenv("REW_LOSS_FRAC", 0.5, 0.4, 1.0),
+        // Defaults = the PROVEN winner config (2026-07-15 probes + 900-iter
+        // run): lower fear (concede 0.35, loss 0.4) beat the old 0.67/0.5
+        // decisively — 300-game holdout +1.397 gd / 90.0% winrate vs −0.123
+        // under the old defaults, and the champion then defended 12 self-play
+        // ladder generations (independent re-eval +0.84, LCB95 +0.71). Still
+        // discoverable within the same bounds.
+        concede_frac: wenv("REW_CONCEDE_FRAC", 0.35, 0.25, 1.0),
+        loss_frac: wenv("REW_LOSS_FRAC", 0.4, 0.4, 1.0),
         shot_span: wenv("REW_SHOT_SPAN", 1.0, MIN_REWARD_WEIGHT, 1.5),
         milestone: wenv("REW_MILESTONE", 12.0, MIN_REWARD_WEIGHT, 40.0),
         // PASS ECONOMICS: a sensible pass must have POSITIVE expected value or
@@ -280,7 +293,6 @@ fn rw() -> &'static Rw {
 // The speed policy is a low-variance REFINEMENT on top of the action policy —
 // small entropy + LR so its exploration can't paralyze the game the action policy
 // is trying to learn in.
-const LR_SPEED: f32 = LR_ACTOR * 0.3;
 const SPEED_ENT_SCALE: f32 = 0.15;
 const ENT_BETA0: f32 = 0.02;
 
@@ -616,6 +628,10 @@ fn full_game_actor_credit(outcome_label: f32) -> f32 {
         )
 }
 
+fn critic_target_units(raw_points: f32) -> f32 {
+    raw_points / RETURN_NORM
+}
+
 struct BcSample {
     obs: [f32; OBS_DIM],
     mask: [bool; NA],
@@ -857,7 +873,8 @@ fn rollout(policy: &Policy, rng: &mut Rng, opponent_noise: f32) -> Vec<Sample> {
         // real distance backward.
         let checkpoint_controlled = matches!(w.owner, Some(o) if o.team == Team::A)
             && w.possession_phase_for(Team::A) == PossessionPhase::Possession;
-        r += rw().checkpoint * checkpoint_step(&mut checkpoint_armed, w.ball.y, checkpoint_controlled);
+        r += rw().checkpoint
+            * checkpoint_step(&mut checkpoint_armed, w.ball.y, checkpoint_controlled);
         // dribbling = possessing the ball (less pinball): forward pays, lateral a
         // little. SMALL per-tick — it fires every tick you carry, so a big value
         // accumulates into ball-hoarding that dwarfs goals.
@@ -1395,6 +1412,7 @@ pub struct IterStats {
 /// One PPO iteration: collect `games` rollouts, then EPOCHS of minibatch updates.
 pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rng) -> IterStats {
     let mut data = collect_rollouts(policy, games, rng);
+    let (actor_learning_rate, critic_learning_rate, speed_learning_rate) = ppo_learning_rates();
     let mut total_r = 0.0f32;
     // returns/advs summed across all player-steps; report mean reward-to-go proxy
     for s in &data {
@@ -1490,7 +1508,7 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 // anchored point scale (predictions are denormalized in rollout).
                 let cacts = policy.critic.forward(&s.gstate);
                 let v = cacts.last().unwrap()[0];
-                let ret_n = s.ret / RETURN_NORM;
+                let ret_n = critic_target_units(s.ret);
                 let dv = v - ret_n; // dL/dv for 0.5*(v-ret_n)^2
                 policy.critic.backward(&cacts, &[dv]);
 
@@ -1498,9 +1516,9 @@ pub fn train_iter(policy: &mut Policy, games: usize, ent_beta: f32, rng: &mut Rn
                 vloss_accum += 0.5 * (v - ret_n) * (v - ret_n);
                 count += 1.0;
             }
-            policy.actor.step(LR_ACTOR);
-            policy.speedor.step(LR_SPEED);
-            policy.critic.step(LR_CRITIC);
+            policy.actor.step(actor_learning_rate);
+            policy.speedor.step(speed_learning_rate);
+            policy.critic.step(critic_learning_rate);
         }
     }
 
@@ -1524,18 +1542,21 @@ pub struct Stats {
     pub winrate: f32,
     pub ga: f32,
     pub gb: f32,
-    pub spacing: f32,      // avg nearest-teammate distance (all ticks)
-    pub bunch: f32,        // fraction of ticks a pair < 2.5
-    pub possession: f32,   // fraction of ticks Team A holds the ball
-    pub pass_att: f32,     // pass attempts / game
-    pub pass_cmp: f32,     // completed passes / game
-    pub pass_fwd: f32,     // forward pass attempts / game
-    pub pass_lat: f32,     // lateral pass attempts / game
-    pub pass_back: f32,    // backward pass attempts / game
-    pub shots: f32,        // shot attempts / game
-    pub shots_scored: f32, // goals (proxy for converted shots) / game
-    pub turnovers: f32,    // A turnovers / game
-    pub wins_won: f32,     // balls won / game (press/intercept/tackle)
+    pub spacing: f32,       // avg nearest-teammate distance (all ticks)
+    pub bunch: f32,         // fraction of ticks a pair < 2.5
+    pub possession: f32,    // fraction of ticks Team A holds the ball
+    pub pass_att: f32,      // pass attempts / game
+    pub pass_cmp: f32,      // completed passes / game
+    pub pass_fwd: f32,      // forward pass attempts / game
+    pub pass_lat: f32,      // lateral pass attempts / game
+    pub pass_back: f32,     // backward pass attempts / game
+    pub pass_cmp_fwd: f32,  // completed forward passes / game
+    pub pass_cmp_lat: f32,  // completed lateral passes / game
+    pub pass_cmp_back: f32, // completed backward passes / game
+    pub shots: f32,         // shot attempts / game
+    pub shots_scored: f32,  // goals (proxy for converted shots) / game
+    pub turnovers: f32,     // A turnovers / game
+    pub wins_won: f32,      // balls won / game (press/intercept/tackle)
 }
 impl Stats {
     pub fn pass_completion(&self) -> f32 {
@@ -1545,12 +1566,29 @@ impl Stats {
             0.0
         }
     }
+    pub fn forward_pass_completion(&self) -> f32 {
+        directional_pass_completion(self.pass_cmp_fwd, self.pass_fwd)
+    }
+    pub fn lateral_pass_completion(&self) -> f32 {
+        directional_pass_completion(self.pass_cmp_lat, self.pass_lat)
+    }
+    pub fn backward_pass_completion(&self) -> f32 {
+        directional_pass_completion(self.pass_cmp_back, self.pass_back)
+    }
     pub fn conversion(&self) -> f32 {
         if self.shots > 0.0 {
             self.shots_scored / self.shots
         } else {
             0.0
         }
+    }
+}
+
+fn directional_pass_completion(completed: f32, attempted: f32) -> f32 {
+    if attempted > 0.0 {
+        (completed / attempted).clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -1575,6 +1613,11 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> Stats {
             w.step(&act_a, &act_b, rng);
             if w.ev_pass_completed_a {
                 s.pass_cmp += 1.0;
+                match w.pass_dir_a {
+                    1 => s.pass_cmp_fwd += 1.0,
+                    -1 => s.pass_cmp_back += 1.0,
+                    _ => s.pass_cmp_lat += 1.0,
+                }
             }
             if w.ev_pass_attempt_a {
                 s.pass_att += 1.0;
@@ -1624,6 +1667,9 @@ pub fn evaluate(policy: &Policy, games: usize, rng: &mut Rng) -> Stats {
         &mut s.pass_fwd,
         &mut s.pass_lat,
         &mut s.pass_back,
+        &mut s.pass_cmp_fwd,
+        &mut s.pass_cmp_lat,
+        &mut s.pass_cmp_back,
         &mut s.shots,
         &mut s.shots_scored,
         &mut s.turnovers,
@@ -2130,6 +2176,15 @@ mod tests {
     }
 
     #[test]
+    fn critic_targets_are_normalized_without_changing_football_anchors() {
+        assert_eq!(REW_GOAL_POINTS, 500.0);
+        assert_eq!(REW_WIN_POINTS, 1000.0);
+        assert_eq!(critic_target_units(REW_GOAL_POINTS), 1.0);
+        assert_eq!(critic_target_units(REW_WIN_POINTS), 2.0);
+        assert_eq!(critic_target_units(-REW_WIN_POINTS), -2.0);
+    }
+
+    #[test]
     fn scripted_vs_scripted_is_seed_reproducible() {
         let mut a = Rng::new(1234);
         let mut b = Rng::new(1234);
@@ -2157,6 +2212,24 @@ mod tests {
         assert!((0.0..=1.0).contains(&stats.possession));
         assert!(stats.pass_completion().is_finite());
         assert!(stats.conversion().is_finite());
+    }
+
+    #[test]
+    fn directional_pass_completion_exposes_the_target_rates() {
+        let stats = Stats {
+            pass_att: 40.0,
+            pass_cmp: 36.0,
+            pass_fwd: 20.0,
+            pass_cmp_fwd: 17.0,
+            pass_back: 20.0,
+            pass_cmp_back: 19.0,
+            ..Stats::default()
+        };
+
+        assert!((stats.pass_completion() - 0.90).abs() < 1e-6);
+        assert!((stats.forward_pass_completion() - 0.85).abs() < 1e-6);
+        assert!((stats.backward_pass_completion() - 0.95).abs() < 1e-6);
+        assert_eq!(stats.lateral_pass_completion(), 0.0);
     }
 
     #[test]

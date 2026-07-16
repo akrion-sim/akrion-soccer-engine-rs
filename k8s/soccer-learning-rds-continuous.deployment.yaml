@@ -88,6 +88,24 @@ spec:
               require_value SOCCER_REQUIRE_POSTGRES true
               require_value SOCCER_NEURAL_LEARNING_ENABLED true
               require_value SOCCER_NEURAL_LEARNING_BACKEND threaded
+              require_value SOCCER_NEURAL_LEARNING_RATE 0.0003
+              require_value SOCCER_NEURAL_HIDDEN_UNITS 128
+              require_value SOCCER_NEURAL_BLEND_MODE authoritative
+              require_value SOCCER_NEURAL_BLEND_LAMBDA 8
+              require_value SOCCER_NEURAL_BLEND_WARMUP_STEPS 0
+              require_value SOCCER_MARL_ALGORITHM mappo
+              require_value SOCCER_MAPPO_TEAM_REWARD_SHARE 0.6
+              require_value SOCCER_MARL_TEAM_REWARD_WEIGHT 0.55
+              require_value SOCCER_LEARNING_MPC_ENABLED true
+              require_value SOCCER_LEARNING_MPC_FIELD_AWARE_ENABLED true
+              require_value SOCCER_LEARNING_MPC_RECONCILE_ENABLED true
+              require_value SOCCER_LEARNING_MPC_LATENT_OBJECTIVE_ENABLED true
+              require_value SOCCER_LEARNING_MPC_PLAYER_HORIZON 30
+              require_value SOCCER_BATCH_CURRICULUM_BALL_SKILLS_AFTER_GAMES 0
+              require_value SOCCER_BATCH_CURRICULUM_DUELS_AFTER_GAMES 0
+              require_value SOCCER_BATCH_CURRICULUM_SMALL_SIDED_AFTER_GAMES 0
+              require_value SOCCER_BATCH_CURRICULUM_TEAM_SHAPE_AFTER_GAMES 0
+              require_value SOCCER_BATCH_CURRICULUM_FULL_MATCH_AFTER_GAMES 0
               require_value SOCCER_PARALLEL_GAMES 1
               require_value SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES 1
               require_value SOCCER_POSTGRES_COMPLETED_RUN_BATCH_GAMES 1
@@ -139,6 +157,7 @@ spec:
               require_value SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN 0
               require_value SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN 0
               require_value SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN 0.0
+              require_value SOCCER_EVAL_MIN_PASS_GAIN_YARDS_MARGIN 0
               require_value SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB true
               require_value SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN 0
               require_value SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN 0
@@ -334,6 +353,20 @@ spec:
               value: Soccer self-play k8s overnight evolutionary learning
             - name: SOCCER_GAMES
               value: "8"
+            # Each cycle is a fresh process.  Without an explicit full-match profile the
+            # episode-local curriculum counter restarts at zero every cycle, so the
+            # continuous 11v11 learner repeatedly trains the opening skill drill instead
+            # of the 22-player match used by promotion and live evaluation.
+            - name: SOCCER_BATCH_CURRICULUM_BALL_SKILLS_AFTER_GAMES
+              value: "0"
+            - name: SOCCER_BATCH_CURRICULUM_DUELS_AFTER_GAMES
+              value: "0"
+            - name: SOCCER_BATCH_CURRICULUM_SMALL_SIDED_AFTER_GAMES
+              value: "0"
+            - name: SOCCER_BATCH_CURRICULUM_TEAM_SHAPE_AFTER_GAMES
+              value: "0"
+            - name: SOCCER_BATCH_CURRICULUM_FULL_MATCH_AFTER_GAMES
+              value: "0"
             - name: SOCCER_CYCLE_SLEEP_SECONDS
               value: "1"
             - name: SOCCER_PARALLEL_GAMES
@@ -355,7 +388,31 @@ spec:
             - name: SOCCER_NEURAL_LEARNING_BACKEND
               value: threaded
             - name: SOCCER_NEURAL_LEARNING_RATE
-              value: "0.035"
+              value: "0.0003"
+            - name: SOCCER_NEURAL_HIDDEN_UNITS
+              value: "128"
+            - name: SOCCER_NEURAL_BLEND_MODE
+              value: authoritative
+            - name: SOCCER_NEURAL_BLEND_LAMBDA
+              value: "8"
+            - name: SOCCER_NEURAL_BLEND_WARMUP_STEPS
+              value: "0"
+            - name: SOCCER_MARL_ALGORITHM
+              value: mappo
+            - name: SOCCER_MAPPO_TEAM_REWARD_SHARE
+              value: "0.6"
+            - name: SOCCER_MARL_TEAM_REWARD_WEIGHT
+              value: "0.55"
+            - name: SOCCER_LEARNING_MPC_ENABLED
+              value: "true"
+            - name: SOCCER_LEARNING_MPC_FIELD_AWARE_ENABLED
+              value: "true"
+            - name: SOCCER_LEARNING_MPC_RECONCILE_ENABLED
+              value: "true"
+            - name: SOCCER_LEARNING_MPC_LATENT_OBJECTIVE_ENABLED
+              value: "true"
+            - name: SOCCER_LEARNING_MPC_PLAYER_HORIZON
+              value: "30"
             - name: SOCCER_NEURAL_BATCH_SIZE
               value: "64"
             - name: SOCCER_NEURAL_TRAIN_EVERY_TICKS
@@ -534,6 +591,8 @@ spec:
               value: "0"
             - name: SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN
               value: "0.0"
+            - name: SOCCER_EVAL_MIN_PASS_GAIN_YARDS_MARGIN
+              value: "0"
             - name: SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB
               value: "true"
             - name: SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN

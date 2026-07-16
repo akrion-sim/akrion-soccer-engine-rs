@@ -3285,6 +3285,43 @@ fn pass_concede_decision_respects_passer_perception() {
 }
 
 #[test]
+fn backward_pass_target_requires_a_clearly_open_receiver() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 9_122,
+        ..Default::default()
+    });
+    let passer = 7;
+    let receiver = 6;
+    let marker = 13;
+    park_players_except(&mut sim, &[passer, receiver, marker]);
+    sim.players[passer].team = Team::Home;
+    sim.players[passer].position = Vec2::new(40.0, 50.0);
+    sim.players[passer].action_facing = FacingBucket::North;
+    sim.players[receiver].team = Team::Home;
+    sim.players[receiver].position = Vec2::new(40.0, 45.0);
+    sim.players[receiver].velocity = Vec2::zero();
+    sim.players[marker].team = Team::Away;
+    sim.players[marker].velocity = Vec2::zero();
+    sim.ball.holder = Some(passer);
+    sim.ball.position = sim.players[passer].position;
+
+    place_marker_on_reception(&mut sim, passer, receiver, marker, Vec2::new(3.5, 0.0));
+    let covered = WorldSnapshot::from_match(&sim);
+    assert!(
+        covered.pass_target_concedes_to_perceived_opponent(passer, receiver, PassFlight::Floor),
+        "a backward reset to a perceived receiver covered within four yards must be vetoed"
+    );
+
+    place_marker_on_reception(&mut sim, passer, receiver, marker, Vec2::new(4.5, 0.0));
+    let open = WorldSnapshot::from_match(&sim);
+    assert!(
+        !open.pass_target_concedes_to_perceived_opponent(passer, receiver, PassFlight::Floor),
+        "the same short backward reset remains legal once the receiver is clearly open"
+    );
+}
+
+#[test]
 fn learned_policy_selector_avoids_conceded_pass_target() {
     // The learned-policy target selector re-ranks the candidate pool and would otherwise bypass
     // the ranker's (demote-only) concede veto. It must refuse to commit a pass to a man with an
@@ -13902,7 +13939,7 @@ fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
     // attacking chain (so an intermediate received pass that leads to a shot/goal
     // earns a share).
     assert_eq!(GOAL_REWARD_POINTS, 500.0);
-    assert_eq!(DIRECT_TURNOVER_GOAL_REWARD_POINTS, 250.0);
+    assert_eq!(DIRECT_TURNOVER_GOAL_REWARD_POINTS, GOAL_REWARD_POINTS);
     assert_eq!(SHOT_ON_TARGET_REWARD_POINTS, 80.0);
     assert!((GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() - 160.0).abs() < 1e-9);
     assert!((SHOT_ON_TARGET_REWARD_PATTERN.iter().sum::<f64>() - 80.0).abs() < 1e-9);
@@ -13911,7 +13948,7 @@ fn goal_and_shot_reward_pools_and_buildup_chain_are_locked() {
             < GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>()
     );
     assert!(GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() < DIRECT_TURNOVER_GOAL_REWARD_POINTS);
-    assert!(DIRECT_TURNOVER_GOAL_REWARD_POINTS < GOAL_REWARD_POINTS);
+    assert_eq!(DIRECT_TURNOVER_GOAL_REWARD_POINTS, GOAL_REWARD_POINTS);
 
     // A pass that leads to a subsequent received pass is rewarded, more for forward
     // build-up than sideways/back, and the immediate link more than a deeper one.
@@ -46958,16 +46995,17 @@ fn goal_reward_credits_last_ten_teammates_with_recency_discount() {
         .iter()
         .map(|&player_id| reward_for(player_id))
         .sum::<f64>();
+    let active_weight = GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>();
+    let expected_for =
+        |slot: usize| GOAL_REWARD_POINTS * GOAL_CHAIN_REWARD_PATTERN[slot] / active_weight;
 
     assert_eq!(goal_events, 10);
     assert!((attacking_total - GOAL_REWARD_POINTS).abs() < 1e-9);
-    // The pattern is a recency SHAPE; the recorder normalizes it to the anchor
-    // pool, so each share is GOAL_REWARD_POINTS · weight / pattern_total.
-    let pattern_total = GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>();
-    let share = |slot: usize| GOAL_REWARD_POINTS * GOAL_CHAIN_REWARD_PATTERN[slot] / pattern_total;
-    assert!((reward_for(shooter) - share(0)).abs() < 1e-9);
-    assert!((reward_for(chain[8]) - share(1)).abs() < 1e-9);
-    assert!((reward_for(chain[0]) - share(9)).abs() < 1e-9);
+    // The pattern is a recency shape; normalization keeps the distributed
+    // shares equal to exactly one dependable goal-reward pool.
+    assert!((reward_for(shooter) - expected_for(0)).abs() < 1e-9);
+    assert!((reward_for(chain[8]) - expected_for(1)).abs() < 1e-9);
+    assert!((reward_for(chain[0]) - expected_for(9)).abs() < 1e-9);
     assert!(reward_for(shooter) > reward_for(chain[8]));
     assert!(reward_for(chain[8]) > reward_for(chain[0]));
 }
@@ -47142,10 +47180,10 @@ fn out_of_play_missed_shot_records_attempt_and_accuracy_penalty() {
 
 #[test]
 fn direct_turnover_goal_distributes_full_anchor_pool() {
-    // THE CONVERSION ANCHOR IS A CONSTANT: a steal-and-finish goal pays the
-    // same 500-point pool as a built-up finish (docs/reward-anchoring.md §1).
-    // The legacy reduced turnover pool exists only behind
-    // DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT.
+    // A goal where only a single scoring-team player touched the ball since
+    // winning it from the opponent credits fewer players, but the conversion
+    // itself remains the same dependable 500-point anchor. The legacy reduced
+    // turnover pool exists only behind the explicit legacy A/B gate.
     let scoring_total = |scoring_touches: &[usize]| -> f64 {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             duration_seconds: 0.1,
@@ -47179,7 +47217,7 @@ fn direct_turnover_goal_distributes_full_anchor_pool() {
 }
 
 #[test]
-fn direct_turnover_goal_pays_shooter_full_anchor() {
+fn direct_turnover_goal_credits_only_the_scorer_from_the_fixed_pool() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 155,
@@ -47262,7 +47300,7 @@ fn direct_turnover_goal_requires_scorer_to_be_only_scoring_touch() {
             .abs()
             < 1e-9
     );
-    assert!(reward_for(scorer) + reward_for(support) > DIRECT_TURNOVER_GOAL_REWARD_POINTS);
+    assert!((reward_for(scorer) + reward_for(support) - GOAL_REWARD_POINTS).abs() < 1e-9);
 }
 
 fn push_contextual_goal_credit_history(sim: &mut SoccerMatch, before: &WorldSnapshot) {
@@ -47336,7 +47374,7 @@ fn push_contextual_goal_credit_history(sim: &mut SoccerMatch, before: &WorldSnap
 }
 
 #[test]
-fn goal_reward_contextualizes_recent_attacking_decisions() {
+fn goal_reward_is_not_duplicated_into_deferred_learning_transitions() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig {
         duration_seconds: 0.1,
         seed: 157,
@@ -47351,33 +47389,31 @@ fn goal_reward_contextualizes_recent_attacking_decisions() {
     // under DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT).
     sim.record_contextual_goal_rewards(Team::Home, Some(9), live_goal_reward_points());
 
-    let total = sim
+    let deferred_total = sim
         .deferred_reward_transitions
         .iter()
         .filter(|transition| transition.team == Team::Home)
         .map(|transition| transition.reward)
         .sum::<f64>();
-    assert!((total - GOAL_REWARD_POINTS).abs() < 1e-9);
+    assert_eq!(deferred_total, 0.0);
     assert_eq!(
         sim.deferred_reward_transitions
             .iter()
             .filter(|transition| transition.team == Team::Home)
             .count(),
-        3
+        0
     );
-    assert!(sim
-        .deferred_reward_transitions
-        .iter()
-        .any(|transition| transition.action == "pass"
-            && transition.decision_context.target_distance_yards > 0.0));
-    assert!(sim
-        .deferred_reward_transitions
-        .iter()
-        .any(|transition| transition.action == "shoot" && transition.reward > 0.0));
-    assert!(!sim
+    let goal_event_total = sim
         .reward_events
         .iter()
-        .any(|event| event.tick == sim.tick && (event.amount - 30.0).abs() < 1e-9));
+        .filter(|event| {
+            event.tick == sim.tick
+                && event.kind == SoccerRewardEventKind::Goal
+                && sim.players[event.player_id].team == Team::Home
+        })
+        .map(|event| event.amount)
+        .sum::<f64>();
+    assert!((goal_event_total - GOAL_REWARD_POINTS).abs() < 1e-9);
 }
 
 #[test]
@@ -59578,6 +59614,56 @@ fn pass_decision_target_records_receiver_stride_not_static_feet() {
 }
 
 #[test]
+fn backward_outlet_targets_stationary_receiver_instead_of_upfield_role_bias() {
+    let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+    let passer = 6;
+    let receiver = 5;
+    sim.ball.holder = Some(passer);
+    sim.ball.position = Vec2::new(40.0, 60.0);
+    sim.ball.last_touch_team = Some(Team::Home);
+    sim.players[passer].position = sim.ball.position;
+    sim.players[receiver].position = Vec2::new(40.0, 50.0);
+    sim.players[receiver].velocity = Vec2::zero();
+
+    let snapshot = WorldSnapshot::from_match(&sim);
+    let speed =
+        pass_speed_yps_from_power(0.72, PassFlight::Floor, false, &sim.players[passer].skills);
+    let anticipated = snapshot
+        .anticipated_pass_reception_point(passer, receiver, PassFlight::Floor, speed)
+        .expect("anticipated backward outlet");
+
+    assert!(
+        anticipated.distance(sim.players[receiver].position) < 0.25,
+        "safe backward reset should meet a stationary receiver at their feet: {anticipated:?}"
+    );
+
+    sim.players[passer].facing_yaw = -std::f64::consts::FRAC_PI_2;
+    for away in 11..22 {
+        sim.players[away].position = Vec2::new(70.0, 90.0);
+    }
+    sim.players[11].position = Vec2::new(45.0, 60.0);
+    sim.apply_player_intent(PlayerIntent {
+        player_id: passer,
+        action: SoccerAction::Pass {
+            target_player: Some(receiver),
+            target_point: None,
+            power: 0.55,
+            flight: PassFlight::Floor,
+        },
+        sprint: false,
+    });
+    let released = sim.pending_pass.as_ref().expect("released backward reset");
+    assert!(
+        released
+            .intended_target
+            .distance(sim.players[receiver].position)
+            < 0.35,
+        "dependable reset execution should remain on the open receiver: {:?}",
+        released.intended_target
+    );
+}
+
+#[test]
 fn pass_decision_target_prefers_explicit_target_point() {
     let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
     let passer = 6;
@@ -69919,6 +70005,10 @@ fn clean_targeted_floor_pass_completes_through_ball_agent_loop() {
     assert_eq!(sim.ball.holder, None);
     assert_eq!(sim.stats.passes_attempted_home, 1);
     assert_eq!(sim.stats.intentional_passes_attempted_home, 1);
+    assert_eq!(sim.stats.passes_attempted_forward_home, 1);
+    assert_eq!(sim.stats.intentional_passes_attempted_forward_home, 1);
+    assert_eq!(sim.stats.passes_attempted_lateral_home, 0);
+    assert_eq!(sim.stats.passes_attempted_backward_home, 0);
     sim.players[passer].position = Vec2::new(34.0, 36.0);
     sim.players[passer].home_position = sim.players[passer].position;
     sim.players[passer].velocity = Vec2::zero();
@@ -69948,6 +70038,7 @@ fn clean_targeted_floor_pass_completes_through_ball_agent_loop() {
     assert!(sim.pending_pass.is_none());
     assert_eq!(sim.stats.passes_completed_home, 1);
     assert_eq!(sim.stats.intentional_passes_completed_home, 1);
+    assert_eq!(sim.stats.passes_completed_forward_home, 1);
     assert_eq!(sim.stats.intentional_passes_completed_forward_home, 1);
     assert_eq!(
         sim.ball

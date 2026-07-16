@@ -589,9 +589,34 @@ fn load_champion_history(dir: &Path) -> AppResult<Vec<(usize, train::Policy)>> {
     Ok(generations)
 }
 
+fn load_persisted_sparring(dir: &Path, max_policies: usize) -> AppResult<Vec<train::Policy>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut policy_dirs = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            policy_dirs.push(entry.path());
+        }
+    }
+    policy_dirs.sort();
+    let keep_from = policy_dirs.len().saturating_sub(max_policies);
+    let mut policies = Vec::with_capacity(policy_dirs.len() - keep_from);
+    for policy_dir in &policy_dirs[keep_from..] {
+        match load_policy(policy_dir) {
+            Ok(policy) => policies.push(policy),
+            Err(error) => eprintln!(
+                "warning: skipping incomplete persisted sparring policy {}: {error}",
+                policy_dir.display()
+            ),
+        }
+    }
+    Ok(policies)
+}
+
 /// In-memory sparring-pool bounds (disk keeps every promoted generation).
 const MAX_CHAMPION_POOL: usize = 32;
-const MAX_EXPLOITER_POOL: usize = 8;
 
 /// AlphaStar-style "challenge" PFSP weights over the frozen champion pool:
 /// w = p·(1−p) + ε with p = the challenger's tracked payoff vs that champion.
@@ -606,7 +631,11 @@ fn pfsp_sample_index(
     let mut weights = Vec::with_capacity(history.len());
     let mut total = 0.0f32;
     for (generation, _) in history {
-        let p = payoff.get(generation).copied().unwrap_or(0.5).clamp(0.0, 1.0);
+        let p = payoff
+            .get(generation)
+            .copied()
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
         let w = p * (1.0 - p) + 0.10;
         total += w;
         weights.push(w);
@@ -633,11 +662,17 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     fs::create_dir_all(&cfg.out_dir)?;
     let champ_dir = cfg.out_dir.join("champions");
     fs::create_dir_all(&champ_dir)?;
+    let sparring_dir = cfg.out_dir.join("sparring");
+    fs::create_dir_all(&sparring_dir)?;
 
     // Merge: keep main's hardened Result-returning parse (propagated with `?`)
     // AND the 5v5 anti-drift knobs — the new knobs adopt the `?` signature too.
     let generations = env_usize_clamped("GENERATIONS", 12, 1, SELFPLAY_MAX_GENERATIONS)?;
-    let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.25, -20.0, 20.0)?;
+    // A positive 95% lower bound already means the challenger has cleared a
+    // statistically conservative superiority test. Requiring an additional
+    // +0.25 goal margin before the independent confirmation stage stranded
+    // improving challengers below the gate for many generations.
+    let promote_margin = env_f32_clamped("PROMOTE_MARGIN", 0.0, -20.0, 20.0)?;
     let confirmation_games =
         env_usize_clamped("PROMOTE_CONFIRM_GAMES", cfg.eval_games.max(120), 2, 20_000)?;
     // ANTI-DRIFT (mirrors the 11v11 league+analytic anchor). Pure latest-champion
@@ -649,6 +684,15 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     // worse than the baseline it is supposed to have surpassed.
     let anchor_every = env_usize_clamped("SCRIPTED_ANCHOR_EVERY", 3, 1, 100_000)?;
     let scripted_floor = env_f32_clamped("SCRIPTED_FLOOR", 0.0, -20.0, 20.0)?;
+    let sparring_pool_max = env_usize_clamped("SPARRING_POOL_MAX", 32, 1, 512)?;
+    let candidate_checkpoint_every = env_usize_clamped(
+        "SELFPLAY_CANDIDATE_CHECKPOINT_EVERY",
+        0,
+        0,
+        cfg.iters.max(1),
+    )?;
+    let candidate_screen_games =
+        env_usize_clamped("SELFPLAY_CANDIDATE_SCREEN_GAMES", 48, 2, 2_000)?;
     // POPULATION KNOBS (AlphaStar league pattern at 5v5 scale): a slice of
     // self-play iterations spars with retained "exploiter" snapshots, and the
     // frozen-champion opponent is PFSP-sampled instead of uniform.
@@ -675,7 +719,13 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     // (unknown members default to 0.5 = maximum sampling weight), plus the
     // retained anchor-qualified held challengers ("exploiters").
     let mut champion_payoff: HashMap<usize, f32> = HashMap::new();
-    let mut exploiters: Vec<train::Policy> = Vec::new();
+    let mut exploiters = load_persisted_sparring(&sparring_dir, sparring_pool_max)?;
+    if !exploiters.is_empty() {
+        println!(
+            "loaded {} anchor-qualified held challengers into the sparring population",
+            exploiters.len()
+        );
+    }
     let mut champion_gen = champion_history
         .last()
         .map_or(0, |(generation, _)| *generation);
@@ -704,7 +754,7 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     println!("=== 5-a-side ADVERSARIAL SELF-PLAY ladder — both teams learned, physics-bounded ===");
     println!("scripted-vs-scripted goal_diff={svs:+.2} (sanity ~0)");
     println!(
-        "generations={generations}  iters/gen={}  games/iter={}  promote_margin_lcb95={promote_margin:+.2}  selection_games={}  confirmation_games={confirmation_games}  speed_warmup={speed_warmup}",
+        "generations={generations}  iters/gen={}  games/iter={}  promote_margin_lcb95={promote_margin:+.2}  selection_games={}  confirmation_games={confirmation_games}  speed_warmup={speed_warmup}  candidate_checkpoint_every={candidate_checkpoint_every}  candidate_screen_games={candidate_screen_games}",
         cfg.iters, cfg.games_per_iter, cfg.eval_games
     );
     println!("{}", "-".repeat(92));
@@ -718,18 +768,24 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     );
 
     for round in 1..=generations {
+        let mut screened_best: Option<(train::Policy, f32, f32, f32, usize)> = None;
         // MIXED OPPONENT: most iterations train against the current champion
         // (self-play), but every `anchor_every`-th iteration trains against the
         // scripted baseline (champion = None) so the challenger keeps practising
         // how to beat the absolute reference and can't quietly forget it.
         for it in 1..=cfg.iters {
-            let vs_scripted = it % anchor_every == 0 || champion_history.is_empty();
+            let vs_scripted =
+                it % anchor_every == 0 || (champion_history.is_empty() && exploiters.is_empty());
             let training_opponent = if vs_scripted {
                 None
             } else if !exploiters.is_empty() && rng.f01() < exploiter_frac {
                 // EXPLOITER slice: anchor-qualified held challengers play
                 // different styles than the champion line — sparring against
                 // them keeps the challenger from overfitting one lineage.
+                Some(exploiters[rng.next_u64() as usize % exploiters.len()].clone())
+            } else if champion_history.is_empty() {
+                // A resumed gen-0 run may have persisted, anchor-qualified held
+                // policies before it has a promoted champion line.
                 Some(exploiters[rng.next_u64() as usize % exploiters.len()].clone())
             } else if it % 2 == 0 {
                 // Half the self-play iterations face the CURRENT frontier
@@ -745,8 +801,54 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             train::set_speed_frozen(it <= speed_warmup);
             let beta = train::ent_beta_at(it, cfg.iters);
             let _ = train::train_iter(&mut challenger, cfg.games_per_iter, beta, &mut rng);
+            if candidate_checkpoint_every > 0
+                && (it % candidate_checkpoint_every == 0 || it == cfg.iters)
+            {
+                train::set_selfplay_champion(None);
+                let screen_champ = match &champion {
+                    Some(incumbent) => train::evaluate_vs_policy_paired(
+                        &challenger,
+                        incumbent,
+                        candidate_screen_games,
+                        &mut rng,
+                    ),
+                    None => train::evaluate_vs_scripted_paired(
+                        &challenger,
+                        candidate_screen_games,
+                        &mut rng,
+                    ),
+                };
+                let screen_anchor = if champion.is_some() {
+                    train::evaluate_vs_scripted_paired(
+                        &challenger,
+                        candidate_screen_games,
+                        &mut rng,
+                    )
+                } else {
+                    screen_champ
+                };
+                let robust_score = screen_champ.goal_diff.min(screen_anchor.goal_diff);
+                if screened_best
+                    .as_ref()
+                    .is_none_or(|(_, best, _, _, _)| robust_score > *best)
+                {
+                    screened_best = Some((
+                        challenger.clone(),
+                        robust_score,
+                        screen_champ.goal_diff,
+                        screen_anchor.goal_diff,
+                        it,
+                    ));
+                }
+            }
         }
         train::set_selfplay_champion(None); // detach so evals are clean
+        if let Some((best, robust_score, champ_gd, anchor_gd, iteration)) = screened_best {
+            challenger = best;
+            println!(
+                "round {round} screened checkpoint iter={iteration} robust_gd={robust_score:+.2} champion_gd={champ_gd:+.2} anchor_gd={anchor_gd:+.2}"
+            );
+        }
 
         // First use a selection set, then a fresh confirmation set. Promotion
         // depends on lower confidence bounds, never the maximum observed mean.
@@ -756,8 +858,16 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             }
             None => train::evaluate_vs_scripted_paired(&challenger, cfg.eval_games, &mut rng),
         };
-        let selection_anchor =
-            train::evaluate_vs_scripted_paired(&challenger, cfg.eval_games, &mut rng);
+        // Before the first neural champion exists, `selection_champ` already IS
+        // the scripted-anchor evaluation. Sampling a second identical opponent
+        // here made gen-0 promotion require two independent selection passes and
+        // then two more identical confirmation passes. Reuse the same evidence;
+        // a fresh confirmation set below still guards against a lucky selection.
+        let selection_anchor = if champion.is_some() {
+            train::evaluate_vs_scripted_paired(&challenger, cfg.eval_games, &mut rng)
+        } else {
+            selection_champ
+        };
         // The selection eval doubles as the PFSP payoff observation for the
         // current champion (the opponent it just measured against).
         if let Some((generation, _)) = champion_history.last() {
@@ -775,12 +885,27 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             ),
             None => train::evaluate_vs_scripted_paired(&challenger, confirmation_games, &mut rng),
         });
-        let confirmation_anchor = selection_passed
-            .then(|| train::evaluate_vs_scripted_paired(&challenger, confirmation_games, &mut rng));
+        let confirmation_anchor = if champion.is_some() {
+            selection_passed.then(|| {
+                train::evaluate_vs_scripted_paired(&challenger, confirmation_games, &mut rng)
+            })
+        } else {
+            confirmation_champ
+        };
         let promoted = confirmation_champ
             .is_some_and(|evaluation| evaluation.goal_diff_lower_95 >= promote_margin)
             && confirmation_anchor
                 .is_some_and(|evaluation| evaluation.goal_diff_lower_95 >= scripted_floor);
+        if let (Some(champion_gate), Some(anchor_gate)) = (confirmation_champ, confirmation_anchor)
+        {
+            println!(
+                "round {round} confirmation champion_gd={:+.2} champion_lcb95={:+.2} anchor_gd={:+.2} anchor_lcb95={:+.2}",
+                champion_gate.goal_diff,
+                champion_gate.goal_diff_lower_95,
+                anchor_gate.goal_diff,
+                anchor_gate.goal_diff_lower_95
+            );
+        }
         if promoted {
             champion = Some(challenger.clone());
             champion_gen += 1;
@@ -811,10 +936,15 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
                 // floor but not the champion gate. Retain it as a sparring
                 // exploiter instead of discarding the style it found — the
                 // population keeps non-transitive answers the champion line
-                // alone would forget.
+                // alone would forget, and persist it across process restarts.
+                save_policy(
+                    &challenger,
+                    &sparring_dir.join(format!("seed{:020}-round{:04}", cfg.seed, round)),
+                )?;
                 exploiters.push(challenger.clone());
-                if exploiters.len() > MAX_EXPLOITER_POOL {
-                    exploiters.remove(0);
+                if exploiters.len() > sparring_pool_max {
+                    let excess = exploiters.len() - sparring_pool_max;
+                    exploiters.drain(0..excess);
                 }
             }
             // A held candidate is not the next generation's starting point once
@@ -983,7 +1113,7 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     );
 
     let mut csv = String::new();
-    csv.push_str("iter,avg_goal_diff,winrate,goals_a,goals_b,spacing,bunch,possession,pass_att,pass_cmp,pass_completion,pass_fwd,pass_lat,pass_back,shots,shots_scored,conversion,turnovers,balls_won,avg_reward,entropy,value_loss\n");
+    csv.push_str("iter,avg_goal_diff,winrate,goals_a,goals_b,spacing,bunch,possession,pass_att,pass_cmp,pass_completion,pass_fwd,pass_cmp_fwd,pass_completion_fwd,pass_lat,pass_cmp_lat,pass_completion_lat,pass_back,pass_cmp_back,pass_completion_back,shots,shots_scored,conversion,turnovers,balls_won,avg_reward,entropy,value_loss\n");
     let csv_row = |iter: usize,
                    s: &train::Stats,
                    avg_reward: f32,
@@ -991,9 +1121,12 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
                    vloss: f32|
      -> String {
         format!(
-            "{},{:.4},{:.4},{:.4},{:.4},{:.3},{:.4},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.3},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.4},{:.4}\n",
+            "{},{:.4},{:.4},{:.4},{:.4},{:.3},{:.4},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.4},{:.4}\n",
             iter, s.goal_diff, s.winrate, s.ga, s.gb, s.spacing, s.bunch, s.possession,
-            s.pass_att, s.pass_cmp, s.pass_completion(), s.pass_fwd, s.pass_lat, s.pass_back,
+            s.pass_att, s.pass_cmp, s.pass_completion(),
+            s.pass_fwd, s.pass_cmp_fwd, s.forward_pass_completion(),
+            s.pass_lat, s.pass_cmp_lat, s.lateral_pass_completion(),
+            s.pass_back, s.pass_cmp_back, s.backward_pass_completion(),
             s.shots, s.shots_scored, s.conversion(), s.turnovers, s.wins_won, avg_reward, ent, vloss
         )
     };
@@ -1055,7 +1188,7 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
                 best_gated = Some((policy.clone(), it, quality));
             }
             println!(
-                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | sp {:>4.1} | {:>6} | pass {:>4.1} ({:.0}%) | shot {:>3.1}",
+                "{:>5} | {:>+10.3} | {:>8.3} | {:>6.2} {:>6.2} | sp {:>4.1} | {:>6} | pass {:>4.1} ({:.0}% all, {:.0}% fwd, {:.0}% back) | shot {:>3.1}",
                 it,
                 st.goal_diff,
                 st.winrate,
@@ -1065,6 +1198,8 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
                 if gated { "ok" } else { "watch" },
                 st.pass_att,
                 st.pass_completion() * 100.0,
+                st.forward_pass_completion() * 100.0,
+                st.backward_pass_completion() * 100.0,
                 st.shots
             );
             if let Some(correction) = correction {
@@ -1129,11 +1264,11 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
         cfg.final_games, f.goal_diff, f.winrate, f.ga, f.gb, f.pass_cmp, f.spacing, f.bunch * 100.0
     );
     println!(
-        "  pass: {:.1} att, {:.0}% complete ({:.0}% fwd / {:.0}% lat / {:.0}% back) | shots {:.1}, {:.0}% converted | poss {:.0}% | turnovers {:.1} | balls won {:.1}",
+        "  pass: {:.1} att, {:.0}% complete (target 90%); directional completion {:.0}% fwd (target 85%) / {:.0}% lat / {:.0}% back (target 95%) | shots {:.1}, {:.0}% converted | poss {:.0}% | turnovers {:.1} | balls won {:.1}",
         f.pass_att, f.pass_completion() * 100.0,
-        if f.pass_att>0.0 {f.pass_fwd/f.pass_att*100.0} else {0.0},
-        if f.pass_att>0.0 {f.pass_lat/f.pass_att*100.0} else {0.0},
-        if f.pass_att>0.0 {f.pass_back/f.pass_att*100.0} else {0.0},
+        f.forward_pass_completion() * 100.0,
+        f.lateral_pass_completion() * 100.0,
+        f.backward_pass_completion() * 100.0,
         f.shots, f.conversion()*100.0, f.possession*100.0, f.turnovers, f.wins_won
     );
     if f.goal_diff > 0.0 {
@@ -1445,7 +1580,7 @@ fn write_run_manifest(
 
 fn stats_json(s: &train::Stats) -> String {
     format!(
-        "{{\"goal_diff\":{:.6},\"winrate\":{:.6},\"goals_a\":{:.6},\"goals_b\":{:.6},\"spacing\":{:.6},\"bunch\":{:.6},\"possession\":{:.6},\"pass_att\":{:.6},\"pass_cmp\":{:.6},\"pass_completion\":{:.6},\"pass_fwd\":{:.6},\"pass_lat\":{:.6},\"pass_back\":{:.6},\"shots\":{:.6},\"shots_scored\":{:.6},\"conversion\":{:.6},\"turnovers\":{:.6},\"balls_won\":{:.6}}}",
+        "{{\"goal_diff\":{:.6},\"winrate\":{:.6},\"goals_a\":{:.6},\"goals_b\":{:.6},\"spacing\":{:.6},\"bunch\":{:.6},\"possession\":{:.6},\"pass_att\":{:.6},\"pass_cmp\":{:.6},\"pass_completion\":{:.6},\"pass_fwd\":{:.6},\"pass_cmp_fwd\":{:.6},\"pass_completion_fwd\":{:.6},\"pass_lat\":{:.6},\"pass_cmp_lat\":{:.6},\"pass_completion_lat\":{:.6},\"pass_back\":{:.6},\"pass_cmp_back\":{:.6},\"pass_completion_back\":{:.6},\"shots\":{:.6},\"shots_scored\":{:.6},\"conversion\":{:.6},\"turnovers\":{:.6},\"balls_won\":{:.6}}}",
         s.goal_diff,
         s.winrate,
         s.ga,
@@ -1457,8 +1592,14 @@ fn stats_json(s: &train::Stats) -> String {
         s.pass_cmp,
         s.pass_completion(),
         s.pass_fwd,
+        s.pass_cmp_fwd,
+        s.forward_pass_completion(),
         s.pass_lat,
+        s.pass_cmp_lat,
+        s.lateral_pass_completion(),
         s.pass_back,
+        s.pass_cmp_back,
+        s.backward_pass_completion(),
         s.shots,
         s.shots_scored,
         s.conversion(),
@@ -1537,6 +1678,9 @@ mod ladder_tests {
             counts[1] > counts[0] && counts[1] > counts[2],
             "even matchup must dominate: {counts:?}"
         );
-        assert!(counts[0] > 0 && counts[2] > 0, "epsilon keeps everyone reachable: {counts:?}");
+        assert!(
+            counts[0] > 0 && counts[2] > 0,
+            "epsilon keeps everyone reachable: {counts:?}"
+        );
     }
 }
