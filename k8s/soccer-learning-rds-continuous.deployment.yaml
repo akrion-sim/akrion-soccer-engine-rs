@@ -65,6 +65,10 @@ spec:
                 repo="$1"; ref="$2"; dir="$3"
                 if [ -d "${dir}/.git" ]; then
                   echo "source_checkout_mode=fetch dir=${dir} ref=${ref}"
+                  # The checkout lives on a persistent hostPath and can outlive source-repo
+                  # migrations. Reconcile origin before every warm fetch so an old clone cannot
+                  # keep fetching a same-named or branch-incomplete repository indefinitely.
+                  git -C "${dir}" remote set-url origin "${repo}"
                   git -C "${dir}" fetch --depth 1 origin "${ref}"
                   git -C "${dir}" switch --detach FETCH_HEAD
                 else

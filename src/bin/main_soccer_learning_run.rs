@@ -14387,6 +14387,7 @@ mod tests {
 
     #[test]
     fn continuous_manifest_keeps_postgres_neural_and_refresh_required() {
+        assert_continuous_manifest_contains("git -C \"${dir}\" remote set-url origin \"${repo}\"");
         assert_eq!(
             continuous_manifest_env_value("SOCCER_REQUIRE_POSTGRES"),
             Some("true")
