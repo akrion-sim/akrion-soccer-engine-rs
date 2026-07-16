@@ -146,6 +146,10 @@ Rails: back up first (`pg_dump -t … --where`); ~500-row batches, short `statem
    also runs after neural-only writes whose new version has no tabular entries, so an existing
    backlog cannot become stranded. Setting `SOCCER_PG_INLINE_POLICY_PRUNE=true` retains the explicit
    full-backlog drain mode.
+5. **Completed-run reclamation (IMPLEMENTED).** The configured recent-run window is enforced in
+   repeatable batches of at most 5,000 delta rows and 25 fully drained runs per writer pass. Locked
+   rows are skipped, and an old run is not deleted until none of its delta rows remain. This replaces
+   the former unbounded transaction that timed out against the production delta backlog.
 
 ### §6.1 loader-safety audit (2026-07-09)
 

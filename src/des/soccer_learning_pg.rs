@@ -103,6 +103,10 @@ const SOCCER_POLICY_TARGET_ENTRY_PARAMETER_COUNT: usize = 14;
 const SOCCER_POLICY_ENTRY_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_RUN_DELTA_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE: usize = 512;
+/// Retention runs after each completed-run write. Keep each pass small enough that historical
+/// cleanup cannot monopolize the 254+ GB delta table or roll back newly persisted learning data.
+const SOCCER_COMPLETED_RUN_DELTA_DELETE_BATCH_SIZE: i64 = 5_000;
+const SOCCER_COMPLETED_RUN_DELETE_BATCH_SIZE: i64 = 25;
 const SOCCER_POLICY_RETENTION_BRANCH_TIP: &str = "branch_tip";
 const SOCCER_POLICY_INLINE_PRUNE_ENV: &str = "SOCCER_PG_INLINE_POLICY_PRUNE";
 const SOCCER_POLICY_RETAIN_ARCHIVED_ENTRIES_ENV: &str = "SOCCER_PG_RETAIN_ARCHIVED_POLICY_ENTRIES";
@@ -3106,6 +3110,9 @@ impl SoccerLearningPgStore {
             .client
             .transaction()
             .map_err(|err| format!("begin soccer completed-run retention transaction: {err}"))?;
+        tx.batch_execute("set local lock_timeout = '250ms'; set local statement_timeout = '10s'")
+            .map_err(|err| format!("bound soccer completed-run retention transaction: {err}"))?;
+        let delta_delete_batch_size = SOCCER_COMPLETED_RUN_DELTA_DELETE_BATCH_SIZE;
         let deleted_delta_rows = tx
             .execute(
                 r#"
@@ -3119,14 +3126,22 @@ impl SoccerLearningPgStore {
                     where experiment_id = $1::text::uuid
                   ) ranked
                   where keep_rank > $2
+                ), stale_deltas as (
+                  select deltas.ctid
+                  from stale_runs
+                  join des_soccer_learning_run_deltas deltas
+                    on deltas.run_id = stale_runs.id
+                  limit $3
+                  for update of deltas skip locked
                 )
                 delete from des_soccer_learning_run_deltas deltas
-                using stale_runs
-                where deltas.run_id = stale_runs.id
+                using stale_deltas
+                where deltas.ctid = stale_deltas.ctid
                 "#,
-                &[&experiment_id, &keep_latest_runs],
+                &[&experiment_id, &keep_latest_runs, &delta_delete_batch_size],
             )
             .map_err(|err| format!("prune soccer completed-run deltas: {err}"))?;
+        let run_delete_batch_size = SOCCER_COMPLETED_RUN_DELETE_BATCH_SIZE;
         let deleted_runs = tx
             .execute(
                 r#"
@@ -3140,12 +3155,24 @@ impl SoccerLearningPgStore {
                     where experiment_id = $1::text::uuid
                   ) ranked
                   where keep_rank > $2
+                ), deletable_runs as (
+                  select runs.ctid
+                  from stale_runs
+                  join des_soccer_learning_runs runs on runs.id = stale_runs.id
+                  where not exists (
+                    select 1
+                    from des_soccer_learning_run_deltas deltas
+                    where deltas.run_id = runs.id
+                  )
+                  order by runs.created_at asc, runs.id asc
+                  limit $3
+                  for update of runs skip locked
                 )
                 delete from des_soccer_learning_runs runs
-                using stale_runs
-                where runs.id = stale_runs.id
+                using deletable_runs
+                where runs.ctid = deletable_runs.ctid
                 "#,
-                &[&experiment_id, &keep_latest_runs],
+                &[&experiment_id, &keep_latest_runs, &run_delete_batch_size],
             )
             .map_err(|err| format!("prune soccer completed runs: {err}"))?;
         tx.commit()
@@ -7191,6 +7218,10 @@ mod tests {
             soccer_completed_run_retention_limit(usize::MAX),
             Some(i64::MAX)
         );
+        assert!(SOCCER_COMPLETED_RUN_DELTA_DELETE_BATCH_SIZE > 0);
+        assert!(SOCCER_COMPLETED_RUN_DELTA_DELETE_BATCH_SIZE <= 5_000);
+        assert!(SOCCER_COMPLETED_RUN_DELETE_BATCH_SIZE > 0);
+        assert!(SOCCER_COMPLETED_RUN_DELETE_BATCH_SIZE <= 25);
     }
 
     #[test]
