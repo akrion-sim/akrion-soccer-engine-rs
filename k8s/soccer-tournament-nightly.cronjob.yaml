@@ -9,16 +9,12 @@
 #   * schedule "0 2 * * *" + spec.timeZone (k8s CronJobs are UTC unless timeZone
 #     is set; 2am LOCAL requires it).
 #   * concurrencyPolicy: Forbid — never overlap two tournaments.
-#   * activeDeadlineSeconds: 28800 (8h) — NOT a 7am stop, and NOT the normal end.
-#     With 30-min matches (MATCH_SECONDS=1800) the full 128-team / T=2 bracket
-#     finishes in ~2.4h, so the 8h cap is now pure HANG-protection a healthy run
-#     never reaches. (At 60-min matches it needed >8h and was hard-killed at the
-#     halfway mark, promoting nothing — DB tournament id=46 stranded 'running',
-#     verified 2026-06-18.) Even if the cap ever fires, learning is no longer lost:
-#     SOFT_DEADLINE_SECONDS stops gracefully between waves and the run is marked
-#     status='partial' (banking its top-16 brains into the next generation's elite
-#     pool), and a run left 'running' by a hard kill is reconciled to 'partial' at
-#     the next run's start. So the night's learning ALWAYS feeds the GA.
+#   * no activeDeadlineSeconds: per owner directive (2026-06-18), the bracket is
+#     allowed to run open-ended until the champion and elite pool are persisted.
+#   * SOCCER_TOURNAMENT_MATCH_WATCHDOG_SECONDS remains enabled so one stuck
+#     fixture can be aborted without imposing an overall tournament deadline.
+#   * concurrencyPolicy: Forbid is the overlap guard if a tournament is still
+#     running when the next nightly schedule fires.
 #
 # Runtime budget: the bracket runs independent fixtures in parallel on
 # SOCCER_TOURNAMENT_THREADS worker threads. Keep this at 2 by default so AWS EC2
@@ -28,11 +24,11 @@
 # World-Cup-style format's critical path is roughly 129 "match-times"; at the
 # measured neural-on throughput (~137 engine-ticks/sec, dt=0.2):
 #   match_seconds  ticks/match  wall/match  ~129 match-times (T=2)
-#      3600 (60m)    18000        ~131s       ~4.7h   <- default, narrow fit
-#      5400 (90m)    27000        ~197s       ~7.1h   <- does not fit this cap
-# activeDeadlineSeconds hard-kills an overrun. SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS
-# stops between fixture waves first so the runner can persist failure state and
-# salvage the best brain before Kubernetes kills the pod.
+#      1800 (30m)     9000        ~66s        ~2.4h   <- default
+#      3600 (60m)    18000        ~131s       ~4.7h
+#      5400 (90m)    27000        ~197s       ~7.1h
+# There is intentionally no overall job/app soft cap. Per-fixture watchdogs and
+# the global tournament lease still protect the cluster from stuck or duplicate work.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -51,10 +47,9 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      # 8h backstop (NOT a 7am stop) — the bracket is allowed to finish past the
-      # 2am-7am window; this only guards against a true hang. Includes the ~4-5 min
-      # cold clone+build (the build dir is a per-pod emptyDir — see volumes below).
-      activeDeadlineSeconds: 28800
+      # No hard stop: the tournament runs open-ended to completion. The per-match
+      # watchdog below handles stuck fixtures; concurrencyPolicy: Forbid prevents
+      # overlapping nightly tournament jobs.
       backoffLimit: 1
       template:
         metadata:
@@ -185,12 +180,10 @@ spec:
                 # keep the bracket moving. Set 0 to disable.
                 - name: SOCCER_TOURNAMENT_MATCH_WATCHDOG_SECONDS
                   value: "900"
-                # Soft cap is measured from binary start, after clone/build; with
-                # the current ~4-5m build this leaves roughly 5m before the hard
-                # job cap for failure marking, lock release, salvage promotion,
-                # and pod termination.
+                # 0 = disabled. There is no overall tournament deadline; per-fixture
+                # watchdogs still prevent a single stuck match from pinning the run.
                 - name: SOCCER_TOURNAMENT_SOFT_DEADLINE_SECONDS
-                  value: "17400"
+                  value: "0"
                 # Parallel workers - keep == the CPU limit below. Each worker runs one
                 # full SoccerMatch at a time.
                 - name: SOCCER_TOURNAMENT_THREADS
