@@ -1764,6 +1764,11 @@ pub struct SoccerMatch {
     /// Dedicated AWAY-team joint actor. `None` preserves the historical shared-home fallback for
     /// single-net matches; per-team tournament/self-play installs keep each brain's actor isolated.
     pub(crate) away_policy_head: Option<SoccerPolicyHead>,
+    /// Actor-independent MAPPO value baselines. The Home/shared head represents
+    /// Home value; a shared Away actor uses its negation. Dedicated Away brains
+    /// carry their own baseline and checkpoint sidecar.
+    pub(crate) central_critic_head: Option<SoccerCentralCriticHead>,
+    pub(crate) away_central_critic_head: Option<SoccerCentralCriticHead>,
     /// HOME/shared independent pass/dribble/shot specialist actors over the shared actor features.
     /// Present only when the actor is active AND `DD_SOCCER_ENABLE_SKILL_POLICY_HEADS` is set; their
     /// log-probabilities refine technical action selection on top of the joint actor. Away uses this
@@ -8135,6 +8140,277 @@ mod tests {
     }
 
     #[test]
+    fn field_vector_v2_uses_full_pitch_scale_and_relative_kinematics() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_FIELD_VECTOR_V2", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            seed: 9_201,
+            ..MatchConfig::default()
+        });
+        let actor_index = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Home)
+            .expect("home actor");
+        let target_index = sim
+            .players
+            .iter()
+            .position(|player| player.team == Team::Away)
+            .expect("away target");
+        let actor_id = sim.players[actor_index].id;
+        let target_id = sim.players[target_index].id;
+        sim.players[actor_index].position = Vec2::new(40.0, 10.0);
+        sim.players[actor_index].velocity = Vec2::new(2.0, 3.0);
+        sim.players[actor_index].acceleration = Vec2::new(1.0, 2.0);
+        sim.players[actor_index].jerk = Vec2::new(4.0, 5.0);
+        sim.players[target_index].position = Vec2::new(40.0, 70.0);
+        sim.players[target_index].velocity = Vec2::new(2.0, 8.0);
+        sim.players[target_index].acceleration = Vec2::new(1.0, 6.0);
+        sim.players[target_index].jerk = Vec2::new(4.0, 15.0);
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let vector = soccer_field_player_motion_block(&snapshot, actor_id, Team::Home);
+        let mut ordered = snapshot.players.iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            (right.team == Team::Home)
+                .cmp(&(left.team == Team::Home))
+                .then(left.id.cmp(&right.id))
+        });
+        let slot = ordered
+            .iter()
+            .position(|player| player.id == target_id)
+            .expect("target slot");
+        let offset = slot * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+        assert!((f64::from(vector[offset]) - 0.5).abs() < 1e-6);
+        assert!((f64::from(vector[offset + 2]) - 0.5).abs() < 1e-6);
+
+        sim.players[target_index].position.y = 110.0;
+        let farther = WorldSnapshot::from_match(&sim);
+        let farther_vector = soccer_field_player_motion_block(&farther, actor_id, Team::Home);
+        assert!((f64::from(farther_vector[offset]) - (100.0 / 120.0)).abs() < 1e-6);
+        assert!(farther_vector[offset] > vector[offset]);
+    }
+
+    #[test]
+    fn field_vector_v2_is_galilean_and_team_mirror_invariant() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_FIELD_VECTOR_V2", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            seed: 9_202,
+            ..MatchConfig::default()
+        });
+        let actor_id = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role == PlayerRole::Midfielder)
+            .expect("home midfielder")
+            .id;
+        for (index, player) in sim.players.iter_mut().enumerate() {
+            player.velocity = Vec2::new(index as f64 * 0.07 - 0.5, index as f64 * 0.11 - 0.8);
+            player.acceleration = Vec2::new(index as f64 * 0.03, index as f64 * -0.02);
+            player.jerk = Vec2::new(index as f64 * -0.05, index as f64 * 0.04);
+        }
+        sim.ball.velocity = Vec2::new(4.0, -3.0);
+        sim.ball.acceleration = Vec2::new(2.0, 1.0);
+        sim.ball.jerk = Vec2::new(-5.0, 7.0);
+        let original = WorldSnapshot::from_match(&sim);
+        let expected = soccer_field_player_motion_block(&original, actor_id, Team::Home);
+
+        for player in &mut sim.players {
+            player.velocity += Vec2::new(3.0, -2.0);
+            player.acceleration += Vec2::new(-1.0, 4.0);
+            player.jerk += Vec2::new(6.0, -8.0);
+        }
+        sim.ball.velocity += Vec2::new(3.0, -2.0);
+        sim.ball.acceleration += Vec2::new(-1.0, 4.0);
+        sim.ball.jerk += Vec2::new(6.0, -8.0);
+        let boosted = WorldSnapshot::from_match(&sim);
+        assert_eq!(
+            &soccer_field_player_motion_block(&boosted, actor_id, Team::Home)
+                [..SOCCER_NEURAL_FIELD_MOTION_PLAYERS * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER],
+            &expected[..SOCCER_NEURAL_FIELD_MOTION_PLAYERS * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER],
+            "a shared change of reference velocity/acceleration/jerk must cancel"
+        );
+        let mut entity_before = Vec::new();
+        push_soccer_field_motion_entity(
+            &mut entity_before,
+            Vec2::new(18.0, 77.0),
+            Vec2::new(4.0, -3.0),
+            Vec2::new(2.0, 1.0),
+            Vec2::new(-5.0, 7.0),
+            Vec2::new(40.0, 50.0),
+            Vec2::new(1.0, 2.0),
+            Vec2::new(-1.0, 4.0),
+            Vec2::new(6.0, -8.0),
+            120.0,
+            80.0,
+            1.0,
+            true,
+        );
+        let mut entity_boosted = Vec::new();
+        push_soccer_field_motion_entity(
+            &mut entity_boosted,
+            Vec2::new(18.0, 77.0),
+            Vec2::new(7.0, -5.0),
+            Vec2::new(1.0, 5.0),
+            Vec2::new(1.0, -1.0),
+            Vec2::new(40.0, 50.0),
+            Vec2::new(4.0, 0.0),
+            Vec2::new(-2.0, 8.0),
+            Vec2::new(12.0, -16.0),
+            120.0,
+            80.0,
+            1.0,
+            true,
+        );
+        assert_eq!(entity_before, entity_boosted);
+
+        for player in &mut sim.players {
+            player.team = player.team.other();
+            player.position = Vec2::new(
+                sim.config.field_width_yards - player.position.x,
+                sim.config.field_length_yards - player.position.y,
+            );
+            player.velocity = Vec2::new(-player.velocity.x, -player.velocity.y);
+            player.acceleration = Vec2::new(-player.acceleration.x, -player.acceleration.y);
+            player.jerk = Vec2::new(-player.jerk.x, -player.jerk.y);
+        }
+        sim.ball.position = Vec2::new(
+            sim.config.field_width_yards - sim.ball.position.x,
+            sim.config.field_length_yards - sim.ball.position.y,
+        );
+        sim.ball.velocity = Vec2::new(-sim.ball.velocity.x, -sim.ball.velocity.y);
+        sim.ball.acceleration = Vec2::new(-sim.ball.acceleration.x, -sim.ball.acceleration.y);
+        sim.ball.jerk = Vec2::new(-sim.ball.jerk.x, -sim.ball.jerk.y);
+        let mirrored = WorldSnapshot::from_match(&sim);
+        assert_eq!(
+            &soccer_field_player_motion_block(&mirrored, actor_id, Team::Away)
+                [..SOCCER_NEURAL_FIELD_MOTION_PLAYERS * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER],
+            &expected[..SOCCER_NEURAL_FIELD_MOTION_PLAYERS * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER],
+            "180-degree team mirroring must preserve the actor-canonical tensor"
+        );
+    }
+
+    #[test]
+    fn central_critic_state_is_shared_sensitive_and_actor_isolated() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_CENTRAL_CRITIC_V2", "1");
+        let sim = SoccerMatch::default_11v11(MatchConfig {
+            seed: 9_203,
+            ..MatchConfig::default()
+        });
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let actors = snapshot.players.iter().take(2).collect::<Vec<_>>();
+        let transition_a = sim.neural_decision_transition(
+            &snapshot,
+            actors[0].id,
+            actors[0].team,
+            actors[0].role,
+            &snapshot.mdp_state_for_player(actors[0].id),
+            &snapshot.observation_for(actors[0].id),
+        );
+        let transition_b = sim.neural_decision_transition(
+            &snapshot,
+            actors[1].id,
+            actors[1].team,
+            actors[1].role,
+            &snapshot.mdp_state_for_player(actors[1].id),
+            &snapshot.observation_for(actors[1].id),
+        );
+        assert_eq!(
+            transition_a.decision_context.central_critic_state.len(),
+            SOCCER_CENTRAL_CRITIC_FEATURE_DIM
+        );
+        assert_eq!(
+            transition_a.decision_context.central_critic_state,
+            transition_b.decision_context.central_critic_state,
+            "central state must not depend on the acting player"
+        );
+        let actor_features = soccer_neural_transition_features(&transition_a);
+        let mut privileged_changed = transition_a.clone();
+        privileged_changed
+            .decision_context
+            .central_critic_state
+            .fill(0.875);
+        assert_eq!(
+            soccer_neural_transition_features(&privileged_changed),
+            actor_features,
+            "privileged critic state must never leak into actor/Q features"
+        );
+
+        let mut moved = SoccerMatch::default_11v11(MatchConfig {
+            seed: 9_203,
+            ..MatchConfig::default()
+        });
+        let far_index = moved.players.len() - 1;
+        moved.players[far_index].position.x += 7.0;
+        let moved_state = soccer_central_critic_state(&WorldSnapshot::from_match(&moved));
+        assert_ne!(
+            transition_a.decision_context.central_critic_state, moved_state,
+            "a remote player's motion must influence the centralized state"
+        );
+    }
+
+    #[test]
+    fn central_critic_trains_predicts_and_round_trips_separately() {
+        let _env_lock = soccer_world_env_lock();
+        let _gate = set_test_env_var("DD_SOCCER_ENABLE_CENTRAL_CRITIC_V2", "1");
+        let mut config = MatchConfig {
+            seed: 9_204,
+            learning_enabled: true,
+            ..MatchConfig::default()
+        };
+        config.neural_learning.enabled = true;
+        config.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
+        let mut sim = SoccerMatch::default_11v11(config);
+        let home_id = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home)
+            .expect("home player")
+            .id;
+        let away_id = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Away)
+            .expect("away player")
+            .id;
+        let mut replay = Vec::new();
+        for tick in 1..=4 {
+            let mut home = world_test_transition(&sim, home_id, "hold", tick);
+            home.reward = 1.0 + tick as f64 * 0.1;
+            replay.push(home);
+            let mut away = world_test_transition(&sim, away_id, "hold", tick);
+            away.reward = -1.0;
+            replay.push(away);
+        }
+        sim.train_central_critic_heads_from_replay(&replay);
+        let head = sim
+            .central_critic_head
+            .as_ref()
+            .expect("central critic allocated");
+        assert!(head.ready());
+        let state = &replay[0].decision_context.central_critic_state;
+        let prediction = sim
+            .central_critic_value_for(Team::Home, state)
+            .expect("finite centralized value");
+        assert!(prediction.is_finite());
+        assert_eq!(
+            sim.central_critic_value_for(Team::Away, state),
+            Some(-prediction),
+            "single-brain Away value is the zero-sum perspective of Home"
+        );
+
+        let snapshot = head.to_snapshot();
+        let restored = SoccerCentralCriticHead::from_snapshot(&snapshot).expect("restore head");
+        assert_eq!(restored.training_steps, head.training_steps);
+        let restored_prediction = restored
+            .predict(state, sim.config.neural_learning.sanitized_target_scale())
+            .expect("restored prediction");
+        assert!((restored_prediction - prediction).abs() < 1e-9);
+    }
+
+    #[test]
     fn neural_candidate_transition_refreshes_target_context_per_plan() {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             duration_seconds: 0.1,
@@ -14263,6 +14539,8 @@ impl SoccerMatch {
             neural_blend: config.neural_blend,
             policy_head: None,
             away_policy_head: None,
+            central_critic_head: None,
+            away_central_critic_head: None,
             skill_policy_heads: None,
             away_skill_policy_heads: None,
             keeper_policy_head: None,
@@ -14527,6 +14805,8 @@ impl SoccerMatch {
             neural_blend: SoccerNeuralBlendConfig::default(),
             policy_head: None,
             away_policy_head: None,
+            central_critic_head: None,
+            away_central_critic_head: None,
             skill_policy_heads: None,
             away_skill_policy_heads: None,
             keeper_policy_head: None,
@@ -14871,6 +15151,11 @@ impl SoccerMatch {
         } else {
             None
         };
+        let central_critic_head = if let Some(head) = snapshot.central_critic_head.as_deref() {
+            Some(SoccerCentralCriticHead::from_snapshot(head)?)
+        } else {
+            None
+        };
         let skill_policy_heads =
             if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_deref() {
                 Some(soccer_skill_policy_heads_from_snapshot(
@@ -14932,6 +15217,8 @@ impl SoccerMatch {
         self.neural_learner = neural_learner;
         self.policy_head = policy_head;
         self.away_policy_head = None;
+        self.central_critic_head = central_critic_head;
+        self.away_central_critic_head = None;
         self.skill_policy_heads = skill_policy_heads;
         self.keeper_policy_head = keeper_policy_head;
         self.away_skill_policy_heads = None;
@@ -15152,6 +15439,8 @@ impl SoccerMatch {
         self.away_neural_learner = None;
         self.policy_head = None;
         self.away_policy_head = None;
+        self.central_critic_head = None;
+        self.away_central_critic_head = None;
         self.home_neural_frozen = false;
         self.away_neural_frozen = false;
         self.skill_policy_heads = None;
@@ -15188,6 +15477,16 @@ impl SoccerMatch {
                 if let Some(policy_head) = self.policy_head_for(team) {
                     snapshot.policy_head = Some(Box::new(soccer_policy_head_snapshot(policy_head)));
                 }
+                let central_critic = match team {
+                    Team::Home => self.central_critic_head.as_ref(),
+                    Team::Away => self.away_central_critic_head.as_ref().or_else(|| {
+                        (self.away_neural_learner.is_none() && !self.away_neural_frozen)
+                            .then_some(self.central_critic_head.as_ref())
+                            .flatten()
+                    }),
+                };
+                snapshot.central_critic_head =
+                    central_critic.map(|head| Box::new(head.to_snapshot()));
                 if let Some(skill_policy_heads) = self.skill_policy_heads_for(team) {
                     snapshot.skill_policy_heads = Some(Box::new(
                         soccer_skill_policy_heads_snapshot(skill_policy_heads),
@@ -15393,6 +15692,7 @@ impl SoccerMatch {
             return Ok(());
         }
         let mut restored_skill_policy_heads = None;
+        let mut restored_central_critic_head = None;
         // Reinstalling a team brain is replacement, not overlay: a checkpoint without an actor
         // must not silently inherit that team's previously installed actor.
         match team {
@@ -15412,6 +15712,11 @@ impl SoccerMatch {
                         Team::Away => self.away_policy_head = Some(restored),
                     }
                 }
+                restored_central_critic_head = snapshot
+                    .central_critic_head
+                    .as_deref()
+                    .map(SoccerCentralCriticHead::from_snapshot)
+                    .transpose()?;
                 if let Some(keeper_policy_head_snapshot) = snapshot.keeper_policy_head.as_deref() {
                     self.keeper_policy_head = Some(soccer_keeper_policy_head_from_snapshot(
                         keeper_policy_head_snapshot,
@@ -15466,12 +15771,14 @@ impl SoccerMatch {
                     Team::Home => {
                         self.neural_learner = None;
                         self.policy_head = None;
+                        self.central_critic_head = None;
                         self.skill_policy_heads = None;
                         self.clear_auxiliary_heads_for(Team::Home);
                     }
                     Team::Away => {
                         self.away_neural_learner = None;
                         self.away_policy_head = None;
+                        self.away_central_critic_head = None;
                         self.away_skill_policy_heads = None;
                         self.clear_auxiliary_heads_for(Team::Away);
                     }
@@ -15483,11 +15790,13 @@ impl SoccerMatch {
             Team::Home => {
                 self.neural_learner = Some(learner);
                 self.home_neural_frozen = frozen;
+                self.central_critic_head = restored_central_critic_head;
                 self.skill_policy_heads = restored_skill_policy_heads;
             }
             Team::Away => {
                 self.away_neural_learner = Some(learner);
                 self.away_neural_frozen = frozen;
+                self.away_central_critic_head = restored_central_critic_head;
                 self.away_skill_policy_heads = restored_skill_policy_heads;
             }
         }
@@ -15505,6 +15814,7 @@ impl SoccerMatch {
                 self.neural_learner = None;
                 self.home_neural_frozen = true;
                 self.policy_head = None;
+                self.central_critic_head = None;
                 self.skill_policy_heads = None;
                 self.clear_auxiliary_heads_for(Team::Home);
             }
@@ -15512,6 +15822,7 @@ impl SoccerMatch {
                 self.away_neural_learner = None;
                 self.away_neural_frozen = true;
                 self.away_policy_head = None;
+                self.away_central_critic_head = None;
                 self.away_skill_policy_heads = None;
                 self.clear_auxiliary_heads_for(Team::Away);
             }
@@ -23163,11 +23474,24 @@ impl SoccerMatch {
         // transition is later valued by its own team's critic.
         let reward_fallback_ready = fast_actor_reward_fallback_enabled();
         let home_critic_ready = self
-            .neural_learner_for(Team::Home)
-            .map_or(false, |learner| learner.has_prediction_network());
+            .central_critic_head
+            .as_ref()
+            .is_some_and(SoccerCentralCriticHead::ready)
+            || self
+                .neural_learner_for(Team::Home)
+                .is_some_and(|learner| learner.has_prediction_network());
         let away_critic_ready = self
-            .neural_learner_for(Team::Away)
-            .map_or(false, |learner| learner.has_prediction_network());
+            .away_central_critic_head
+            .as_ref()
+            .is_some_and(SoccerCentralCriticHead::ready)
+            || (self.away_neural_learner.is_none()
+                && self
+                    .central_critic_head
+                    .as_ref()
+                    .is_some_and(SoccerCentralCriticHead::ready))
+            || self
+                .neural_learner_for(Team::Away)
+                .is_some_and(|learner| learner.has_prediction_network());
         let home_ready =
             (home_critic_ready || reward_fallback_ready) && !self.neural_team_frozen(Team::Home);
         let away_ready =
@@ -23211,12 +23535,18 @@ impl SoccerMatch {
         let values: Vec<f64> = replay
             .iter()
             .map(|transition| {
-                self.neural_learner_for(transition.team)
-                    .and_then(|learner| {
-                        learner.predict_value(&soccer_neural_transition_features(transition))
-                    })
-                    .map(|value| value * target_scale)
-                    .unwrap_or(0.0)
+                self.central_critic_value_for(
+                    transition.team,
+                    &transition.decision_context.central_critic_state,
+                )
+                .or_else(|| {
+                    self.neural_learner_for(transition.team)
+                        .and_then(|learner| {
+                            learner.predict_value(&soccer_neural_transition_features(transition))
+                        })
+                        .map(|value| value * target_scale)
+                })
+                .unwrap_or(0.0)
             })
             .collect();
 
@@ -23680,6 +24010,125 @@ impl SoccerMatch {
             Team::Home => self.policy_head.as_ref(),
             Team::Away if self.away_neural_learner.is_some() => self.away_policy_head.as_ref(),
             Team::Away => self.policy_head.as_ref(),
+        }
+    }
+
+    fn central_critic_value_for(&self, team: Team, state: &[f32]) -> Option<f64> {
+        if !dd_soccer_enable_central_critic_v2() {
+            return None;
+        }
+        let target_scale = self.config.neural_learning.sanitized_target_scale();
+        match team {
+            Team::Home => self
+                .central_critic_head
+                .as_ref()
+                .filter(|head| head.ready())
+                .and_then(|head| head.predict(state, target_scale)),
+            Team::Away => self
+                .away_central_critic_head
+                .as_ref()
+                .filter(|head| head.ready())
+                .and_then(|head| head.predict(state, target_scale))
+                .or_else(|| {
+                    // Historical single-brain runs share one zero-sum critic.
+                    // The input remains actor-independent; only the value perspective flips.
+                    (self.away_neural_learner.is_none() && !self.away_neural_frozen)
+                        .then(|| {
+                            self.central_critic_head
+                                .as_ref()
+                                .filter(|head| head.ready())
+                                .and_then(|head| head.predict(state, target_scale))
+                                .map(|value| -value)
+                        })
+                        .flatten()
+                }),
+        }
+    }
+
+    fn ensure_central_critic_head_for_training(&mut self, team: Team) {
+        if !dd_soccer_enable_central_critic_v2() || self.neural_team_frozen(team) {
+            return;
+        }
+        match team {
+            Team::Home => {
+                if self.central_critic_head.is_none() {
+                    self.central_critic_head = Some(SoccerCentralCriticHead::new(self.config.seed));
+                }
+            }
+            Team::Away if self.away_neural_learner.is_some() => {
+                if self.away_central_critic_head.is_none() {
+                    self.away_central_critic_head =
+                        Some(SoccerCentralCriticHead::new(self.config.seed ^ 0xA11A_0A11));
+                }
+            }
+            Team::Away => {}
+        }
+    }
+
+    fn central_critic_training_samples(
+        &self,
+        replay: &[SoccerLearningTransition],
+        team: Team,
+    ) -> Vec<(Vec<f32>, f64)> {
+        let tick_rewards = soccer_actor_advantage_tick_rewards(replay);
+        let mut states_by_tick = std::collections::BTreeMap::<u64, Vec<f32>>::new();
+        for transition in replay.iter().filter(|transition| {
+            transition.team == team
+                && !learned_mpc_rejected_action_counterexample(transition)
+                && transition.decision_context.central_critic_state.len()
+                    == SOCCER_CENTRAL_CRITIC_FEATURE_DIM
+        }) {
+            states_by_tick
+                .entry(transition.tick)
+                .or_insert_with(|| transition.decision_context.central_critic_state.clone());
+        }
+        let gamma = self
+            .team_policies
+            .as_ref()
+            .map(|policies| soccer_q_sanitized_gamma(policies.policy(team).options.gamma))
+            .unwrap_or_else(|| soccer_q_sanitized_gamma(SoccerQPolicyOptions::default().gamma));
+        let ordered = states_by_tick.into_iter().collect::<Vec<_>>();
+        let mut reversed = Vec::with_capacity(ordered.len());
+        let mut next_return = 0.0;
+        let mut next_tick = None;
+        for (tick, state) in ordered.into_iter().rev() {
+            let reward = tick_rewards.get(&tick).map_or(0.0, |tick_reward| {
+                let own = tick_reward.average_for(team);
+                if tick_reward.has_both_teams() {
+                    own - tick_reward.average_for(team.other())
+                } else {
+                    own
+                }
+            });
+            let contiguous = next_tick.is_some_and(|next: u64| {
+                next.saturating_sub(tick) <= SOCCER_TRAJECTORY_MAX_DECISION_GAP_TICKS
+            });
+            let target = reward + if contiguous { gamma * next_return } else { 0.0 };
+            reversed.push((state, target));
+            next_return = target;
+            next_tick = Some(tick);
+        }
+        reversed.reverse();
+        reversed
+    }
+
+    fn train_central_critic_heads_from_replay(&mut self, replay: &[SoccerLearningTransition]) {
+        if !dd_soccer_enable_central_critic_v2() || replay.is_empty() {
+            return;
+        }
+        let target_scale = self.config.neural_learning.sanitized_target_scale();
+        let target_clip = self.config.neural_learning.sanitized_target_clip();
+        let home_samples = self.central_critic_training_samples(replay, Team::Home);
+        self.ensure_central_critic_head_for_training(Team::Home);
+        if let Some(head) = self.central_critic_head.as_mut() {
+            head.train(&home_samples, target_scale, target_clip);
+        }
+        if self.away_neural_learner.is_some() {
+            let away_samples = self.central_critic_training_samples(replay, Team::Away);
+            self.ensure_central_critic_head_for_training(Team::Away);
+            if let Some(head) = self.away_central_critic_head.as_mut() {
+                head.train(&away_samples, target_scale, target_clip);
+            }
         }
     }
 
@@ -24189,6 +24638,9 @@ impl SoccerMatch {
         };
         self.train_neural_value_models(&bellman_replay);
         let policy_samples_trained = self.train_actor_policy_head_from_batch(policy_training_batch);
+        // Update the separate global V(s) only after this episode's actor step, so
+        // GAE uses a detached pre-update baseline just like the existing critic path.
+        self.train_central_critic_heads_from_replay(&replay);
         // Dedicated goalkeeper head: trained on the keeper's own transitions (gate checked when
         // the samples were built, so a non-empty batch already implies the gate is on). Under the
         // curriculum, the keeper only trains in its focused phase or the joint phase.
@@ -28036,11 +28488,15 @@ impl SoccerMatch {
             return;
         }
         let duel_reward = self
-            .steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position);
+            .steal_reward_scaled_for_box(WON_FIFTY_FIFTY_DUEL_REWARD_POINTS, self.ball.position)
+            * anchored_currency_scale();
         self.record_reward_event(winner, duel_reward);
         for (player_id, team) in contenders {
             if team != winner_team {
-                self.record_reward_event(player_id, -LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS);
+                self.record_reward_event(
+                    player_id,
+                    -LOST_FIFTY_FIFTY_DUEL_PENALTY_POINTS * anchored_currency_scale(),
+                );
             }
         }
     }
@@ -28096,7 +28552,7 @@ impl SoccerMatch {
                 * freshness
                 * action_scale
         };
-        self.record_reward_event(long_ball.launcher_id, amount);
+        self.record_reward_event(long_ball.launcher_id, amount * anchored_currency_scale());
     }
 
     fn recent_possession_reward_sequence(
@@ -28266,6 +28722,21 @@ impl SoccerMatch {
                 < 1e-9
         );
         let scale = self.shot_reward_distance_scale(shooting_team, shooter);
+        if anchored_rewards_enabled() {
+            // ANCHORED FINISHING (docs/reward-anchoring.md §2): the shooter's
+            // on-frame shot pays ≥ 50 points DIRECTLY — not chain-diluted — with
+            // the cap set by the field-vector context (distance taper × xG). An
+            // on-frame 80-yarder caps at the floor. This replaces the inert
+            // DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE, which lived below the
+            // `infer_discrete_events` early-return and never fired in self-play.
+            // The legacy chain pool below still pays the build-up (passers) at
+            // its small historical magnitude, keeping shooter total ≤ 0.45·goal.
+            self.record_reward_event_with_kind(
+                shooter,
+                anchored_on_frame_shot_points(scale),
+                SoccerRewardEventKind::ShotOnTarget,
+            );
+        }
         self.record_recent_defensive_shot_on_target_penalties(shooting_team.other(), scale);
         // The field vector (shot origin/distance/angle/keeper context) selects
         // the value inside the grounded band. A speculative 80-yard effort falls
@@ -28314,8 +28785,9 @@ impl SoccerMatch {
         let danger = (1.0
             - shot.origin.distance(attacked_goal) / GOALKEEPER_SAVE_DANGER_REFERENCE_YARDS)
             .clamp(0.0, 1.0);
-        let amount =
-            GOALKEEPER_SAVE_BASE_REWARD_POINTS + GOALKEEPER_SAVE_DANGER_REWARD_POINTS * danger;
+        let amount = (GOALKEEPER_SAVE_BASE_REWARD_POINTS
+            + GOALKEEPER_SAVE_DANGER_REWARD_POINTS * danger)
+            * anchored_currency_scale();
         self.record_reward_event_with_kind(
             keeper_id,
             amount,
@@ -28715,7 +29187,10 @@ impl SoccerMatch {
         true
     }
 
-    fn record_contextual_goal_rewards(
+    // pub(crate) so tests can exercise the contextual-distribution mechanism
+    // directly: the default goal path no longer routes through it (see
+    // `record_goal_rewards` — it is legacy-A/B only there).
+    pub(crate) fn record_contextual_goal_rewards(
         &mut self,
         scoring_team: Team,
         shooter: Option<usize>,
@@ -28944,22 +29419,69 @@ impl SoccerMatch {
             shooter,
             BUILDUP_CHAIN_CREDIT_GOAL_BASE_POINTS,
         );
-        if let Some(reward_points) =
-            self.direct_turnover_goal_reward_points(scoring_team, shooter, previous_touch_team)
-        {
-            self.record_possession_reward_pattern_with_kind(
-                scoring_team,
-                shooter,
-                &[reward_points],
-                SoccerRewardEventKind::Goal,
-            );
+        if legacy_goal_multi_credit_enabled() {
+            // A/B-ONLY legacy stack (see `legacy_goal_multi_credit_enabled`):
+            // turnover goals pay a reduced pool, and a built-up goal enters
+            // learning through THREE stacked mechanisms — chain events, a
+            // cloned direct-shot transition, and the contextual-deferred pool
+            // — so the same conversion counted ~3× the anchor in total.
+            if let Some(reward_points) =
+                self.direct_turnover_goal_reward_points(scoring_team, shooter, previous_touch_team)
+            {
+                self.record_possession_reward_pattern_with_kind(
+                    scoring_team,
+                    shooter,
+                    &[reward_points],
+                    SoccerRewardEventKind::Goal,
+                );
+                if let Some(shooter) = shooter {
+                    self.queue_direct_shot_outcome_learning_credit(
+                        shooter,
+                        scoring_team,
+                        reward_points,
+                        SoccerRewardEventKind::Goal,
+                    );
+                }
+            } else {
+                self.record_weighted_possession_chain_reward_at_with_kind(
+                    self.tick,
+                    scoring_team,
+                    shooter,
+                    live_goal_reward_points(),
+                    &GOAL_CHAIN_REWARD_PATTERN,
+                    SoccerRewardEventKind::Goal,
+                );
+                if let Some(shooter) = shooter {
+                    self.queue_direct_shot_outcome_learning_credit(
+                        shooter,
+                        scoring_team,
+                        live_goal_reward_points(),
+                        SoccerRewardEventKind::Goal,
+                    );
+                }
+                self.record_contextual_goal_rewards(
+                    scoring_team,
+                    shooter,
+                    live_goal_reward_points(),
+                );
+            }
         } else {
-            debug_assert!(GOAL_CHAIN_REWARD_PATTERN.iter().sum::<f64>() > 0.0);
+            // THE CONVERSION ANCHOR (docs/reward-anchoring.md §1): every goal —
+            // steal-and-finish included — pays exactly ONE
+            // `live_goal_reward_points()` (500) pool, distributed over the
+            // scoring possession chain. The recorder normalizes the pattern
+            // weights, so the distributed credit sums to the pool EXACTLY and
+            // "a conversion is worth 500" is a constant the learner can bank
+            // on. A direct-turnover chain contains only the shooter, so the
+            // whole pool lands there — the old 250 discount is gone; the
+            // recency pattern already handles how little the rest of the team
+            // contributed. (`direct_turnover_goal_reward_points` remains for
+            // the legacy A/B branch above.)
             self.record_weighted_possession_chain_reward_at_with_kind(
                 self.tick,
                 scoring_team,
                 shooter,
-                GOAL_REWARD_POINTS,
+                live_goal_reward_points(),
                 &GOAL_CHAIN_REWARD_PATTERN,
                 SoccerRewardEventKind::Goal,
             );
@@ -28982,10 +29504,15 @@ impl SoccerMatch {
             (Team::Away, self.score_away - self.score_home)
         };
         let margin = f64::from(margin.saturating_sub(1));
-        let win_amount =
-            MATCH_RESULT_WIN_PLAYER_REWARD + margin * MATCH_RESULT_MARGIN_REWARD_PER_GOAL;
-        let loss_amount =
-            -(MATCH_RESULT_LOSS_PLAYER_PENALTY + margin * MATCH_RESULT_MARGIN_PENALTY_PER_GOAL);
+        // Under the anchored currency the WIN anchor itself (±1000) travels on
+        // the match-outcome broadcast label; this terminal per-player event
+        // scales uniformly and stays the small margin-flavored component.
+        let win_amount = (MATCH_RESULT_WIN_PLAYER_REWARD
+            + margin * MATCH_RESULT_MARGIN_REWARD_PER_GOAL)
+            * anchored_currency_scale();
+        let loss_amount = -(MATCH_RESULT_LOSS_PLAYER_PENALTY
+            + margin * MATCH_RESULT_MARGIN_PENALTY_PER_GOAL)
+            * anchored_currency_scale();
         let events = self
             .players
             .iter()
@@ -29036,7 +29563,7 @@ impl SoccerMatch {
             let base = DEFENSIVE_GOAL_HISTORY_MIN_PENALTY
                 + (DEFENSIVE_GOAL_HISTORY_MAX_PENALTY - DEFENSIVE_GOAL_HISTORY_MIN_PENALTY)
                     * recency.clamp(0.0, 1.0);
-            transition.reward = -(base * role_multiplier);
+            transition.reward = -(base * role_multiplier * anchored_currency_scale());
             transition.done = false;
             self.deferred_reward_transitions.push(transition);
             actions += 1;
@@ -32927,6 +33454,9 @@ impl SoccerMatch {
                     self.pending_shot = None;
                     self.record_possession_touch(player_id);
                     self.stat_pass_attempt(player_team);
+                    let attempt_forward_yards =
+                        (release_target.y - player_pos.y) * player_team.attack_dir();
+                    self.stat_pass_attempt_direction(player_team, attempt_forward_yards);
                     if intentional_distinct_target {
                         self.stat_intentional_pass_attempt(player_team);
                     }
@@ -36452,11 +36982,10 @@ impl SoccerMatch {
                                 .map(|player| player.position.y)
                                 .unwrap_or(self.ball.position.y);
                             let forward_yards = (reception_y - pass.origin.y) * team.attack_dir();
-                            self.stat_pass_completed_direction(
-                                team,
-                                (pass.intended_target.y - pass.origin.y) * pass.team.attack_dir(),
-                                forward_yards,
-                            );
+                            self.stat_pass_completed_direction(team, forward_yards);
+                            let launch_forward_yards =
+                                (pass.intended_target.y - pass.origin.y) * team.attack_dir();
+                            self.stat_pass_completed_intent_direction(team, launch_forward_yards);
                             if pass.target.is_some_and(|target| target != pass.from) {
                                 self.stat_intentional_pass_completed_direction(
                                     team,
@@ -38886,6 +39415,23 @@ impl SoccerMatch {
         }
     }
 
+    /// Completion counted under the LAUNCH-intent classifier (see the
+    /// `passes_completed_*_intent_*` field docs): completed/attempted per
+    /// direction is only a true rate when both sides use the same bucketing.
+    fn stat_pass_completed_intent_direction(&mut self, team: Team, launch_forward_yards: f64) {
+        if launch_forward_yards > 1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_forward_intent_home += 1,
+                Team::Away => self.stats.passes_completed_forward_intent_away += 1,
+            }
+        } else if launch_forward_yards < -1.25 {
+            match team {
+                Team::Home => self.stats.passes_completed_backward_intent_home += 1,
+                Team::Away => self.stats.passes_completed_backward_intent_away += 1,
+            }
+        }
+    }
+
     fn stat_intentional_pass_attempt(&mut self, team: Team) {
         match team {
             Team::Home => self.stats.intentional_passes_attempted_home += 1,
@@ -38945,21 +39491,16 @@ impl SoccerMatch {
         }
     }
 
-    /// Retain the pass's launch-time direction through completion while accumulating
-    /// the actual reception gain separately. This keeps directional attempts and
-    /// completions in the same population even when the receiver moves in flight.
-    fn stat_pass_completed_direction(
-        &mut self,
-        team: Team,
-        intended_forward_yards: f64,
-        completed_forward_yards: f64,
-    ) {
-        if intended_forward_yards > 1.25 {
+    /// Record the realized reception direction separately from launch intent.
+    /// This exposes under-hit forward balls while the dedicated intent counters
+    /// retain a valid completed/attempted rate for each launch direction.
+    fn stat_pass_completed_direction(&mut self, team: Team, completed_forward_yards: f64) {
+        if completed_forward_yards > 1.25 {
             match team {
                 Team::Home => self.stats.passes_completed_forward_home += 1,
                 Team::Away => self.stats.passes_completed_forward_away += 1,
             }
-        } else if intended_forward_yards < -1.25 {
+        } else if completed_forward_yards < -1.25 {
             match team {
                 Team::Home => self.stats.passes_completed_backward_home += 1,
                 Team::Away => self.stats.passes_completed_backward_away += 1,

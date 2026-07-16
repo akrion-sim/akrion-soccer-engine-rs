@@ -19,6 +19,7 @@ mod train;
 
 use game::*;
 use rng::Rng;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
@@ -614,6 +615,41 @@ fn load_persisted_sparring(dir: &Path, max_policies: usize) -> AppResult<Vec<tra
     Ok(policies)
 }
 
+/// In-memory sparring-pool bounds (disk keeps every promoted generation).
+const MAX_CHAMPION_POOL: usize = 32;
+
+/// AlphaStar-style "challenge" PFSP weights over the frozen champion pool:
+/// w = p·(1−p) + ε with p = the challenger's tracked payoff vs that champion.
+/// Even matchups (p≈0.5) carry the most learning signal; long-beaten champions
+/// fade instead of diluting training; ε keeps every member reachable so a
+/// forgotten style can resurface.
+fn pfsp_sample_index(
+    history: &[(usize, train::Policy)],
+    payoff: &HashMap<usize, f32>,
+    rng: &mut Rng,
+) -> usize {
+    let mut weights = Vec::with_capacity(history.len());
+    let mut total = 0.0f32;
+    for (generation, _) in history {
+        let p = payoff
+            .get(generation)
+            .copied()
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        let w = p * (1.0 - p) + 0.10;
+        total += w;
+        weights.push(w);
+    }
+    let mut t = rng.f01() * total;
+    for (index, w) in weights.iter().enumerate() {
+        t -= w;
+        if t <= 0.0 {
+            return index;
+        }
+    }
+    history.len() - 1
+}
+
 /// Adversarial SELF-PLAY ladder. Both teams are learned policies: a frozen champion
 /// plays Team B while a challenger trains (Team A) against it. Each generation the
 /// challenger is scored head-to-head vs the champion on paired, side-swapped seeds.
@@ -657,6 +693,11 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     )?;
     let candidate_screen_games =
         env_usize_clamped("SELFPLAY_CANDIDATE_SCREEN_GAMES", 48, 2, 2_000)?;
+    // POPULATION KNOBS (AlphaStar league pattern at 5v5 scale): a slice of
+    // self-play iterations spars with retained "exploiter" snapshots, and the
+    // frozen-champion opponent is PFSP-sampled instead of uniform.
+    let exploiter_frac = env_f32_clamped("EXPLOITER_FRAC", 0.15, 0.0, 0.5)?;
+    let pfsp_probe_games = env_usize_clamped("PFSP_PROBE_GAMES", 10, 2, 400)?;
     let speed_warmup = env_usize_clamped(
         "SPEED_WARMUP",
         (cfg.iters / 2).max(1),
@@ -668,26 +709,27 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     // Historical champions remain in the opponent curriculum so a new frontier
     // cannot advance by exploiting only the most recent policy.
     let mut champion_history = load_champion_history(&champ_dir)?;
+    // Bound the in-memory sparring pool on resume (disk keeps the full
+    // lineage): newest members carry the most curriculum value.
+    if champion_history.len() > MAX_CHAMPION_POOL {
+        let excess = champion_history.len() - MAX_CHAMPION_POOL;
+        champion_history.drain(..excess);
+    }
+    // PFSP bookkeeping: challenger-vs-champion payoff EMA keyed by generation
+    // (unknown members default to 0.5 = maximum sampling weight), plus the
+    // retained anchor-qualified held challengers ("exploiters").
+    let mut champion_payoff: HashMap<usize, f32> = HashMap::new();
+    let mut exploiters = load_persisted_sparring(&sparring_dir, sparring_pool_max)?;
+    if !exploiters.is_empty() {
+        println!(
+            "loaded {} anchor-qualified held challengers into the sparring population",
+            exploiters.len()
+        );
+    }
     let mut champion_gen = champion_history
         .last()
         .map_or(0, |(generation, _)| *generation);
     let mut champion = champion_history.last().map(|(_, policy)| policy.clone());
-    // The promotion archive remains immutable evidence. The sparring population
-    // additionally keeps anchor-qualified held challengers: a policy can expose
-    // a non-transitive weakness without being strong enough to replace the
-    // champion, and forgetting it recreates the same self-play cycle later.
-    let mut sparring_pool: Vec<train::Policy> = champion_history
-        .iter()
-        .map(|(_, policy)| policy.clone())
-        .collect();
-    let persisted_sparring = load_persisted_sparring(&sparring_dir, sparring_pool_max)?;
-    if !persisted_sparring.is_empty() {
-        println!(
-            "loaded {} anchor-qualified held challengers into the sparring population",
-            persisted_sparring.len()
-        );
-        sparring_pool.extend(persisted_sparring);
-    }
     let mut challenger = if let Some(incumbent) = champion.as_ref() {
         println!(
             "resuming frozen champion gen{champion_gen} with {} historical opponents",
@@ -726,26 +768,34 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
     );
 
     for round in 1..=generations {
-        let round_start = challenger.clone();
         let mut screened_best: Option<(train::Policy, f32, f32, f32, usize)> = None;
         // MIXED OPPONENT: most iterations train against the current champion
         // (self-play), but every `anchor_every`-th iteration trains against the
         // scripted baseline (champion = None) so the challenger keeps practising
         // how to beat the absolute reference and can't quietly forget it.
         for it in 1..=cfg.iters {
-            let vs_scripted = it % anchor_every == 0 || sparring_pool.is_empty();
+            let vs_scripted =
+                it % anchor_every == 0 || (champion_history.is_empty() && exploiters.is_empty());
             let training_opponent = if vs_scripted {
                 None
+            } else if !exploiters.is_empty() && rng.f01() < exploiter_frac {
+                // EXPLOITER slice: anchor-qualified held challengers play
+                // different styles than the champion line — sparring against
+                // them keeps the challenger from overfitting one lineage.
+                Some(exploiters[rng.next_u64() as usize % exploiters.len()].clone())
+            } else if champion_history.is_empty() {
+                // A resumed gen-0 run may have persisted, anchor-qualified held
+                // policies before it has a promoted champion line.
+                Some(exploiters[rng.next_u64() as usize % exploiters.len()].clone())
+            } else if it % 2 == 0 {
+                // Half the self-play iterations face the CURRENT frontier
+                // champion so promotion pressure stays on the gate opponent.
+                Some(champion_history[champion_history.len() - 1].1.clone())
             } else {
-                // Half the self-play iterations face the current champion; the
-                // other half sample the broader sparring population, including
-                // qualified held challengers that reveal cyclic weaknesses.
-                if it % 2 == 0 {
-                    champion.clone().or_else(|| sparring_pool.last().cloned())
-                } else {
-                    let index = rng.next_u64() as usize % sparring_pool.len();
-                    Some(sparring_pool[index].clone())
-                }
+                // The other half PFSP-sample the frozen pool (challenge
+                // weighting — see pfsp_sample_index).
+                let index = pfsp_sample_index(&champion_history, &champion_payoff, &mut rng);
+                Some(champion_history[index].1.clone())
             };
             train::set_selfplay_champion(training_opponent);
             train::set_speed_frozen(it <= speed_warmup);
@@ -818,6 +868,12 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
         } else {
             selection_champ
         };
+        // The selection eval doubles as the PFSP payoff observation for the
+        // current champion (the opponent it just measured against).
+        if let Some((generation, _)) = champion_history.last() {
+            let entry = champion_payoff.entry(*generation).or_insert(0.5);
+            *entry = 0.5 * *entry + 0.5 * selection_champ.payoff;
+        }
         let selection_passed = selection_champ.goal_diff_lower_95 >= promote_margin
             && selection_anchor.goal_diff_lower_95 >= scripted_floor;
         let confirmation_champ = selection_passed.then(|| match &champion {
@@ -855,23 +911,72 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             champion_gen += 1;
             save_policy(&challenger, &champ_dir.join(format!("gen{champion_gen}")))?;
             champion_history.push((champion_gen, challenger.clone()));
-            sparring_pool.push(challenger.clone());
+            champion_payoff.insert(champion_gen, 0.5);
+            if champion_history.len() > MAX_CHAMPION_POOL {
+                // Evict the most-beaten member of the OLDER half (highest
+                // payoff EMA): hard/even sparring partners and the recent
+                // frontier stay; a long-solved style goes. Its snapshot
+                // remains on disk under champions/.
+                let half = (champion_history.len() / 2).max(1);
+                let evict = champion_history[..half]
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, (ga, _)), (_, (gb, _))| {
+                        let pa = champion_payoff.get(ga).copied().unwrap_or(0.5);
+                        let pb = champion_payoff.get(gb).copied().unwrap_or(0.5);
+                        pa.total_cmp(&pb)
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                champion_history.remove(evict);
+            }
         } else {
             if selection_anchor.goal_diff_lower_95 >= scripted_floor {
+                // ANCHOR-QUALIFIED held challenger: it clears the scripted
+                // floor but not the champion gate. Retain it as a sparring
+                // exploiter instead of discarding the style it found — the
+                // population keeps non-transitive answers the champion line
+                // alone would forget, and persist it across process restarts.
                 save_policy(
                     &challenger,
                     &sparring_dir.join(format!("seed{:020}-round{:04}", cfg.seed, round)),
                 )?;
-                sparring_pool.push(challenger.clone());
+                exploiters.push(challenger.clone());
+                if exploiters.len() > sparring_pool_max {
+                    let excess = exploiters.len() - sparring_pool_max;
+                    exploiters.drain(0..excess);
+                }
             }
-            // A held candidate is not the next generation's starting point. Reset
-            // to the protected champion (or the coherent gen-0 warm start) so
-            // rejected gradient drift cannot accumulate across rounds.
-            challenger = champion.clone().unwrap_or(round_start);
+            // A held candidate is not the next generation's starting point once
+            // a champion exists: reset to the protected champion so rejected
+            // gradient drift cannot accumulate across rounds.
+            //
+            // GEN-0 BOOTSTRAP EXCEPTION (witnessed treadmill, 2026-07-15): with
+            // no champion yet there is no frozen line to drift away from, and
+            // resetting made every round an independent from-warm-start attempt
+            // at the full LCB95 bar — rounds 1..5 all held with no accumulated
+            // progress. Until the first champion is crowned, the challenger
+            // KEEPS its training; the scripted-anchor gate still decides when
+            // it has genuinely cleared the bar.
+            if let Some(incumbent) = champion.as_ref() {
+                challenger = incumbent.clone();
+            }
         }
-        if sparring_pool.len() > sparring_pool_max {
-            let excess = sparring_pool.len() - sparring_pool_max;
-            sparring_pool.drain(0..excess);
+        // Refresh PFSP estimates with cheap paired probes vs a couple of pool
+        // members, so sampling weights track the CURRENT challenger.
+        if champion_history.len() > 1 {
+            for _ in 0..2 {
+                let index = rng.next_u64() as usize % (champion_history.len() - 1);
+                let (generation, opponent) = &champion_history[index];
+                let probe = train::evaluate_vs_policy_paired(
+                    &challenger,
+                    opponent,
+                    pfsp_probe_games,
+                    &mut rng,
+                );
+                let entry = champion_payoff.entry(*generation).or_insert(0.5);
+                *entry = 0.5 * *entry + 0.5 * probe.payoff;
+            }
         }
         let champ_label = if champion_gen == 0 {
             "scripted".to_string()
@@ -879,12 +984,14 @@ fn run_selfplay(cfg: &RunConfig) -> AppResult<()> {
             format!("gen{champion_gen}")
         };
         println!(
-            "{round:>4} | gd {:>+6.2} lb {:>+6.2} | gd {:>+6.2} lb {:>+6.2} | {:>9} | {champ_label}",
+            "{round:>4} | gd {:>+6.2} lb {:>+6.2} | gd {:>+6.2} lb {:>+6.2} | {:>9} | {champ_label} (pool {}, expl {})",
             selection_champ.goal_diff,
             selection_champ.goal_diff_lower_95,
             selection_anchor.goal_diff,
             selection_anchor.goal_diff_lower_95,
-            if promoted { "PROMOTED" } else { "hold" }
+            if promoted { "PROMOTED" } else { "hold" },
+            champion_history.len(),
+            exploiters.len()
         );
         let confirmation_champ = confirmation_champ.unwrap_or_default();
         let confirmation_anchor = confirmation_anchor.unwrap_or_default();
@@ -1025,9 +1132,11 @@ fn run_training(cfg: &RunConfig) -> AppResult<()> {
     };
     csv.push_str(&csv_row(0, &s0, 0.0, 0.0, 0.0));
 
+    // Header must match the eval row printed below (pass volume/completion and
+    // shots); entropy + value_loss live in learning_curve.csv per-iteration.
     println!(
         "{:>5} | {:>10} | {:>8} | {:>6} {:>6} | {:>6} | {:>6} | {:>7} | {:>9}",
-        "iter", "goal_diff", "winrate", "gA", "gB", "space", "gate", "entropy", "val_loss"
+        "iter", "goal_diff", "winrate", "gA", "gB", "space", "gate", "pass", "shot"
     );
     println!("{}", "-".repeat(80));
 
@@ -1542,4 +1651,36 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+
+    #[test]
+    fn pfsp_sampling_prefers_even_matchups() {
+        let mut rng = Rng::new(99);
+        let history: Vec<(usize, train::Policy)> = (1..=3)
+            .map(|generation| (generation, train::Policy::new(&mut rng)))
+            .collect();
+        let mut payoff: HashMap<usize, f32> = HashMap::new();
+        payoff.insert(1, 0.95); // long-beaten champion
+        payoff.insert(2, 0.50); // even matchup — the learning frontier
+        payoff.insert(3, 0.95); // long-beaten champion
+        let mut counts = [0usize; 3];
+        for _ in 0..600 {
+            counts[pfsp_sample_index(&history, &payoff, &mut rng)] += 1;
+        }
+        // Challenge weighting: w(0.5)=0.35 vs w(0.95)=0.0975+0.15≈0.1975 —
+        // the even matchup should draw clearly more sparring than either
+        // solved one, while epsilon keeps the solved ones reachable.
+        assert!(
+            counts[1] > counts[0] && counts[1] > counts[2],
+            "even matchup must dominate: {counts:?}"
+        );
+        assert!(
+            counts[0] > 0 && counts[2] > 0,
+            "epsilon keeps everyone reachable: {counts:?}"
+        );
+    }
 }

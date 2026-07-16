@@ -11957,9 +11957,10 @@ fn completed_pass_reward_values_flank_usage_more_in_own_half() {
 #[test]
 fn reward_shaping_values_retention_over_forcing_a_turnover() {
     // The overnight learners must prefer KEEPING the ball to gambling it forward into a
-    // turnover. This locks in the rebalanced signal: a safe lateral ball is positively
-    // rewarded, a safe backward ball is meaningfully penalized, and either is still
-    // preferable to the turnover cost the learners apply on losing the ball.
+    // turnover. This locks in the rebalanced signal: every SUCCESSFUL retention pass is
+    // positive (backward included — the ~95%-backward-completion target depends on the
+    // safest ball never being taxed for succeeding), ordered backward < lateral, and
+    // either far preferable to the turnover cost the learners apply on losing the ball.
     let field_length = 120.0;
     let lateral = completed_pass_reward(
         Team::Home,
@@ -11981,8 +11982,8 @@ fn reward_shaping_values_retention_over_forcing_a_turnover() {
         "a safe lateral retention pass must be rewarded, not near-worthless: {lateral}"
     );
     assert!(
-        backward <= -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF && backward > -4.0,
-        "a safe backward pass should be penalized without becoming worse than a turnover: {backward}"
+        backward > 0.0 && backward < lateral,
+        "a safe backward pass keeps possession: small positive, below lateral: backward={backward} lateral={lateral}"
     );
     assert!(
         turnover_cost >= 12.0,
@@ -47000,6 +47001,8 @@ fn goal_reward_credits_last_ten_teammates_with_recency_discount() {
 
     assert_eq!(goal_events, 10);
     assert!((attacking_total - GOAL_REWARD_POINTS).abs() < 1e-9);
+    // The pattern is a recency shape; normalization keeps the distributed
+    // shares equal to exactly one dependable goal-reward pool.
     assert!((reward_for(shooter) - expected_for(0)).abs() < 1e-9);
     assert!((reward_for(chain[8]) - expected_for(1)).abs() < 1e-9);
     assert!((reward_for(chain[0]) - expected_for(9)).abs() < 1e-9);
@@ -47176,10 +47179,11 @@ fn out_of_play_missed_shot_records_attempt_and_accuracy_penalty() {
 }
 
 #[test]
-fn every_conversion_distributes_the_same_fixed_reward_pool() {
+fn direct_turnover_goal_distributes_full_anchor_pool() {
     // A goal where only a single scoring-team player touched the ball since
     // winning it from the opponent credits fewer players, but the conversion
-    // itself remains the same dependable 500-point anchor.
+    // itself remains the same dependable 500-point anchor. The legacy reduced
+    // turnover pool exists only behind the explicit legacy A/B gate.
     let scoring_total = |scoring_touches: &[usize]| -> f64 {
         let mut sim = SoccerMatch::default_11v11(MatchConfig {
             duration_seconds: 0.1,
@@ -47204,9 +47208,12 @@ fn every_conversion_distributes_the_same_fixed_reward_pool() {
     let turnover_total = scoring_total(&[9]);
     let buildup_total = scoring_total(&[5, 7, 9]);
 
-    assert!((turnover_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
+    assert!((turnover_total - GOAL_REWARD_POINTS).abs() < 1e-9);
     assert!((buildup_total - GOAL_REWARD_POINTS).abs() < 1e-9);
-    assert!((turnover_total - buildup_total).abs() < 1e-9);
+    assert!(
+        (turnover_total - buildup_total).abs() < 1e-9,
+        "a conversion distributes the same dependable pool however it was created"
+    );
 }
 
 #[test]
@@ -47245,12 +47252,14 @@ fn direct_turnover_goal_credits_only_the_scorer_from_the_fixed_pool() {
         .into_iter()
         .map(|player_id| reward_for(player_id))
         .sum::<f64>();
-    assert_eq!(reward_for(scorer), DIRECT_TURNOVER_GOAL_REWARD_POINTS);
+    // The steal-and-finish chain contains only the scorer, so the whole
+    // 500-point anchor lands there — teammates who never touched the ball in
+    // the chain get nothing, and the total still equals the anchor exactly.
+    assert_eq!(reward_for(scorer), GOAL_REWARD_POINTS);
     assert_eq!(reward_for(support), 0.0);
     assert_eq!(reward_for(deeper_support), 0.0);
     assert_eq!(reward_for(opponent), 0.0);
-    assert!((attacking_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
-    assert_eq!(attacking_total, GOAL_REWARD_POINTS);
+    assert!((attacking_total - GOAL_REWARD_POINTS).abs() < 1e-9);
 }
 
 #[test]
@@ -47375,7 +47384,10 @@ fn goal_reward_is_not_duplicated_into_deferred_learning_transitions() {
     let before = WorldSnapshot::from_match(&sim);
     push_contextual_goal_credit_history(&mut sim, &before);
 
-    sim.record_goal_rewards(Team::Home, Some(9));
+    // The default goal path is a SINGLE chain injection; the contextual
+    // distributor is exercised directly here (in the live stack it only runs
+    // under DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT).
+    sim.record_contextual_goal_rewards(Team::Home, Some(9), live_goal_reward_points());
 
     let deferred_total = sim
         .deferred_reward_transitions
@@ -47527,7 +47539,10 @@ fn direct_turnover_goal_ignores_stale_contextual_credit() {
         .map(|event| event.amount)
         .sum::<f64>();
     assert_eq!(stale_context_total, 0.0);
-    assert!((reward_event_total - DIRECT_TURNOVER_GOAL_REWARD_POINTS).abs() < 1e-9);
+    // Full anchor, single injection: the steal-and-finish chain pays the
+    // shooter the whole 500 pool and never routes through the contextual
+    // distributor, so stale history cannot leak into deferred credit.
+    assert!((reward_event_total - GOAL_REWARD_POINTS).abs() < 1e-9);
     assert!(sim
         .deferred_reward_transitions
         .iter()
@@ -100183,13 +100198,18 @@ fn same_team_proximity_grace_matches_the_worked_example() {
 #[test]
 fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
     let build_and_run = || {
+        // Learned-policy inference must be active for the carrier to produce the committed
+        // technical decisions the collector samples (production learner games always are;
+        // `learning_enabled` + installed team policies replicates that here).
         let config = MatchConfig {
             duration_seconds: 20.0,
             seed: 44_101,
+            learning_enabled: true,
             ..MatchConfig::default()
         };
         let total = config.total_ticks();
-        let mut sim = SoccerMatch::default_11v11(config);
+        let mut sim = SoccerMatch::default_11v11(config)
+            .with_team_policies(SoccerTeamQPolicies::new(SoccerQPolicyOptions::default()));
         for _ in 0..total {
             sim.run_time_step();
         }
@@ -100222,27 +100242,266 @@ fn mpc_reject_threshold_pipeline_collects_and_trains_end_to_end() {
         );
         assert!(s.reward.is_finite(), "sample reward must be finite");
     }
-    // All three families should appear over a full match (pass targets the most-advanced
-    // teammate; dribble/shot resolve their own targets in the MPC estimators).
-    let saw_pass = on_samples
-        .iter()
-        .any(|s| s.inputs.family == MpcRejectFamily::Pass);
-    let saw_dribble = on_samples
-        .iter()
-        .any(|s| s.inputs.family == MpcRejectFamily::Dribble);
-    let saw_shot = on_samples
-        .iter()
-        .any(|s| s.inputs.family == MpcRejectFamily::Shot);
+    // The collector samples the ACTUALLY committed carrier action (not hypothetical
+    // alternatives), so which families appear depends on real play. Every sample must be
+    // one of the MPC-gated families, and passes — the dominant carrier action — should
+    // appear over a full match of possession.
     assert!(
-        saw_pass && saw_dribble && saw_shot,
-        "all three families should be sampled over a full match: pass={saw_pass} dribble={saw_dribble} shot={saw_shot}"
+        on_samples
+            .iter()
+            .any(|s| s.inputs.family == MpcRejectFamily::Pass),
+        "a full match of possession should commit at least one pass"
     );
 
     // The drained corpus trains a usable head (the learner's per-game step).
-    let (head, report) = train_mpc_reject_threshold_head(&on_samples, 7, 4, 0.02)
+    let (trained_head, report) = train_mpc_reject_threshold_head(&on_samples, 7, 4, 0.02)
         .expect("a non-empty corpus trains a reject-threshold head");
     assert!(
-        report.training_steps > 0 && head.training_steps() > 0 && report.final_loss.is_finite(),
+        report.training_steps > 0
+            && trained_head.training_steps() > 0
+            && report.final_loss.is_finite(),
         "training must advance the head: {report:?}"
     );
+
+    // --- Live seam behavior: build a fresh in-play snapshot with ball carriers and
+    // exercise `learned_mpc_reject_threshold` directly (this is the value MPC actually
+    // gates against). All env toggling stays inside this single test to avoid racing a
+    // parallel test on the process-global flag.
+    let seam_config = MatchConfig {
+        duration_seconds: 12.0,
+        seed: 77_010,
+        ..MatchConfig::default()
+    };
+    let seam_ticks = seam_config.total_ticks().min(300);
+    let mut seam_sim = SoccerMatch::default_11v11(seam_config);
+    for _ in 0..seam_ticks {
+        seam_sim.run_time_step();
+    }
+    let carriers: Vec<usize> = {
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        snap.players
+            .iter()
+            .filter(|p| p.role != PlayerRole::Goalkeeper)
+            .map(|p| p.id)
+            .collect()
+    };
+    assert!(!carriers.is_empty(), "match must have field players");
+    let base = 0.18_f64;
+    let families = [
+        MpcRejectFamily::Pass,
+        MpcRejectFamily::Dribble,
+        MpcRejectFamily::Shot,
+    ];
+
+    // OFF: the seam must return EXACTLY the base constant — byte-identical, no feature
+    // build, for every player and family.
+    std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
+    {
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        for &pid in &carriers {
+            for fam in families {
+                let bar = snap.learned_mpc_reject_threshold(pid, fam, base);
+                assert_eq!(
+                    bar, base,
+                    "disabled seam must return exactly the base bar (player {pid}, {fam:?})"
+                );
+            }
+        }
+    }
+
+    // ON (analytic seed, no head installed): bars stay in the valid band AND vary across
+    // contexts — i.e. "too low" is genuinely a function of the field vector, not a global
+    // constant. Also capture a per-player reference bar to prove the gate below.
+    std::env::set_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "1");
+    let analytic_bars: Vec<f64> = {
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        let mut bars = Vec::new();
+        for &pid in &carriers {
+            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
+            assert!(
+                (MPC_REJECT_THRESHOLD_FLOOR..=MPC_REJECT_THRESHOLD_CEIL).contains(&bar),
+                "enabled bar {bar} out of band"
+            );
+            bars.push(bar);
+        }
+        bars
+    };
+    let bar_min = analytic_bars.iter().cloned().fold(f64::INFINITY, f64::min);
+    let bar_max = analytic_bars
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        bar_max - bar_min > 1e-3,
+        "enabled analytic reject bar must vary across contexts (range {bar_min}..{bar_max}), \
+         proving it is context-dependent and not the global constant"
+    );
+
+    // Min-training-steps gate: installing a RAW head (0 training steps, below
+    // MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS) must NOT be consumed — the seam must
+    // still return the analytic-seed bar, identical to the no-head case above.
+    assert!(
+        MpcRejectThresholdHead::new(9).training_steps()
+            < MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
+        "a freshly-seeded head must start below the consumption gate"
+    );
+    seam_sim.set_mpc_reject_threshold_head(MpcRejectThresholdHead::new(9));
+    {
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        for (i, &pid) in carriers.iter().enumerate() {
+            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
+            assert_eq!(
+                bar, analytic_bars[i],
+                "a raw head below the min-training-steps gate must fall back to the analytic \
+                 bar (player {pid}), got {bar} vs analytic {}",
+                analytic_bars[i]
+            );
+        }
+    }
+
+    // A TRAINED head (>= the min-steps gate) IS consumed and overrides the analytic
+    // seed. Regress a head toward a distinctive high bar (0.70) for these contexts —
+    // well above any analytic bar (base 0.18 + at most ANALYTIC_CONTEXT_SWING) — so a
+    // seam value near 0.70 can only mean the learned head, not the seed, was used.
+    {
+        let target_bar = 0.70_f64;
+        let training_rows: Vec<(MpcRejectThresholdInputs, f64)> = {
+            let snap = WorldSnapshot::from_match(&seam_sim);
+            carriers
+                .iter()
+                .filter_map(|&pid| {
+                    let player = snap.players.iter().find(|p| p.id == pid)?;
+                    let inputs = snap.build_mpc_reject_threshold_inputs(
+                        player,
+                        MpcRejectFamily::Pass,
+                        base,
+                    )?;
+                    Some((inputs, target_bar))
+                })
+                .collect()
+        };
+        assert!(
+            !training_rows.is_empty(),
+            "need carrier contexts to train on"
+        );
+        let mut head = MpcRejectThresholdHead::new(31);
+        let mut guard = 0;
+        while head.training_steps() < MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS && guard < 5000 {
+            head.train(&training_rows, 0.1);
+            guard += 1;
+        }
+        assert!(
+            head.training_steps() >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
+            "head must cross the consumption gate"
+        );
+        seam_sim.set_mpc_reject_threshold_head(head);
+        let snap = WorldSnapshot::from_match(&seam_sim);
+        for &pid in &carriers {
+            let bar = snap.learned_mpc_reject_threshold(pid, MpcRejectFamily::Pass, base);
+            assert!(
+                bar > 0.55,
+                "a trained head regressed toward {target_bar} must be consumed at the seam \
+                 (got {bar}); no analytic seed can reach here"
+            );
+        }
+    }
+    std::env::remove_var("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL");
+}
+
+#[test]
+fn anchored_reward_currency_invariants() {
+    // One test fn so the env-flag transitions are ordered (parallel-safe):
+    // OFF ⇒ byte-identical legacy currency.
+    std::env::remove_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS");
+    assert!(!anchored_rewards_enabled());
+    assert!((live_goal_reward_points() - GOAL_REWARD_POINTS).abs() < 1e-9);
+    assert!((anchored_currency_scale() - 1.0).abs() < 1e-9);
+
+    // ON ⇒ the anchors, exactly.
+    std::env::set_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS", "true");
+    assert!((live_goal_reward_points() - ANCHOR_GOAL_POINTS).abs() < 1e-9);
+    assert!((match_outcome_win_reward_points() - ANCHOR_WIN_POINTS).abs() < 1e-9);
+    assert!((anchored_currency_scale() - ANCHOR_GOAL_POINTS / GOAL_REWARD_POINTS).abs() < 1e-9);
+
+    // On-frame shot anchor: floor 50 everywhere (an on-frame 80-yarder pays
+    // exactly the floor), cap 200 = 0.40·goal at the best field-vector
+    // context, monotone between, clamped outside [0,1].
+    assert!((anchored_on_frame_shot_points(0.0) - ANCHOR_ON_FRAME_SHOT_FLOOR).abs() < 1e-9);
+    let best = anchored_on_frame_shot_points(1.0);
+    assert!((best - 200.0).abs() < 1e-9);
+    assert!(best <= ANCHOR_GOAL_POINTS * 0.40 + 1e-9);
+    assert!(anchored_on_frame_shot_points(0.8) > anchored_on_frame_shot_points(0.3));
+    assert!((anchored_on_frame_shot_points(7.0) - 200.0).abs() < 1e-9);
+
+    // Currency ordering: shot cap < goal < win, win = 2·goal, goal = 10·floor.
+    assert!(best < ANCHOR_GOAL_POINTS && ANCHOR_GOAL_POINTS < ANCHOR_WIN_POINTS);
+    assert!((ANCHOR_WIN_POINTS - 2.0 * ANCHOR_GOAL_POINTS).abs() < 1e-9);
+    assert!((ANCHOR_GOAL_POINTS - 10.0 * ANCHOR_ON_FRAME_SHOT_FLOOR).abs() < 1e-9);
+
+    std::env::remove_var("DD_SOCCER_ENABLE_ANCHORED_REWARDS");
+}
+
+#[test]
+fn goal_pool_is_single_injection_and_calibration_immune() {
+    // 1) One conversion ⇒ exactly ONE anchor pool in Goal-kind reward events —
+    //    no direct-shot clone, no contextual duplicate. (The triple-credit
+    //    stack lives only behind DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT.)
+    let mut sim = SoccerMatch::default_11v11(MatchConfig {
+        duration_seconds: 0.1,
+        seed: 954,
+        ..Default::default()
+    });
+    sim.tick = 60;
+    sim.possession_chain.clear();
+    sim.record_possession_touch(5);
+    sim.record_possession_touch(7);
+    sim.record_possession_touch(9);
+    sim.reward_events.clear();
+    sim.deferred_reward_transitions.clear();
+
+    sim.record_goal_rewards(Team::Home, Some(9));
+
+    let goal_total = sim
+        .reward_events
+        .iter()
+        .filter(|event| event.kind == SoccerRewardEventKind::Goal)
+        .map(|event| event.amount)
+        .sum::<f64>();
+    assert!(
+        (goal_total - live_goal_reward_points()).abs() < 1e-9,
+        "the conversion pool must sum to exactly one anchor, got {goal_total}"
+    );
+    assert!(
+        !sim.deferred_reward_transitions
+            .iter()
+            .any(|transition| transition.reward >= live_goal_reward_points() * 0.2),
+        "no deferred goal-credit clones may ride along on the default path"
+    );
+
+    // 2) The anchors are calibration-immune: an explicit Goal/MatchResult
+    //    entry in the kind-scales must not move them (the outer fn's
+    //    carve-out), while ordinary kinds still calibrate through the seam.
+    assert_eq!(
+        calibrated_reward_event_amount(SoccerRewardEventKind::Goal, 500.0, None),
+        500.0
+    );
+    assert_eq!(
+        calibrated_reward_event_amount(SoccerRewardEventKind::MatchResult, -1000.0, None),
+        -1000.0
+    );
+    let mut scales = std::collections::HashMap::new();
+    scales.insert("Goal".to_string(), 0.3);
+    scales.insert("CompletedForwardPass".to_string(), 0.5);
+    let ordinary = calibrated_reward_event_amount_with(
+        SoccerRewardEventKind::CompletedForwardPass,
+        10.0,
+        None,
+        &scales,
+    );
+    assert!((ordinary - 5.0).abs() < 1e-9);
+    // The inner (env-free) fn WOULD rescale a Goal if it reached it — proving
+    // the outer carve-out is what protects the anchor.
+    let goal_if_not_exempt =
+        calibrated_reward_event_amount_with(SoccerRewardEventKind::Goal, 500.0, None, &scales);
+    assert!((goal_if_not_exempt - 150.0).abs() < 1e-9);
 }

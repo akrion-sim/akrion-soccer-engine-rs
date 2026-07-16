@@ -924,6 +924,9 @@ fn refresh_neural_snapshot_norm_recursive(
     if let Some(policy_head) = snapshot.policy_head.as_mut() {
         refresh_policy_head_snapshot_norm(policy_head, depth + 1);
     }
+    if let Some(central_critic_head) = snapshot.central_critic_head.as_mut() {
+        refresh_auxiliary_head_snapshot_norm(central_critic_head, depth + 1);
+    }
     if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_mut() {
         refresh_skill_policy_heads_snapshot_norm(skill_policy_heads, depth + 1);
     }
@@ -1012,6 +1015,9 @@ fn mutate_neural_snapshot_recursive(
     if depth < 8 {
         if let Some(policy_head) = snapshot.policy_head.as_mut() {
             mutate_policy_head_snapshot(policy_head, rng, config, depth + 1);
+        }
+        if let Some(central_critic_head) = snapshot.central_critic_head.as_mut() {
+            mutate_auxiliary_head_snapshot(central_critic_head, rng, config, depth + 1);
         }
         if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_mut() {
             mutate_skill_policy_heads_snapshot(skill_policy_heads, rng, config, depth + 1);
@@ -1146,6 +1152,17 @@ fn crossover_neural_snapshot_recursive(
             crossover_policy_head_snapshot(child_head, b_head, rng, depth + 1);
         } else if child.policy_head.is_none() && b.policy_head.is_some() && rng.coin() {
             child.policy_head = b.policy_head.clone();
+        }
+        if let (Some(child_head), Some(b_head)) = (
+            child.central_critic_head.as_mut(),
+            b.central_critic_head.as_ref(),
+        ) {
+            crossover_auxiliary_head_snapshot(child_head, b_head, rng, depth + 1);
+        } else if child.central_critic_head.is_none()
+            && b.central_critic_head.is_some()
+            && rng.coin()
+        {
+            child.central_critic_head = b.central_critic_head.clone();
         }
         if let (Some(child_head), Some(b_head)) = (
             child.skill_policy_heads.as_mut(),
@@ -11258,6 +11275,15 @@ fn run() -> Result<(), Box<dyn Error>> {
             evolution_window_games,
         );
         let completed_after_batch = episode_summaries.len();
+        // EVIDENCE-WINDOW GUARD: evolution may only fire on a FULL sample
+        // window. The bare `completed_after_batch >= games` final-batch bypass
+        // used to let a 1-game run mutate tactical weights from a single
+        // sample whenever the promotion gate was disabled or its floor
+        // lowered (witnessed: attack width 0.680→1.180 after one match). The
+        // promotion gate (min_sample_games) remains the second line of
+        // defense; this makes the trigger itself structurally incapable of
+        // single-sample evolution. Runs shorter than the window never evolve
+        // — by design: less than a window of evidence is not evidence.
         let should_evolve = evolution_enabled
             && !completed_games.is_empty()
             // Never mutate a generation from a partial evidence window merely
@@ -12855,6 +12881,11 @@ mod tests {
             }],
             forward_select_logit_weight: 0.0,
         }));
+        snapshot.central_critic_head = Some(Box::new(SoccerAuxiliaryHeadSnapshot {
+            network: neural_population_network(base + 47.0),
+            training_steps: 10,
+            average_loss: Some(0.2),
+        }));
         snapshot.skill_policy_heads = Some(Box::new(SoccerSkillPolicyHeadsSnapshot {
             heads: vec![SoccerSkillPolicyHeadSnapshot {
                 group: "pass".to_string(),
@@ -12897,6 +12928,9 @@ mod tests {
                     collect_neural_population_values(&specialist.network, values);
                 }
             }
+        }
+        if let Some(central_critic_head) = snapshot.central_critic_head.as_ref() {
+            collect_neural_population_values(&central_critic_head.network, values);
         }
         if let Some(skill_policy_heads) = snapshot.skill_policy_heads.as_ref() {
             for head in &skill_policy_heads.heads {

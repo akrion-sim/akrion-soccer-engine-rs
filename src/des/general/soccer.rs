@@ -1291,12 +1291,18 @@ const FIRST_TIME_SHORT_FORWARD_PASS_MIN_PROGRESS_YARDS: f64 = 1.25;
 const FIRST_TIME_SHORT_FORWARD_PASS_MIN_YARDS: f64 = 5.47;
 const FIRST_TIME_SHORT_FORWARD_PASS_IDEAL_MAX_YARDS: f64 = 8.75;
 const FIRST_TIME_SHORT_FORWARD_PASS_TAPER_YARDS: f64 = 8.0;
-// A completed back pass KEEPS possession, so it must still beat a turnover, but it should
-// no longer look like an attractive default recycle. Penalize it enough that safe lateral
-// and forward options win clearly, with own-half retreats stinging more because they move
-// the ball back toward danger. Pressure-relief escapes are still handled separately.
-const COMPLETED_BACK_PASS_PENALTY_OWN_HALF: f64 = 4.0;
-const COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF: f64 = 3.4;
+// A completed back pass KEEPS possession — the safest ball in football and the
+// outlet the ~95%-completion backward-pass target depends on. It earns a SMALL
+// positive reward: penalizing a SUCCESSFUL retention pass (the old −4.0/−3.4)
+// taught pass-avoidance — the policy stopped playing backward at all rather
+// than risk the tax, which capped overall completion. The ordering the learner
+// sees is forward ≫ lateral > backward > 0 ≫ turnover; recycle abuse is
+// policed by the dedicated machinery (backward-pass discipline gate, the
+// anti-recycle levers), not by taxing success. Opponent-half recycles earn
+// slightly more than own-half retreats (restarting the attack near the box
+// beats moving the ball back toward danger).
+const COMPLETED_BACK_PASS_REWARD_OWN_HALF: f64 = 0.6;
+const COMPLETED_BACK_PASS_REWARD_OPPONENT_HALF: f64 = 0.9;
 const COMPLETED_DANGEROUS_CROSS_BONUS_POINTS: f64 = 3.8;
 const COMPLETED_CROSS_MAX_BONUS_POINTS: f64 = 5.0;
 // Through-balls (killer passes) are the one user-named penetration pattern that did NOT get a new
@@ -4548,6 +4554,15 @@ const SOCCER_NEURAL_FIELD_MOTION_DIM_V1: usize = (SOCCER_NEURAL_FIELD_MOTION_PLA
 const SOCCER_NEURAL_FIELD_MOTION_DIM: usize = (SOCCER_NEURAL_FIELD_MOTION_PLAYERS
     + SOCCER_NEURAL_FIELD_MOTION_BALLS)
     * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER;
+/// Actor-independent, fixed-frame input for the centralized value baseline:
+/// the same 22 players + ball at every decision in a tick, plus eight match-state
+/// channels. This is deliberately separate from the actor/POMDP motion block.
+const SOCCER_CENTRAL_CRITIC_ENTITY_DIM: usize = SOCCER_NEURAL_FIELD_MOTION_DIM;
+const SOCCER_CENTRAL_CRITIC_GLOBAL_DIM: usize = 8;
+const SOCCER_CENTRAL_CRITIC_FEATURE_DIM: usize =
+    SOCCER_CENTRAL_CRITIC_ENTITY_DIM + SOCCER_CENTRAL_CRITIC_GLOBAL_DIM;
+const SOCCER_CENTRAL_CRITIC_HIDDEN_UNITS: usize = 128;
+const SOCCER_CENTRAL_CRITIC_LEARNING_RATE: f64 = 0.015;
 const SOCCER_NEURAL_FIELD_MOTION_TAIL_START_V1: usize =
     SOCCER_NEURAL_BASE_FEATURE_DIM + SOCCER_NEURAL_FIELD_MOTION_DIM_V1;
 const SOCCER_NEURAL_FIELD_MOTION_TAIL_START: usize =
@@ -5662,7 +5677,10 @@ const SOCCER_POLICY_ASSIGNED_POSITION_DIM: usize = SOCCER_ASSIGNED_POSITION_COUN
 const SOCCER_POLICY_FEATURE_DIM: usize = SOCCER_NEURAL_FEATURE_DIM
     + SOCCER_POLICY_ROLE_EMBEDDING_DIM
     + SOCCER_POLICY_ASSIGNED_POSITION_DIM;
-const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 24;
+// The 24-unit trunk was narrower than the 635-wide state input by more than 26x
+// and repeatedly plateaued. Existing 24-unit snapshots widen function-preservingly
+// on restore; set SOCCER_POLICY_HIDDEN_UNITS=24 for the controlled legacy arm.
+const DEFAULT_SOCCER_POLICY_HIDDEN_UNITS: usize = 128;
 const MIN_SOCCER_POLICY_HIDDEN_UNITS: usize = 8;
 const MAX_SOCCER_POLICY_HIDDEN_UNITS: usize = 512;
 const SOCCER_POLICY_LEARNING_RATE: f64 = 0.05;
@@ -5802,6 +5820,16 @@ const SOCCER_FULL_GAME_RETURN_BLEND: f64 = 0.35;
 /// chance-quality context. The old 400 clamp silently erased most outcome
 /// credit before PPO/MAPPO saw it.
 const SOCCER_FULL_GAME_RETURN_CLIP: f64 = 1250.0;
+/// Return clip must clear the anchor magnitudes: a ±1000 win label plus a few
+/// ±500 goals would still need more room than the non-anchored clip. Anchored
+/// mode therefore expands to ±4000 (2·WIN + 4·GOAL of headroom).
+fn soccer_full_game_return_clip() -> f64 {
+    if anchored_rewards_enabled() {
+        4_000.0
+    } else {
+        SOCCER_FULL_GAME_RETURN_CLIP
+    }
+}
 const DD_SOCCER_OUTCOME_CREDIT_ENV: &str = "DD_SOCCER_OUTCOME_CREDIT";
 const DD_SOCCER_MATCH_OUTCOME_REWARD_ENV: &str = "DD_SOCCER_ENABLE_MATCH_OUTCOME_REWARD";
 const DD_SOCCER_DP_TERMINAL_OUTCOME_CREDIT_ENV: &str =
@@ -8409,6 +8437,13 @@ pub struct SoccerDecisionContext {
     /// each decision on every player's grid spot + smooth motion vector.
     #[serde(default)]
     pub field_player_motion: Vec<f32>,
+    /// Actor-independent, Home-canonical whole-pitch state used only by the
+    /// centralized value baseline. Every actor at a tick receives identical bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub central_critic_state: Vec<f32>,
+    /// The matching actor-independent state after the action, used for value targets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_central_critic_state: Vec<f32>,
     /// Bayesian opponent-press belief summary (length `SOCCER_NEURAL_OPP_BELIEF_DIM`): nearest /
     /// mean / max centered press tendency of nearby opponents + belief coverage. Lets the neural
     /// value/critic and policy learn to exploit a passive marker or respect a proven aggressor,
@@ -15337,10 +15372,14 @@ fn soccer_correlated_full_game_replay_transitions(
         } else {
             away_sum / away_count as f64
         };
-        home_return = (home_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * home_return)
-            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
-        away_return = (away_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * away_return)
-            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+        home_return = (home_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * home_return).clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
+        away_return = (away_mean + SOCCER_FULL_GAME_RETURN_DISCOUNT_PER_TICK * away_return).clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
 
         for idx in indices {
             let mut transition = transitions[*idx].clone();
@@ -15357,8 +15396,10 @@ fn soccer_correlated_full_game_replay_transitions(
                 Some(outcome) => blended + outcome.for_team(transition.team),
                 None => blended,
             };
-            transition.reward =
-                with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+            transition.reward = with_outcome.clamp(
+                -soccer_full_game_return_clip(),
+                soccer_full_game_return_clip(),
+            );
             transition.done = true;
             replay.push(transition);
         }
@@ -15393,8 +15434,10 @@ fn soccer_dp_value_iteration(
             if count > 0 {
                 value.insert(
                     b,
-                    (sum / count as f64)
-                        .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP),
+                    (sum / count as f64).clamp(
+                        -soccer_full_game_return_clip(),
+                        soccer_full_game_return_clip(),
+                    ),
                 );
             }
         }
@@ -15428,7 +15471,10 @@ fn soccer_dp_nstep_return(
             }
         }
     }
-    ret.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP)
+    ret.clamp(
+        -soccer_full_game_return_clip(),
+        soccer_full_game_return_clip(),
+    )
 }
 
 /// Build the outcome-only sequence used by DP terminal credit. Exactly one sample carries the
@@ -15627,8 +15673,10 @@ fn soccer_dp_bootstrapped_replay_transitions(
                 .unwrap_or(0.0)
         };
         let with_outcome = blended + outcome_component;
-        transition.reward =
-            with_outcome.clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+        transition.reward = with_outcome.clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
         transition.done = true;
         replay.push(transition);
     }
@@ -15761,8 +15809,10 @@ fn soccer_outcome_credit_replay_transitions(
             .unwrap_or(0.0);
         let milestone_reward = soccer_outcome_credit_milestone_reward(&transition);
         let pitch_shaping = soccer_outcome_credit_pitch_value_shaping(&transition);
-        transition.reward = finite_metric(outcome_reward + milestone_reward + pitch_shaping)
-            .clamp(-SOCCER_FULL_GAME_RETURN_CLIP, SOCCER_FULL_GAME_RETURN_CLIP);
+        transition.reward = finite_metric(outcome_reward + milestone_reward + pitch_shaping).clamp(
+            -soccer_full_game_return_clip(),
+            soccer_full_game_return_clip(),
+        );
         transition.done = true;
         replay.push(transition);
     }
@@ -19447,7 +19497,17 @@ impl Default for SoccerNeuralLearningConfig {
             replay_capacity: DEFAULT_SOCCER_NEURAL_REPLAY_CAPACITY,
             replay_samples_per_tick: DEFAULT_SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK,
             target_clip: DEFAULT_SOCCER_NEURAL_TARGET_CLIP,
-            target_popart_enabled: false,
+            // PopArt ON by default: value-target normalization is one of the
+            // two "always helpful" MAPPO levers (the other is per-batch
+            // advantage normalization), and the 1000-point win / 500-point
+            // goal anchors need an adaptive critic scale. The league/ratchet
+            // bins and the k8s continuous manifest already forced this on —
+            // the code default lagging at `false` meant every LOCAL trainer
+            // run silently trained without it (the target_popart=false
+            // inconsistency the 2026-07 audit flagged). Any consumer can
+            // still opt out via SOCCER_NEURAL_TARGET_POPART=0 (live:
+            // SOCCER_LIVE_NEURAL_TARGET_POPART).
+            target_popart_enabled: true,
             snapshot_every_batches: DEFAULT_SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES,
             lp_coupling_enabled: false,
             critic_baseline_weight: 0.0,
@@ -20488,6 +20548,21 @@ pub struct MatchStats {
     pub intentional_passes_completed_lateral_home: u32,
     #[serde(default)]
     pub intentional_passes_completed_lateral_away: u32,
+    // Completed passes bucketed by the SAME launch-intent classifier as the
+    // attempted-by-direction counters, so completed/attempted per direction is
+    // a true rate. The reception-based completed_forward/backward counters
+    // above measure REALIZED direction instead — the two disagree exactly when
+    // a forward-intent ball completes with the receiver checking back to
+    // collect it (measured 2026-07-15: ~90% forward intent at launch, ~8%
+    // realized forward gain — the under-hit forward ball in one number).
+    #[serde(default)]
+    pub passes_completed_forward_intent_home: u32,
+    #[serde(default)]
+    pub passes_completed_forward_intent_away: u32,
+    #[serde(default)]
+    pub passes_completed_backward_intent_home: u32,
+    #[serde(default)]
+    pub passes_completed_backward_intent_away: u32,
     // Learning-progress pass metrics. Sum of per-pass forward yards over COMPLETED passes
     // (can be negative); divide by passes_completed for the average yards gained per pass.
     #[serde(default)]
@@ -21644,10 +21719,17 @@ pub(crate) fn calibrated_reward_event_amount(
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
-    // A scored goal is the fixed sparse anchor for every reward model. Learned
-    // and configured calibration may reshape all contextual signals around it,
-    // but must never turn a conversion into a moving target.
-    if kind == SoccerRewardEventKind::Goal {
+    // THE ANCHORS ARE THE CURRENCY (docs/reward-anchoring.md §1): the goal and
+    // match-result rewards define the unit every other weight is priced in, so
+    // neither the static kind-scales nor a learned contextual calibration may
+    // rescale them. Without this carve-out, `DD_SOCCER_REWARD_KIND_SCALES=
+    // "Goal=0.3"` (or a learned Goal head) could silently move the 500-point
+    // conversion — the exact class of inert/mutable-anchor bug the 2026-07-13
+    // audit found throughout the legacy reward stack.
+    if matches!(
+        kind,
+        SoccerRewardEventKind::Goal | SoccerRewardEventKind::MatchResult
+    ) {
         return amount;
     }
 
@@ -21660,6 +21742,18 @@ pub(crate) fn calibrated_reward_event_amount(
                 .unwrap_or(""),
         )
     });
+    calibrated_reward_event_amount_with(kind, amount, whole_field_embedding, scales)
+}
+
+/// Inner, env-free calibration used by [`calibrated_reward_event_amount`] and
+/// unit tests (the outer fn's `OnceLock` snapshot of the env cannot be varied
+/// inside one test process). The anchor carve-out lives in the outer fn.
+pub(crate) fn calibrated_reward_event_amount_with(
+    kind: SoccerRewardEventKind,
+    amount: f64,
+    whole_field_embedding: Option<&[f64]>,
+    scales: &std::collections::HashMap<String, f64>,
+) -> f64 {
     let key = format!("{kind:?}");
     let static_scale = scales.get(&key).copied().unwrap_or(1.0);
     let contextual_scale = reward_context_calibration()
@@ -23362,9 +23456,21 @@ pub(crate) fn dd_soccer_dp_bootstrap_sweeps() -> usize {
 /// (default) is byte-identical. Complements the DP bootstrap: DP sharpens the target signal,
 /// standardization makes the net actually use it.
 pub(crate) fn dd_soccer_enable_target_standardization() -> bool {
-    use std::sync::OnceLock;
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
+    // Default-ON in production (the value-head-collapse fix; the league bin,
+    // ratchet bin, and the k8s continuous manifest all forced it on already —
+    // this closes the gap for every other trainer). `=0` remains the kill
+    // switch. Tests stay default-OFF and env-driven so the byte-identical
+    // parity suite is unchanged.
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_TARGET_STANDARDIZATION"))
+    }
 }
 
 /// Append-only structured action-parameter feature block (priority-1 Part A): fills the
@@ -24809,6 +24915,82 @@ pub(crate) fn on_frame_shot_reward_scale() -> f64 {
     grounded_non_conversion_reward_scale(raw, SHOT_ON_TARGET_REWARD_POINTS, conversion_points)
 }
 
+// ═══ ANCHORED REWARD CURRENCY (docs/reward-anchoring.md) ════════════════════
+// Env `DD_SOCCER_ENABLE_ANCHORED_REWARDS` — default OFF ⇒ byte-identical.
+// When ON, the LIVE self-play currency is fixed: a goal pays 500 (replacing the
+// hardcoded 160-pt chain total), a match win pays 1000 (bypassing the
+// goal-scale floor logic, which floored wins against a goal magnitude that the
+// live path never actually scaled), and an on-frame shot is paid DIRECTLY to
+// the shooter with floor 50 and field-vector cap 50+150·xg_scale. This exists
+// because the audit showed the previous levers never reached live training:
+// `DD_SOCCER_ON_FRAME_SHOT_REWARD_SCALE` is consumed only below the
+// `infer_discrete_events` early-return (tracking-only), and
+// `DD_SOCCER_GOAL_REWARD_SCALE` never touches `record_goal_rewards`.
+// Secondary live events (duels, saves, recoveries, defensive-goal history
+// penalties, direct-turnover goals) scale uniformly by ANCHOR_GOAL/160 so
+// their RELATIVE weight is preserved in the new currency.
+pub(crate) const ANCHOR_WIN_POINTS: f64 = 1000.0;
+pub(crate) const ANCHOR_GOAL_POINTS: f64 = 500.0;
+pub(crate) const ANCHOR_ON_FRAME_SHOT_FLOOR: f64 = 50.0;
+pub(crate) const ANCHOR_ON_FRAME_SHOT_CAP_SPAN: f64 = 150.0;
+
+pub(crate) fn anchored_rewards_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ANCHORED_REWARDS")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_ANCHORED_REWARDS"))
+    }
+}
+
+/// The live goal event total. Since the 2026-07-13 constant bump both branches
+/// resolve to 500 (`GOAL_REWARD_POINTS` was raised 160→500), so a conversion
+/// pays the anchor whether or not `DD_SOCCER_ENABLE_ANCHORED_REWARDS` is set;
+/// the gate still controls the wider return clip and shot-anchor behavior.
+pub(crate) fn live_goal_reward_points() -> f64 {
+    if anchored_rewards_enabled() {
+        ANCHOR_GOAL_POINTS
+    } else {
+        GOAL_REWARD_POINTS
+    }
+}
+
+/// Restores the pre-2026-07 goal-credit stack for A/B comparison ONLY: the
+/// same conversion entering learning through THREE stacked mechanisms (chain
+/// events + a cloned direct-shot transition + the contextual-deferred pool —
+/// ~3× the anchor in total), and steal-and-finish goals discounted to
+/// `DIRECT_TURNOVER_GOAL_REWARD_POINTS`. Default OFF: a conversion pays
+/// exactly ONE `live_goal_reward_points()` pool in every case, which is what
+/// makes the 500-point anchor a dependable constant. See
+/// `World::record_goal_rewards`.
+pub(crate) fn legacy_goal_multi_credit_enabled() -> bool {
+    soccer_env_flag_enabled("DD_SOCCER_ENABLE_LEGACY_GOAL_MULTI_CREDIT")
+}
+
+/// Uniform scale for secondary LIVE reward events under the anchored currency
+/// (keeps duel/save/recovery/defensive magnitudes at the same fraction of a
+/// goal as before). 1.0 when anchoring is off.
+pub(crate) fn anchored_currency_scale() -> f64 {
+    if anchored_rewards_enabled() {
+        ANCHOR_GOAL_POINTS / GOAL_REWARD_POINTS
+    } else {
+        1.0
+    }
+}
+
+/// Anchored on-frame shot points for the SHOOTER: floor 50 anywhere on the
+/// pitch, cap 50+150·xg_scale where `xg_scale` ∈ [0,1] is the field-vector
+/// shot context (`shot_reward_distance_scale`: distance taper × xG). An
+/// on-frame 80-yarder caps at exactly the floor; a close central chance can
+/// reach 200 = 0.40 · goal.
+pub(crate) fn anchored_on_frame_shot_points(xg_scale: f64) -> f64 {
+    ANCHOR_ON_FRAME_SHOT_FLOOR + ANCHOR_ON_FRAME_SHOT_CAP_SPAN * xg_scale.clamp(0.0, 1.0)
+}
+
 fn hierarchy_bounded_shot_on_target_points(shot_scale: f64, goal_scale: f64) -> f64 {
     let raw = SHOT_ON_TARGET_REWARD_POINTS * shot_scale.max(MIN_SOCCER_REWARD_WEIGHT);
     let outcome_ceiling =
@@ -24830,7 +25012,32 @@ fn hierarchy_projected_match_win_points(requested: f64, goal_scale: f64) -> f64 
 /// win-over-goal hierarchy. Public so experiment binaries can report the treatment
 /// that actually executed instead of only the requested environment value.
 pub fn match_outcome_win_reward_points() -> f64 {
-    MATCH_OUTCOME_WIN_REWARD_POINTS
+    if anchored_rewards_enabled() {
+        // Anchored currency: winning the match IS the 1000-point anchor. The
+        // env knob and the goal-scale floor are bypassed — the floor logic
+        // scaled against a goal magnitude the live path never actually paid.
+        return ANCHOR_WIN_POINTS;
+    }
+    let requested = if dynamic_reward_weights_enabled() {
+        reward_weight_env(
+            "DD_SOCCER_MATCH_WIN_REWARD_POINTS",
+            MATCH_OUTCOME_WIN_REWARD_POINTS,
+            MIN_SOCCER_REWARD_WEIGHT,
+            5_000.0,
+        )
+    } else {
+        use std::sync::OnceLock;
+        static V: OnceLock<f64> = OnceLock::new();
+        *V.get_or_init(|| {
+            reward_weight_env(
+                "DD_SOCCER_MATCH_WIN_REWARD_POINTS",
+                MATCH_OUTCOME_WIN_REWARD_POINTS,
+                MIN_SOCCER_REWARD_WEIGHT,
+                5_000.0,
+            )
+        })
+    };
+    hierarchy_projected_match_win_points(requested, goal_reward_scale())
 }
 
 pub(crate) fn bounded_shot_on_target_reward_points() -> f64 {
@@ -24975,8 +25182,8 @@ fn completed_pass_reward_for_pitch(
         // A completed lateral ball keeps possession and may switch the attack, but generic
         // recycle completions must not outscore working the ball into shots — and are NOT scaled.
         (PassDirectionBucket::Lateral, _) => 1.2,
-        (PassDirectionBucket::Backward, true) => -COMPLETED_BACK_PASS_PENALTY_OWN_HALF,
-        (PassDirectionBucket::Backward, false) => -COMPLETED_BACK_PASS_PENALTY_OPPONENT_HALF,
+        (PassDirectionBucket::Backward, true) => COMPLETED_BACK_PASS_REWARD_OWN_HALF,
+        (PassDirectionBucket::Backward, false) => COMPLETED_BACK_PASS_REWARD_OPPONENT_HALF,
     };
     // Flank bonus is unscaled (it applies to forward/lateral alike, so scaling it would re-leak the
     // lever into lateral). Forward magnitude is already scaled inside `base`.
@@ -26402,6 +26609,14 @@ fn soccer_field_player_motion_block(
     // +y is always the actor team's attack direction; x is mirrored with it so left/right
     // is consistent for both teams (a 180° rotation for the side defending +y).
     let dir = actor_team.attack_dir();
+    let relative_kinematics = dd_soccer_enable_field_vector_v2();
+    let actor_velocity = snapshot
+        .player_velocity(actor_id)
+        .unwrap_or_else(Vec2::zero);
+    let actor_acceleration = snapshot
+        .player_acceleration(actor_id)
+        .unwrap_or_else(Vec2::zero);
+    let actor_jerk = snapshot.player_jerk(actor_id).unwrap_or_else(Vec2::zero);
     let mut ordered: Vec<(usize, bool)> = snapshot
         .players
         .iter()
@@ -26433,7 +26648,21 @@ fn soccer_field_player_motion_block(
         let vel = snapshot.player_velocity(id).unwrap_or_else(Vec2::zero);
         let acc = snapshot.player_acceleration(id).unwrap_or_else(Vec2::zero);
         let jerk = snapshot.player_jerk(id).unwrap_or_else(Vec2::zero);
-        push_soccer_field_motion_entity(&mut block, pos, vel, acc, jerk, actor_pos, dir);
+        push_soccer_field_motion_entity(
+            &mut block,
+            pos,
+            vel,
+            acc,
+            jerk,
+            actor_pos,
+            actor_velocity,
+            actor_acceleration,
+            actor_jerk,
+            snapshot.field_length,
+            snapshot.field_width,
+            dir,
+            relative_kinematics,
+        );
         player_slots += 1;
     }
     for _ in player_slots..SOCCER_NEURAL_FIELD_MOTION_PLAYERS {
@@ -26446,7 +26675,13 @@ fn soccer_field_player_motion_block(
         snapshot.ball.acceleration,
         snapshot.ball.jerk,
         actor_pos,
+        actor_velocity,
+        actor_acceleration,
+        actor_jerk,
+        snapshot.field_length,
+        snapshot.field_width,
         dir,
+        relative_kinematics,
     );
     debug_assert_eq!(block.len(), SOCCER_NEURAL_FIELD_MOTION_DIM);
     block
@@ -26459,17 +26694,154 @@ fn push_soccer_field_motion_entity(
     acceleration: Vec2,
     jerk: Vec2,
     actor_pos: Vec2,
+    actor_velocity: Vec2,
+    actor_acceleration: Vec2,
+    actor_jerk: Vec2,
+    field_length: f64,
+    field_width: f64,
     attack_dir: f64,
+    relative_kinematics: bool,
 ) {
     let rel = position - actor_pos;
-    block.push(soccer_neural_scaled(rel.y * attack_dir, 60.0) as f32);
-    block.push(soccer_neural_scaled(rel.x * attack_dir, 40.0) as f32);
+    let (position_long_scale, position_lateral_scale) = if relative_kinematics {
+        (field_length.max(1.0), field_width.max(1.0))
+    } else {
+        (60.0, 40.0)
+    };
+    let velocity = if relative_kinematics {
+        velocity - actor_velocity
+    } else {
+        velocity
+    };
+    let acceleration = if relative_kinematics {
+        acceleration - actor_acceleration
+    } else {
+        acceleration
+    };
+    let jerk = if relative_kinematics {
+        jerk - actor_jerk
+    } else {
+        jerk
+    };
+    block.push(soccer_neural_scaled(rel.y * attack_dir, position_long_scale) as f32);
+    block.push(soccer_neural_scaled(rel.x * attack_dir, position_lateral_scale) as f32);
     block.push(soccer_neural_scaled(velocity.y * attack_dir, 10.0) as f32);
     block.push(soccer_neural_scaled(velocity.x * attack_dir, 10.0) as f32);
     block.push(soccer_neural_scaled(acceleration.y * attack_dir, 12.0) as f32);
     block.push(soccer_neural_scaled(acceleration.x * attack_dir, 12.0) as f32);
     block.push(soccer_neural_scaled(jerk.y * attack_dir, 40.0) as f32);
     block.push(soccer_neural_scaled(jerk.x * attack_dir, 40.0) as f32);
+}
+
+/// New 11v11 entity contract. Test builds re-read the environment so invariance
+/// tests can compare both arms in one process; production latches once.
+pub(crate) fn dd_soccer_enable_field_vector_v2() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FIELD_VECTOR_V2")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_FIELD_VECTOR_V2"))
+    }
+}
+
+pub(crate) fn dd_soccer_enable_central_critic_v2() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_CENTRAL_CRITIC_V2")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_CENTRAL_CRITIC_V2"))
+    }
+}
+
+/// Actor-independent centralized state, ordered Home then Away (stable player id),
+/// in a single fixed Home-attacking pitch frame. Unlike the POMDP block this is
+/// intentionally privileged and must never be appended to actor features.
+fn soccer_central_critic_state(snapshot: &WorldSnapshot) -> Vec<f32> {
+    let mut players = snapshot.players.iter().collect::<Vec<_>>();
+    players.sort_by(|left, right| {
+        let team_key = |team: Team| match team {
+            Team::Home => 0usize,
+            Team::Away => 1usize,
+        };
+        team_key(left.team)
+            .cmp(&team_key(right.team))
+            .then(left.id.cmp(&right.id))
+    });
+    let mut out = Vec::with_capacity(SOCCER_CENTRAL_CRITIC_FEATURE_DIM);
+    let push_entity =
+        |out: &mut Vec<f32>, position: Vec2, velocity: Vec2, acceleration: Vec2, jerk: Vec2| {
+            let x = ((position.x / snapshot.field_width.max(1.0)) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            let y = ((position.y / snapshot.field_length.max(1.0)) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            out.push(x as f32);
+            out.push(y as f32);
+            out.push(soccer_neural_scaled(velocity.x, 10.0) as f32);
+            out.push(soccer_neural_scaled(velocity.y, 10.0) as f32);
+            out.push(soccer_neural_scaled(acceleration.x, 12.0) as f32);
+            out.push(soccer_neural_scaled(acceleration.y, 12.0) as f32);
+            out.push(soccer_neural_scaled(jerk.x, 40.0) as f32);
+            out.push(soccer_neural_scaled(jerk.y, 40.0) as f32);
+        };
+    for player in players.into_iter().take(SOCCER_NEURAL_FIELD_MOTION_PLAYERS) {
+        push_entity(
+            &mut out,
+            snapshot
+                .player_position(player.id)
+                .unwrap_or(player.position),
+            snapshot
+                .player_velocity(player.id)
+                .unwrap_or(player.velocity),
+            snapshot
+                .player_acceleration(player.id)
+                .unwrap_or(player.acceleration),
+            snapshot.player_jerk(player.id).unwrap_or(player.jerk),
+        );
+    }
+    while out.len() < SOCCER_NEURAL_FIELD_MOTION_PLAYERS * SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER {
+        out.extend([0.0; SOCCER_NEURAL_FIELD_MOTION_PER_PLAYER]);
+    }
+    push_entity(
+        &mut out,
+        snapshot.ball.position,
+        snapshot.ball.velocity,
+        snapshot.ball.acceleration,
+        snapshot.ball.jerk,
+    );
+    let possession = snapshot.possession_team();
+    out.extend([
+        f32::from(possession == Some(Team::Home)),
+        f32::from(possession == Some(Team::Away)),
+        f32::from(possession.is_none()),
+        soccer_neural_scaled(snapshot.score_home as f64 - snapshot.score_away as f64, 5.0) as f32,
+        soccer_neural_scaled(snapshot.clock_seconds, 5_400.0) as f32,
+        soccer_neural_scaled(snapshot.ball.altitude_yards.max(0.0), 10.0) as f32,
+        snapshot.ball.holder.map_or(0.0, |holder| {
+            snapshot
+                .players
+                .iter()
+                .find(|player| player.id == holder)
+                .map_or(
+                    0.0,
+                    |player| {
+                        if player.team == Team::Home {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    },
+                )
+        }),
+        1.0,
+    ]);
+    debug_assert_eq!(out.len(), SOCCER_CENTRAL_CRITIC_FEATURE_DIM);
+    out
 }
 
 fn soccer_decision_context_for(
@@ -26932,6 +27304,12 @@ fn soccer_decision_context_for(
         actor_velocity,
         actor_acceleration,
         field_player_motion: soccer_field_player_motion_block(before, player_id, team),
+        central_critic_state: dd_soccer_enable_central_critic_v2()
+            .then(|| soccer_central_critic_state(before))
+            .unwrap_or_default(),
+        next_central_critic_state: dd_soccer_enable_central_critic_v2()
+            .then(|| soccer_central_critic_state(after))
+            .unwrap_or_default(),
         opponent_belief: soccer_opponent_belief_block(before, player_id, team),
         ball_position: before.ball.position,
         ball_velocity: before.ball.velocity,
@@ -40568,6 +40946,10 @@ pub struct SoccerNeuralNetworkSnapshot {
     /// trained passing/dribbling/shooting/GK specialists across episodes and persisted runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_head: Option<Box<SoccerPolicyHeadSnapshot>>,
+    /// Separate centralized V(s) baseline for MAPPO/GAE. Its 192-wide input is
+    /// actor-independent and never reused by the action-conditioned Q critic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub central_critic_head: Option<Box<SoccerAuxiliaryHeadSnapshot>>,
     /// Optional independent pass/dribble/shot specialist actors. These are separate
     /// from the role-local specialists embedded in `policy_head`: they directly
     /// refine technical action selection through `SoccerSkillPolicyHeads`, so eval
@@ -40766,6 +41148,11 @@ fn average_soccer_neural_network_snapshot_refs(
         )
     })
     .map(Box::new);
+    out.central_critic_head = average_optional_aux_head(
+        base.and_then(|snapshot| snapshot.central_critic_head.as_deref()),
+        snapshots,
+        |snapshot| snapshot.central_critic_head.as_deref(),
+    );
     out.skill_policy_heads = collect_all_some(
         snapshots
             .iter()
@@ -41205,6 +41592,120 @@ pub struct SoccerPassCompletionHead {
     network: FeedForwardNetwork,
     training_steps: usize,
     last_loss: Option<f64>,
+}
+
+/// Team value baseline over the actor-independent global state. This deliberately
+/// does not score actions; the existing neural learner remains the Q(s,a) critic
+/// used for candidate ranking and Bellman replay.
+#[derive(Clone, Debug)]
+pub(crate) struct SoccerCentralCriticHead {
+    network: FeedForwardNetwork,
+    training_steps: usize,
+    last_loss: Option<f64>,
+}
+
+impl SoccerCentralCriticHead {
+    fn new(seed: u32) -> Self {
+        let mut rng = mulberry32(seed ^ 0xC37A_11C5);
+        let network = FeedForwardNetwork::random(
+            &RandomNetworkSpec {
+                input_dim: SOCCER_CENTRAL_CRITIC_FEATURE_DIM,
+                hidden_layers: vec![SOCCER_CENTRAL_CRITIC_HIDDEN_UNITS, 64],
+                output_dim: 1,
+                hidden_activation: ActivationName::Tanh,
+                output_activation: ActivationName::Linear,
+                weight_scale: None,
+            },
+            &mut rng,
+        );
+        Self {
+            network,
+            training_steps: 0,
+            last_loss: None,
+        }
+    }
+
+    fn predict(&self, state: &[f32], target_scale: f64) -> Option<f64> {
+        if state.len() != SOCCER_CENTRAL_CRITIC_FEATURE_DIM
+            || state.iter().any(|value| !value.is_finite())
+        {
+            return None;
+        }
+        let input = state
+            .iter()
+            .map(|value| f64::from(*value))
+            .collect::<Vec<_>>();
+        self.network
+            .predict(&input)
+            .first()
+            .copied()
+            .filter(|value| value.is_finite())
+            .map(|value| value * target_scale)
+    }
+
+    fn train(&mut self, samples: &[(Vec<f32>, f64)], target_scale: f64, target_clip: f64) {
+        let scale = target_scale.max(1.0e-6);
+        let clip = target_clip.max(0.1);
+        let mut total_loss = 0.0;
+        let mut applied = 0usize;
+        for (state, raw_target) in samples {
+            if state.len() != SOCCER_CENTRAL_CRITIC_FEATURE_DIM
+                || state.iter().any(|value| !value.is_finite())
+                || !raw_target.is_finite()
+            {
+                continue;
+            }
+            let input = state
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect::<Vec<_>>();
+            let target = [(raw_target / scale).clamp(-clip, clip)];
+            let result = self.network.train_sample_clipped(
+                &input,
+                &target,
+                SOCCER_CENTRAL_CRITIC_LEARNING_RATE,
+                SOCCER_NEURAL_GRAD_CLIP_NORM,
+            );
+            if result.applied && result.loss.is_finite() {
+                total_loss += result.loss;
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            self.training_steps = self.training_steps.saturating_add(applied);
+            self.last_loss = Some(total_loss / applied as f64);
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.training_steps > 0
+    }
+
+    fn to_snapshot(&self) -> SoccerAuxiliaryHeadSnapshot {
+        let mut network = soccer_neural_network_snapshot(&self.network);
+        network.training_steps = self.training_steps;
+        network.average_loss = self.last_loss;
+        SoccerAuxiliaryHeadSnapshot {
+            network,
+            training_steps: self.training_steps,
+            average_loss: self.last_loss,
+        }
+    }
+
+    fn from_snapshot(snapshot: &SoccerAuxiliaryHeadSnapshot) -> Result<Self, String> {
+        let network = build_soccer_feed_forward_network_from_snapshot(
+            &snapshot.network,
+            SOCCER_CENTRAL_CRITIC_FEATURE_DIM,
+            1,
+            &[],
+            "central critic head",
+        )?;
+        Ok(Self {
+            network,
+            training_steps: snapshot.training_steps.max(snapshot.network.training_steps),
+            last_loss: snapshot.average_loss.or(snapshot.network.average_loss),
+        })
+    }
 }
 
 impl SoccerPassCompletionHead {
@@ -45945,6 +46446,7 @@ fn soccer_neural_network_snapshot(network: &FeedForwardNetwork) -> SoccerNeuralN
         average_loss: None,
         target_popart: None,
         policy_head: None,
+        central_critic_head: None,
         skill_policy_heads: None,
         keeper_policy_head: None,
         line_depth_head: None,

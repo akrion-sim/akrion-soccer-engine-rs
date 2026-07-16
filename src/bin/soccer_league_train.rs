@@ -157,6 +157,78 @@ fn apply_league_actor_config(config: &mut EngineMatchRunnerConfig) -> bool {
     enabled
 }
 
+/// PFSP fixture allocation (pure, unit-tested). Budget = len·games_per_opp,
+/// redistributed over the pool by the AlphaStar "challenge" curve
+/// w = p·(1−p)+ε with p = logistic(goal-diff EMA): even matchups get the most
+/// fixtures, long-beaten members fade. Invariants: the analytic anchor (when
+/// present) keeps EXACTLY its full games_per_opp share, every other member
+/// keeps a coverage floor of 1, and the total always equals the budget.
+fn pfsp_fixture_allocation(
+    gd_ema_by_idx: &[f64],
+    anchor_idx: Option<usize>,
+    games_per_opp: usize,
+) -> Vec<usize> {
+    let members = gd_ema_by_idx.len();
+    let weights: Vec<f64> = (0..members)
+        .map(|idx| {
+            if Some(idx) == anchor_idx {
+                0.0
+            } else {
+                let p = 1.0 / (1.0 + (-gd_ema_by_idx[idx]).exp());
+                p * (1.0 - p) + 0.15
+            }
+        })
+        .collect();
+    let anchor_reserved = anchor_idx.map_or(0, |_| games_per_opp);
+    let pool_budget = members * games_per_opp - anchor_reserved;
+    let pool_members = members - usize::from(anchor_idx.is_some());
+    let weight_total: f64 = weights.iter().sum();
+    let mut alloc: Vec<usize> = (0..members)
+        .map(|idx| {
+            if Some(idx) == anchor_idx {
+                anchor_reserved
+            } else if weight_total > 0.0 {
+                // Coverage floor 1, remainder proportional to weight.
+                let spare = pool_budget.saturating_sub(pool_members) as f64;
+                1 + (spare * weights[idx] / weight_total).round() as usize
+            } else {
+                games_per_opp
+            }
+        })
+        .collect();
+    // Rounding drift: trim/pad against the exact budget, never below the
+    // per-opponent floor of 1 and never off the anchor's reserved share.
+    let mut total: usize = alloc.iter().sum();
+    let budget = members * games_per_opp;
+    while total > budget {
+        if let Some((idx, _)) = alloc
+            .iter()
+            .enumerate()
+            .filter(|(idx, games)| Some(*idx) != anchor_idx && **games > 1)
+            .max_by_key(|(_, games)| **games)
+        {
+            alloc[idx] -= 1;
+            total -= 1;
+        } else {
+            break;
+        }
+    }
+    while total < budget {
+        if let Some((idx, _)) = alloc
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| Some(*idx) != anchor_idx)
+            .min_by_key(|(_, games)| **games)
+        {
+            alloc[idx] += 1;
+            total += 1;
+        } else {
+            break;
+        }
+    }
+    alloc
+}
+
 fn league_worker_count(requested_workers: usize, fixture_count: usize) -> usize {
     let capped = requested_workers.clamp(1, fixture_count.max(1));
     let carries_mpc_head = learned_mpc_objective_enabled() || mpc_reject_threshold_model_enabled();
@@ -1751,6 +1823,13 @@ fn main() {
     let mut round = 0u32;
     let mut best_checkpoint_net_forward_pass_margin = f64::NEG_INFINITY;
     let mut archived_step_buckets: BTreeSet<usize> = BTreeSet::new();
+    // PFSP (prioritized fictitious self-play, AlphaStar's "challenge" curve):
+    // per-opponent goal-diff EMA keyed by opponent INDEX (the archive loads in
+    // sorted-filename order, so existing members keep their index across
+    // rounds; the trailing frontier/anchor slots shift only on promotion and
+    // the EMA re-adapts within a couple of rounds). Even matchups get the most
+    // fixtures; long-beaten champions fade instead of consuming the round.
+    let mut pfsp_goal_diff_ema: HashMap<usize, f64> = HashMap::new();
     println!(
         "league_train_started_at_utc={} games/opp={} minutes={} period_count={} weight_decay={} fresh_opp={} checkpoint_every={} max_rounds={} max_training_steps={} max_target_entries_per_side={} advancement_metric=completed_forward_passes net_metric=completed_forward_passes_minus_turnovers analytic_opponents={} uniform_elite_players={} seed_varied_skills={} hermetic_neural={} attack_canonical_features={} ball_zone_tactical_scale={} player_grid_xy_features={} policy_train_max_transitions_per_tick={} full_game_policy_max_samples={} full_game_learning_enabled={} neural_learning_rate={} neural_optimizer_momentum={} neural_blend_mode={:?} neural_blend_lambda={} neural_authoritative_lambda={} neural_blend_candidates={} neural_blend_warmup_steps={} policy_learning_rate={} mappo_epochs={} policy_entropy_coeff={} mpc_reject_threshold_model={mpc_reject_threshold_model} mpc_reject_threshold_epochs={mpc_reject_threshold_epochs} mpc_reject_threshold_learning_rate={mpc_reject_threshold_learning_rate} forward_select_logit_weight={} forward_select_logit_learning_rate={} forward_select_restore_override={forward_select_restore_override} finishing_select_bonus_weight={} finishing_selection_floor={} finishing_selection_max_regression={} finishing_selection_shot_drought_boost={finishing_selection_shot_drought_boost} finishing_selection_max_effective_floor={finishing_selection_max_effective_floor} forward_creation_selection_floor={forward_creation_selection_floor} forward_creation_selection_max_regression={forward_creation_selection_max_regression} forward_creation_min_quality={forward_creation_min_quality} forward_creation_min_completion={forward_creation_min_completion} forward_creation_min_forward_yards={forward_creation_min_forward_yards} forward_creation_bypass_min_quality={forward_creation_bypass_min_quality} forward_creation_bypass_min_completion={forward_creation_bypass_min_completion} planner_teacher_missed_opportunity={planner_teacher_missed_opportunity} planner_teacher_advantage_floor={planner_teacher_advantage_floor:.3} planner_teacher_advantage_max={planner_teacher_advantage_max:.3} planner_teacher_weight={planner_teacher_weight:.2} planner_teacher_min_score_share={planner_teacher_min_score_share:.3} planner_teacher_min_shot_quality={planner_teacher_min_shot_quality:.2} planner_teacher_min_forward_quality={planner_teacher_min_forward_quality:.2} planner_teacher_min_forward_completion={planner_teacher_min_forward_completion:.2} planner_teacher_max_samples_per_decision={planner_teacher_max_samples_per_decision} planner_teacher_include_same_pass_family={planner_teacher_include_same_pass_family} planner_teacher_same_pass_min_margin_share={planner_teacher_same_pass_min_margin_share:.3} chance_quality_reward={} chance_quality_composite={} chance_quality_k={} chance_quality_cap={} league_neural_mcts_enabled={} actor_critic_enabled={} lp_coupling_enabled={} target_standardization_enabled={} mc_critic_target_enabled={} neural_self_bootstrap_enabled={} maxa_bootstrap_enabled={} novelty_bonus_enabled={} fast_actor_reward_fallback_enabled={} pass_outcome_priority_learning_enabled={} forward_pass_climb_curriculum_enabled={} dp_bootstrap_enabled={} dp_bootstrap_horizon={} dp_bootstrap_sweeps={} mpc_tier2_enabled={} mpc_reconcile_enabled={} mpc_field_aware_enabled={} mpc_latent_objective_enabled={} local_mpc_enabled={} checkpoint_require_forward_pass_climb={} checkpoint_max_forward_pass_regression={} checkpoint_min_forward_pass_margin={} checkpoint_validate_games={} checkpoint_validate_min_forward_pass_margin={} checkpoint_validate_min_net_forward_pass_margin={} checkpoint_validate_min_goal_diff_margin={} frontier={} candidate_frontier={} archive={} step_archive_dir={} step_archive_buckets={:?}",
         chrono_now(),
@@ -1926,10 +2005,39 @@ fn main() {
         let frontier_always_home = std::env::var("SOCCER_LEAGUE_FRONTIER_ALWAYS_HOME")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        // PFSP fixture allocation (kill switch SOCCER_LEAGUE_PFSP=0): the round
+        // budget stays opponents.len()·games_per_opp, but fixtures concentrate
+        // on even matchups (w = p·(1−p)+ε on a logistic squash of the gd EMA).
+        // Floors: every opponent keeps ≥1 fixture (coverage), and the analytic
+        // anchor (last slot in ladder/anchored modes) keeps its FULL share —
+        // grounding vs the engine is the anti-drift guard, never traded away.
+        let pfsp_enabled = env_default_bool("SOCCER_LEAGUE_PFSP", true);
+        let anchor_idx = (self_play_ladder || fixed_analytic_training_anchor)
+            .then(|| opponents.len().saturating_sub(1));
+        let per_opp_games: Vec<usize> = if pfsp_enabled && opponents.len() > 1 {
+            let gd_by_idx: Vec<f64> = (0..opponents.len())
+                .map(|idx| pfsp_goal_diff_ema.get(&idx).copied().unwrap_or(0.0))
+                .collect();
+            pfsp_fixture_allocation(&gd_by_idx, anchor_idx, games_per_opp)
+        } else {
+            vec![games_per_opp; opponents.len()]
+        };
+        if pfsp_enabled && opponents.len() > 1 {
+            println!(
+                "league_pfsp round={round} allocation={per_opp_games:?} gd_ema={:?}",
+                (0..opponents.len())
+                    .map(
+                        |idx| (pfsp_goal_diff_ema.get(&idx).copied().unwrap_or(0.0) * 100.0)
+                            .round()
+                            / 100.0
+                    )
+                    .collect::<Vec<_>>()
+            );
+        }
         let mut fixtures: Vec<Fx> = Vec::new();
         let mut fixture = 0u32;
         for idx in 0..opponents.len() {
-            for g in 0..games_per_opp {
+            for g in 0..per_opp_games[idx] {
                 let seed = train_seed_base
                     .wrapping_add(round.wrapping_mul(1_000_003))
                     .wrapping_add(fixture.wrapping_mul(2_246_822_519))
@@ -1974,6 +2082,8 @@ fn main() {
                     } else if kpis.goal_diff < 0 {
                         losses += 1;
                     }
+                    let entry = pfsp_goal_diff_ema.entry(fx.opp_idx).or_insert(0.0);
+                    *entry = 0.7 * *entry + 0.3 * f64::from(kpis.goal_diff);
                     round_kpis.add(kpis);
                 }
             }
@@ -1983,7 +2093,7 @@ fn main() {
             let wins_a = std::sync::atomic::AtomicI32::new(0);
             let losses_a = std::sync::atomic::AtomicI32::new(0);
             let trained_brains = std::sync::Mutex::new(Vec::<TeamBrain>::new());
-            let match_kpis = std::sync::Mutex::new(Vec::<LeagueMatchKpis>::new());
+            let match_kpis = std::sync::Mutex::new(Vec::<(usize, LeagueMatchKpis)>::new());
             std::thread::scope(|scope| {
                 for w in 0..workers {
                     let lo = w * chunk;
@@ -2017,14 +2127,16 @@ fn main() {
                                 } else if kpis.goal_diff < 0 {
                                     losses_a.fetch_add(1, Relaxed);
                                 }
-                                match_kpis.lock().unwrap().push(kpis);
+                                match_kpis.lock().unwrap().push((fx.opp_idx, kpis));
                             }
                         }
                         trained_brains.lock().unwrap().push(wf);
                     });
                 }
             });
-            for kpis in match_kpis.into_inner().unwrap() {
+            for (opp_idx, kpis) in match_kpis.into_inner().unwrap() {
+                let entry = pfsp_goal_diff_ema.entry(opp_idx).or_insert(0.0);
+                *entry = 0.7 * *entry + 0.3 * f64::from(kpis.goal_diff);
                 round_kpis.add(kpis);
             }
             (
@@ -2306,9 +2418,17 @@ fn main() {
                     checkpoint_min_backward_pass_attempts,
                 );
                 let promotes = if self_play_ladder {
-                    // Gen-0 is a challenger to the frozen starting brain, not an
-                    // automatic champion. Every generation must clear the same
-                    // side-balanced lower-confidence-bound and analytic anchor.
+                    // GEN-0 BOOTSTRAP: with no frontier published yet, the only
+                    // pool member is the analytic anchor — so the "champion
+                    // gate" degenerates into "beat the analytic engine by
+                    // LCB95 ≥ margin", which is the CEILING the ladder exists
+                    // to climb toward, not a beatable floor (the ladder held
+                    // forever here; the 5v5 port learned the same lesson).
+                    // The first checkpoint therefore promotes unconditionally:
+                    // the floor is the starting net, analytic stays in the
+                    // TRAINING pool for grounding, and from gen-1 on every
+                    // generation must clear the full side-balanced LCB95 gate
+                    // plus the analytic-anchor non-regression co-gate.
                     let bootstrap_gen0 = !std::path::Path::new(&frontier_path).exists();
                     let gate_goal_diff_lower_95 = validation
                         .as_ref()
@@ -2322,21 +2442,22 @@ fn main() {
                         .as_ref()
                         .map(LeagueRoundKpis::net_forward_pass_margin_lower_95)
                         .unwrap_or(f64::NEG_INFINITY);
-                    let ladder_promotes = self_play_ladder_promotion_passes(
-                        gate_goal_diff_lower_95,
-                        self_play_promote_margin,
-                        gate_forward_pass_margin_lower_95,
-                        self_play_forward_promote_margin,
-                        gate_net_forward_pass_margin_lower_95,
-                        self_play_net_forward_promote_margin,
-                        passes_analytic_anchor,
-                        checkpoint_require_forward_pass_climb,
-                        passes_forward_pass_climb,
-                        passes_forward_pass_floor,
-                        passes_net_forward_pass_floor,
-                        passes_validation,
-                        passes_completion_floor,
-                    );
+                    let ladder_promotes = bootstrap_gen0
+                        || self_play_ladder_promotion_passes(
+                            gate_goal_diff_lower_95,
+                            self_play_promote_margin,
+                            gate_forward_pass_margin_lower_95,
+                            self_play_forward_promote_margin,
+                            gate_net_forward_pass_margin_lower_95,
+                            self_play_net_forward_promote_margin,
+                            passes_analytic_anchor,
+                            checkpoint_require_forward_pass_climb,
+                            passes_forward_pass_climb,
+                            passes_forward_pass_floor,
+                            passes_net_forward_pass_floor,
+                            passes_validation,
+                            passes_completion_floor,
+                        );
                     println!(
                         "league_self_play_ladder round={round} bootstrap_gen0={} gd_vs_champion={:.3} gd_lcb95={:.3} promote_margin={:.3} forward_margin_lcb95={:.3} forward_promote_margin={:.3} net_forward_margin_lcb95={:.3} net_forward_promote_margin={:.3} analytic_anchor_passed={} forward_climb_passed={} forward_floor_passed={} net_forward_floor_passed={} validation_passed={} completion_floor_passed={} completion_targets={:.3}/{:.3}/{:.3} backward_attempts={}/{} verdict={}",
                         bootstrap_gen0,
@@ -2459,6 +2580,30 @@ mod tests {
     use super::*;
     use soccer_engine::des::general::soccer::MatchStats;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn pfsp_allocation_preserves_budget_anchor_and_floors() {
+        // 4 pool members + anchor (last): one even matchup (ema 0), one
+        // long-beaten (+5), one losing badly (−5), one unknown-but-tracked 0.8.
+        let gd = [0.0, 5.0, -5.0, 0.8, 0.0];
+        let alloc = pfsp_fixture_allocation(&gd, Some(4), 4);
+        assert_eq!(alloc.iter().sum::<usize>(), 5 * 4, "budget is exact");
+        assert_eq!(alloc[4], 4, "the analytic anchor keeps its full share");
+        assert!(alloc.iter().all(|&games| games >= 1), "coverage floor");
+        assert!(
+            alloc[0] > alloc[1] && alloc[0] > alloc[2],
+            "the even matchup out-draws both solved matchups: {alloc:?}"
+        );
+
+        // No anchor: still exact budget + floors, even weights ⇒ even split.
+        let flat = pfsp_fixture_allocation(&[0.0, 0.0, 0.0], None, 2);
+        assert_eq!(flat.iter().sum::<usize>(), 6);
+        assert!(flat.iter().all(|&games| games == 2), "{flat:?}");
+
+        // Two members, one anchor: the lone pool member absorbs the pool budget.
+        let duo = pfsp_fixture_allocation(&[1.0, 0.0], Some(1), 3);
+        assert_eq!(duo, vec![3, 3]);
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

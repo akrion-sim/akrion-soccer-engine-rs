@@ -21,8 +21,6 @@
 //! Everything is seeded and deterministic: the same teams + seed + runner
 //! always produce the same bracket and champion.
 
-#[cfg(test)]
-use crate::des::general::soccer::{MatchStats, MpcRejectFamily, MpcRejectThresholdInputs};
 use crate::des::general::soccer::{
     learned_mpc_objective_enabled, mpc_reject_threshold_model_enabled, MatchConfig, MatchSummary,
     MpcObjectiveSample, MpcRejectThresholdHead, MpcRejectThresholdSample, SoccerMatch,
@@ -30,6 +28,8 @@ use crate::des::general::soccer::{
     SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry, SoccerTeamQPolicies, Team,
     MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
 };
+#[cfg(test)]
+use crate::des::general::soccer::{MatchStats, MpcRejectFamily, MpcRejectThresholdInputs};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
