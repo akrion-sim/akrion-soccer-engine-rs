@@ -21809,7 +21809,7 @@ impl SoccerMatch {
         let ranked = policy
             .ranked_action_values_for_snapshot(snapshot, player_id, LEARNED_MPC_REPLAN_CANDIDATES)
             .map(|(_, ranked)| ranked);
-        let contextual_hard_threshold = Self::learned_mpc_reject_family_for_label(original_family)
+        let contextual_hard_threshold = mpc_reject_family_for_action_label(original_family)
             .map(|family| {
                 let field_vector_threshold = snapshot.learned_mpc_reject_threshold(
                     player_id,
@@ -21863,7 +21863,7 @@ impl SoccerMatch {
                     .unwrap_or(0.0)
                     .clamp(0.0, 1.0);
             let candidate_family = normalize_soccer_action_label(&candidate_plan.action);
-            let candidate_hard_replan = Self::learned_mpc_reject_family_for_label(candidate_family)
+            let candidate_hard_replan = mpc_reject_family_for_action_label(candidate_family)
                 .is_some_and(|family| {
                     let field_vector_threshold = snapshot.learned_mpc_reject_threshold(
                         player_id,
@@ -21995,7 +21995,7 @@ impl SoccerMatch {
         plan: &SoccerLearnedPlan,
     ) -> bool {
         let label = normalize_soccer_action_label(&plan.action);
-        let family = Self::learned_mpc_reject_family_for_label(label);
+        let family = mpc_reject_family_for_action_label(label);
         let Some(family) = family else {
             return false;
         };
