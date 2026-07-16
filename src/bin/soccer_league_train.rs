@@ -1377,6 +1377,18 @@ fn completion_lower_95(completed: u32, attempted: u32) -> f64 {
     )
 }
 
+fn minimum_attempts_for_possible_completion_floor(min_completion: f64) -> u32 {
+    let target = min_completion.clamp(0.0, 1.0);
+    if target <= 0.0 {
+        return 0;
+    }
+    if target >= 1.0 {
+        return u32::MAX;
+    }
+    let required = (PROMOTION_WILSON_Z * PROMOTION_WILSON_Z * target / (1.0 - target)).ceil();
+    required.min(u32::MAX as f64) as u32
+}
+
 fn checkpoint_pass_completion_passes(
     validation: Option<&LeagueRoundKpis>,
     expected_games: usize,
@@ -1484,15 +1496,25 @@ fn main() {
     .clamp(0.0, 1.0);
     let checkpoint_min_pass_attempts = env_usize(
         "SOCCER_LEAGUE_CHECKPOINT_MIN_PASS_ATTEMPTS",
-        checkpoint_validate_games.saturating_mul(8).max(32),
+        checkpoint_validate_games.saturating_mul(8).max(
+            minimum_attempts_for_possible_completion_floor(checkpoint_min_pass_completion) as usize,
+        ),
     ) as u32;
     let checkpoint_min_forward_pass_attempts = env_usize(
         "SOCCER_LEAGUE_CHECKPOINT_MIN_FORWARD_PASS_ATTEMPTS",
-        checkpoint_validate_games.saturating_mul(4).max(16),
+        checkpoint_validate_games
+            .saturating_mul(4)
+            .max(minimum_attempts_for_possible_completion_floor(
+                checkpoint_min_forward_pass_completion,
+            ) as usize),
     ) as u32;
     let checkpoint_min_backward_pass_attempts = env_usize(
         "SOCCER_LEAGUE_CHECKPOINT_MIN_BACKWARD_PASS_ATTEMPTS",
-        checkpoint_validate_games.div_ceil(2).max(8),
+        checkpoint_validate_games
+            .div_ceil(2)
+            .max(minimum_attempts_for_possible_completion_floor(
+                checkpoint_min_backward_pass_completion,
+            ) as usize),
     ) as u32;
     let fixed_analytic_training_anchor =
         env_bool("SOCCER_LEAGUE_FIXED_ANALYTIC_TRAINING_ANCHOR", true);
@@ -2896,6 +2918,13 @@ mod tests {
         ));
         assert!(completion_lower_95(1, 1) < 0.90);
         assert_eq!(completion_lower_95(0, 0), 0.0);
+        assert_eq!(minimum_attempts_for_possible_completion_floor(0.90), 35);
+        assert_eq!(minimum_attempts_for_possible_completion_floor(0.85), 22);
+        assert_eq!(minimum_attempts_for_possible_completion_floor(0.95), 73);
+        assert_eq!(
+            minimum_attempts_for_possible_completion_floor(1.0),
+            u32::MAX
+        );
     }
 
     #[test]
