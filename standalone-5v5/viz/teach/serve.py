@@ -18,6 +18,15 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **k):
         super().__init__(*a, directory=HERE, **k)
 
+
+    def guess_type(self, path):
+        # UTF-8 charset on every text response: the pages embed em-dashes and
+        # arrows; served without a charset, browsers may fall back to Latin-1
+        # and render mojibake ('\u00e2\u20ac\u201d' where '\u2014' belongs).
+        base = super().guess_type(path)
+        if isinstance(base, str) and base.startswith(("text/", "application/javascript")) and "charset" not in base:
+            return base + "; charset=utf-8"
+        return base
     def end_headers(self):
         self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("Access-Control-Allow-Origin", "*")
