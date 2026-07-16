@@ -107,6 +107,7 @@ const SOCCER_RUN_DELTA_INSERT_BATCH_SIZE: usize = 1024;
 const SOCCER_COMPLETED_RUN_INSERT_BATCH_SIZE: usize = 512;
 const SOCCER_POLICY_RETENTION_BRANCH_TIP: &str = "branch_tip";
 const SOCCER_POLICY_INLINE_PRUNE_ENV: &str = "SOCCER_PG_INLINE_POLICY_PRUNE";
+const SOCCER_MOMENT_VECTOR_INLINE_PRUNE_ENV: &str = "SOCCER_PG_INLINE_MOMENT_VECTOR_PRUNE";
 const SOCCER_POLICY_RETAIN_ARCHIVED_ENTRIES_ENV: &str = "SOCCER_PG_RETAIN_ARCHIVED_POLICY_ENTRIES";
 /// Escape hatch to keep the heavy `neuralNetwork` blob in `metrics` for versions the promotion
 /// gate has already archived. Defaults OFF: archived, gate-rejected non-loadable versions are
@@ -2489,11 +2490,6 @@ impl SoccerLearningPgStore {
                 Some(experiment_id),
                 &game.config_moments,
             )?;
-            soft_delete_old_moment_vectors_in_transaction(
-                &mut tx,
-                Some(experiment_id),
-                SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
-            )?;
         }
         if !game.pass_outcome_samples.is_empty() {
             ensure_soccer_pass_outcome_tables(&mut tx)?;
@@ -2506,6 +2502,9 @@ impl SoccerLearningPgStore {
         }
         tx.commit()
             .map_err(|err| format!("commit soccer learning run: {err}"))?;
+        if !game.config_moments.is_empty() {
+            self.prune_moment_vectors_after_commit_best_effort(Some(experiment_id));
+        }
         Ok(run_id)
     }
 
@@ -2612,13 +2611,9 @@ impl SoccerLearningPgStore {
             tx.execute(&sql, &params)
                 .map_err(|err| format!("insert soccer moment embeddings: {err}"))?;
         }
-        soft_delete_old_moment_vectors_in_transaction(
-            &mut tx,
-            experiment_id,
-            SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
-        )?;
         tx.commit()
             .map_err(|err| format!("commit soccer moment embeddings: {err}"))?;
+        self.prune_moment_vectors_after_commit_best_effort(experiment_id);
         Ok(moments.len())
     }
 
@@ -2702,13 +2697,9 @@ impl SoccerLearningPgStore {
             .map_err(|err| format!("begin config moment transaction: {err}"))?;
         ensure_soccer_config_moment_tables(&mut tx)?;
         insert_config_moments_in_transaction(&mut tx, run_id, experiment_id, moments)?;
-        soft_delete_old_moment_vectors_in_transaction(
-            &mut tx,
-            experiment_id,
-            SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
-        )?;
         tx.commit()
             .map_err(|err| format!("commit soccer config moments: {err}"))?;
+        self.prune_moment_vectors_after_commit_best_effort(experiment_id);
         Ok(moments.len())
     }
 
@@ -2839,15 +2830,11 @@ impl SoccerLearningPgStore {
             }
             run_ids.extend(chunk_run_ids);
         }
-        if has_config_moments {
-            soft_delete_old_moment_vectors_in_transaction(
-                &mut tx,
-                Some(experiment_id),
-                SOCCER_MOMENT_VECTOR_SOFT_DELETE_AFTER_DAYS,
-            )?;
-        }
         tx.commit()
             .map_err(|err| format!("commit soccer learning run batch: {err}"))?;
+        if has_config_moments {
+            self.prune_moment_vectors_after_commit_best_effort(Some(experiment_id));
+        }
         Ok(run_ids)
     }
 
@@ -3038,6 +3025,20 @@ impl SoccerLearningPgStore {
         tx.commit()
             .map_err(|err| format!("commit soccer moment-vector retention: {err}"))?;
         Ok(prune)
+    }
+
+    /// Run retention only after the caller's learning data is durable. Remote stores defer this
+    /// potentially expensive maintenance by default; an explicit maintenance job can call
+    /// [`Self::soft_delete_old_moment_vectors`] or opt in with
+    /// [`SOCCER_MOMENT_VECTOR_INLINE_PRUNE_ENV`]. Retention is best-effort here because cleanup
+    /// must never invalidate a completed game, policy delta, or retrieval moment.
+    fn prune_moment_vectors_after_commit_best_effort(&mut self, experiment_id: Option<&str>) {
+        if !soccer_moment_vector_inline_prune_enabled() {
+            return;
+        }
+        if let Err(err) = self.soft_delete_old_moment_vectors(experiment_id) {
+            eprintln!("soccer moment retention: post-commit cleanup deferred (best-effort): {err}");
+        }
     }
 
     /// Roll one completed run's both-teams pass metrics into the per-commit learning-progress
@@ -5817,6 +5818,22 @@ fn soccer_policy_inline_prune_enabled() -> bool {
     soccer_policy_inline_prune_enabled_from_env_value(raw.as_deref(), database_url.as_deref())
 }
 
+fn soccer_moment_vector_inline_prune_enabled() -> bool {
+    let raw = std::env::var(SOCCER_MOMENT_VECTOR_INLINE_PRUNE_ENV).ok();
+    let database_url = soccer_learning_database_url();
+    soccer_moment_vector_inline_prune_enabled_from_env_value(
+        raw.as_deref(),
+        database_url.as_deref(),
+    )
+}
+
+fn soccer_moment_vector_inline_prune_enabled_from_env_value(
+    raw: Option<&str>,
+    database_url: Option<&str>,
+) -> bool {
+    soccer_policy_inline_prune_enabled_from_env_value(raw, database_url)
+}
+
 fn soccer_policy_inline_prune_enabled_from_env_value(
     raw: Option<&str>,
     database_url: Option<&str>,
@@ -7082,6 +7099,31 @@ mod tests {
         ));
         assert!(soccer_policy_inline_prune_enabled_from_env_value(
             Some(" on "),
+            remote_url
+        ));
+    }
+
+    #[test]
+    fn inline_moment_vector_prune_defaults_to_local_postgres_only() {
+        let local_url = Some("postgres://soccer@localhost:5432/soccer");
+        let remote_url = Some("postgres://soccer@akrion-rds.example.com:5432/soccer");
+
+        assert!(soccer_moment_vector_inline_prune_enabled_from_env_value(
+            None, local_url
+        ));
+        assert!(!soccer_moment_vector_inline_prune_enabled_from_env_value(
+            None, remote_url
+        ));
+        assert!(!soccer_moment_vector_inline_prune_enabled_from_env_value(
+            Some("auto"),
+            remote_url
+        ));
+        assert!(!soccer_moment_vector_inline_prune_enabled_from_env_value(
+            Some("false"),
+            local_url
+        ));
+        assert!(soccer_moment_vector_inline_prune_enabled_from_env_value(
+            Some("true"),
             remote_url
         ));
     }
