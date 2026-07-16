@@ -6073,21 +6073,14 @@ mod tests {
 
     #[test]
     fn learned_mpc_rejection_threshold_tracks_contextual_policy_competition() {
-        let action = |label: &str, probability: f64| SoccerLearnedActionTrace {
-            label: label.to_string(),
-            value: probability,
-            visits: 10,
-            probability,
-            legal: true,
-            level: PitchGridLevel::Fine,
-        };
-        let decisive = vec![action("pass1", 0.82), action("pass2", 0.10)];
-        let competitive = vec![action("pass1", 0.42), action("pass2", 0.40)];
+        // Decisive: the committed action (0.82) dominates the best alternative (0.10) ⇒
+        // relax the bar below base. Competitive: alternative (0.40) ≈ original (0.42) ⇒
+        // barely moves. Exercises the blend math directly, so it does not depend on the
+        // `DD_SOCCER_ENABLE_MPC_CONTEXT_THRESHOLD` gate (which the wrapper applies) and
+        // cannot race a parallel test on that process-global flag.
         let base = 0.18;
-        let decisive_threshold =
-            learned_mpc_contextual_rejection_threshold(base, "pass1", &decisive);
-        let competitive_threshold =
-            learned_mpc_contextual_rejection_threshold(base, "pass1", &competitive);
+        let decisive_threshold = contextual_rejection_threshold_blend(base, 0.82, 0.10);
+        let competitive_threshold = contextual_rejection_threshold_blend(base, 0.42, 0.40);
 
         assert!(decisive_threshold < base);
         assert!(competitive_threshold > decisive_threshold);
