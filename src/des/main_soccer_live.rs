@@ -588,8 +588,18 @@ mod tests {
         assert!(cfg.match_config.mpc.tier2_player_enabled);
         assert!(cfg.match_config.mpc.reconcile_enabled);
         assert!(cfg.match_config.mpc.field_aware_enabled);
+        assert!(!cfg.match_config.neural_blend.mcts_enabled);
         assert!(cfg.match_config.adversarial_embedding_exploitation_enabled);
         assert!(!cfg.match_config.full_game_learning_enabled);
+    }
+
+    #[test]
+    fn live_server_env_can_opt_into_neural_mcts() {
+        let cfg = live_server_config_from_lookup(|name| {
+            (name == "SOCCER_LIVE_NEURAL_MCTS_ENABLED").then(|| "1".to_string())
+        });
+
+        assert!(cfg.match_config.neural_blend.mcts_enabled);
     }
 
     #[test]

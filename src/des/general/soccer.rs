@@ -20268,11 +20268,10 @@ impl MatchConfig {
             neural_blend: SoccerNeuralBlendConfig {
                 mode: SoccerNeuralBlendMode::Additive,
                 actor_critic: true,
-                // MCTS is DP-lookahead scored by the value net + analytic MPC priors — it can pull the
-                // net's choices back toward the analytic policy (entrenching parity). SOCCER_DISABLE_NEURAL_MCTS=1
-                // lets the raw actor-critic policy drive directly, to A/B whether MCTS helps or hurts the climb.
-                mcts_enabled: std::env::var("SOCCER_DISABLE_NEURAL_MCTS").ok().as_deref()
-                    != Some("1"),
+                // The trained actor-critic is sufficient for live gameplay; MCTS adds a
+                // second decision layer and is opt-in through the live-server
+                // SOCCER_LIVE_NEURAL_MCTS_ENABLED / SOCCER_NEURAL_MCTS_ENABLED override.
+                mcts_enabled: false,
                 // Env-tunable so we can A/B whether SOLVING MORE EXACTLY (deeper lookahead / more
                 // simulations / wider candidate set) climbs above parity — i.e. whether the plateau is
                 // a shallow-search approximation ceiling. Sanitizers clamp to [1,32]/[2,16]/[1,3].
