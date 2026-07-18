@@ -93,6 +93,7 @@ See `docs/observability.md` for the collector manifest and CockroachDB TTL schem
 ```sh
 ./shell cargo test --lib
 ```
+## Build lifecycle
 
 The repository shell routes build-producing Cargo commands through
 `scripts/cargo-fresh`. When the soccer/DES source, toolchain, or Cargo build arguments change, it
