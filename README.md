@@ -50,12 +50,18 @@ or unset, is **off**.
 | Flag | Default | Effect |
 |------|---------|--------|
 | `SOCCER_TELEMETRY_ENABLED` | auto | Enables the shared tracing subscriber; cluster jobs set this explicitly. |
-| `SOCCER_LOG_JSON` | off | Emit tracing events as newline-delimited JSON for OTel filelog collection. |
+| `SOCCER_LOG_JSON` | off | Emit tracing events as newline-delimited JSON to stdout for Promtail/Loki. |
 | `SOCCER_RUST_LOG` | `info,soccer_engine=info` | Soccer-specific tracing filter; falls back to `RUST_LOG`. |
 | `SOCCER_CLUSTER_NAME` | local/unset | Cluster resource attribute for logs/traces. |
+| `SOCCER_OTEL_TRACES` | endpoint-driven | Enable OTLP/HTTP trace export. |
+| `SOCCER_OTEL_METRICS` | endpoint-driven | Enable OTLP/HTTP metric export. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Generic collector base URL; signal paths are derived automatically. |
 | `SOCCER_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | OTLP/HTTP trace endpoint when trace export is enabled. |
+| `SOCCER_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | `http://127.0.0.1:4318/v1/metrics` | OTLP/HTTP metric endpoint when metric export is enabled. |
 
-See `docs/observability.md` for the collector manifest and CockroachDB TTL schema.
+Service and job binaries publish execution start/completion counters and duration
+histograms with bounded service/outcome attributes. In Kubernetes, the collector
+forwards traces and exposes OTLP metrics for Prometheus scraping.
 
 ### Live server
 
