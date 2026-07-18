@@ -99,6 +99,7 @@ forwards traces and exposes OTLP metrics for Prometheus scraping.
 ```sh
 ./shell cargo test --lib
 ```
+## Build lifecycle
 
 The repository shell routes build-producing Cargo commands through
 `scripts/cargo-fresh`. When the soccer/DES source, toolchain, or Cargo build arguments change, it
