@@ -109,6 +109,23 @@ impl WorldSnapshot {
         player_id: usize,
         home_position: Vec2,
     ) -> Option<(Vec2, f64)> {
+        let _ = home_position;
+        let (inputs, spot, base_strength) = self.pass_lane_yield_context(player_id)?;
+        // Learnable yield willingness (MDP/POMDP): shift the hand-computed strength by a learned
+        // bias so a middle man chooses to vacate the lane (open the longer ball) or hold his slot.
+        // Off ⇒ `base_strength` unchanged (byte-identical).
+        let strength = self.pass_lane_yield_effective_strength(&inputs, base_strength);
+        Some((spot, strength))
+    }
+
+    /// Read-only geometry for the pass-lane yield decision: the [`PassLaneYieldInputs`] the choice
+    /// is a function of, the elected step-out `spot`, and the hand-computed base strength. Shared by
+    /// [`Self::pass_lane_yield_target_for`] (the seam) and the RL collector. `None` when the yield
+    /// does not apply. Gated by [`pass_lane_yield_enabled`] (off ⇒ byte-identical early return).
+    pub(crate) fn pass_lane_yield_context(
+        &self,
+        player_id: usize,
+    ) -> Option<(super::PassLaneYieldInputs, Vec2, f64)> {
         if !pass_lane_yield_enabled() {
             return None;
         }
@@ -137,7 +154,8 @@ impl WorldSnapshot {
 
         // Find the best far team-mate F such that I (the middle) am the sole blocker of the
         // carrier→F lane, and F is a genuinely longer, productive option than me.
-        let mut best: Option<(usize, Vec2, f64)> = None; // (far_id, far_pos, value)
+        // (far_id, far_pos, value, forward_gain, openness, lane_len)
+        let mut best: Option<(usize, Vec2, f64, f64, f64, f64)> = None;
         for far in self.players.iter() {
             if far.id == player_id || far.id == carrier_id || far.team != me.team {
                 continue;
@@ -178,11 +196,14 @@ impl WorldSnapshot {
                 Some(carrier_id),
             );
             let value = forward_gain.max(0.0) * 0.5 + openness * 6.0 + (lane_len * 0.12);
-            if best.as_ref().is_none_or(|(_, _, best_value)| value > *best_value) {
-                best = Some((far.id, far_pos, value));
+            if best
+                .as_ref()
+                .is_none_or(|(_, _, best_value, ..)| value > *best_value)
+            {
+                best = Some((far.id, far_pos, value, forward_gain, openness, lane_len));
             }
         }
-        let (_, far_pos, raw_value) = best?;
+        let (_, far_pos, raw_value, best_forward_gain, best_openness, best_lane_len) = best?;
 
         // Step out of the corridor "to space": forward when attacking, backward for a deep
         // defender holding the back line. Try both sides at growing step sizes and keep the
@@ -221,7 +242,10 @@ impl WorldSnapshot {
                     continue;
                 }
                 let space = self.space_score_at(spot, me.team);
-                if chosen.as_ref().is_none_or(|(_, best_space)| space > *best_space) {
+                if chosen
+                    .as_ref()
+                    .is_none_or(|(_, best_space)| space > *best_space)
+                {
                     chosen = Some((spot, space));
                 }
             }
@@ -229,12 +253,18 @@ impl WorldSnapshot {
                 break;
             }
         }
-        let (spot, _) = chosen?;
-        // Keep the yield home-aware: a defender shouldn't bolt miles from its slot. Blend a
-        // touch toward the home slot only as a tiebreak via the existing strength scaling.
-        let _ = home_position;
-        let strength = (raw_value / 14.0).clamp(0.0, 1.0);
-        Some((spot, strength))
+        let (spot, spot_space) = chosen?;
+        let base_strength = (raw_value / 14.0).clamp(0.0, 1.0);
+        let inputs = super::PassLaneYieldInputs {
+            forward_gain: (best_forward_gain / 20.0).clamp(0.0, 1.0),
+            far_openness: best_openness.clamp(0.0, 1.0),
+            lane_len: (best_lane_len / 40.0).clamp(0.0, 1.0),
+            dist_from_carrier: (me_from_carrier / 30.0).clamp(0.0, 1.0),
+            spot_space: (spot_space / 18.0).clamp(0.0, 1.0),
+            is_defender: (me.role == PlayerRole::Defender) as i32 as f64,
+            base_strength,
+        };
+        Some((inputs, spot, base_strength))
     }
 }
 
@@ -300,7 +330,10 @@ impl SoccerMatch {
                 continue;
             }
             // The dummy nearest the ball acts first (it would trap it first).
-            if best.as_ref().is_none_or(|(_, best_dist)| dist_to_ball < *best_dist) {
+            if best
+                .as_ref()
+                .is_none_or(|(_, best_dist)| dist_to_ball < *best_dist)
+            {
                 best = Some((p.id, dist_to_ball));
             }
         }
@@ -363,7 +396,9 @@ mod tests {
         assert!(!pass_lane_yield_enabled());
         let (sim, _c, m, _f) = three_in_a_line();
         let snap = WorldSnapshot::from_match(&sim);
-        assert!(snap.pass_lane_yield_target_for(m, sim.players[m].home_position).is_none());
+        assert!(snap
+            .pass_lane_yield_target_for(m, sim.players[m].home_position)
+            .is_none());
         assert!(sim.pass_lane_dummy_guard().is_none());
     }
 
@@ -409,8 +444,14 @@ mod tests {
         std::env::remove_var(ENV);
 
         // Home attacks toward +y: the attacker pushes forward, the deep defender drops back.
-        assert!(fwd.y > 58.0, "attacking middle should move forward, got {fwd:?}");
-        assert!(back.y < 58.0, "defending middle should drop back, got {back:?}");
+        assert!(
+            fwd.y > 58.0,
+            "attacking middle should move forward, got {fwd:?}"
+        );
+        assert!(
+            back.y < 58.0,
+            "defending middle should drop back, got {back:?}"
+        );
     }
 
     fn floor_pass(team: Team, from: usize, target: usize, origin: Vec2, dest: Vec2) -> PendingPass {
@@ -432,6 +473,7 @@ mod tests {
             offside: None,
             offside_candidates: Vec::new(),
             learn_features: Vec::new(),
+            mpc_objective: None,
         }
     }
 
@@ -450,7 +492,11 @@ mod tests {
 
         let guard = sim.pass_lane_dummy_guard();
         std::env::remove_var(ENV);
-        assert_eq!(guard, Some(m), "the middle man in the path should dummy the pass");
+        assert_eq!(
+            guard,
+            Some(m),
+            "the middle man in the path should dummy the pass"
+        );
     }
 
     #[test]

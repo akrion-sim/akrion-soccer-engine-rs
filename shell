@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+if [[ $# -gt 0 ]]; then
+  if [[ "$1" == "cargo" ]]; then
+    shift
+    exec nix develop --no-write-lock-file "$repo_root/.nix" --command "$repo_root/scripts/cargo-fresh" "$@"
+  fi
+  exec nix develop --no-write-lock-file "$repo_root/.nix" --command "$@"
+fi
+
+exec nix develop --no-write-lock-file "$repo_root/.nix"

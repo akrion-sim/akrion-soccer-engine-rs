@@ -72,6 +72,15 @@ path = "src/bin/main_soccer_learning_run.rs"
 required-features = ["postgres-persistence"]
 
 [[bin]]
+name = "main_soccer_offline_train"
+path = "src/bin/main_soccer_offline_train.rs"
+required-features = ["postgres-persistence"]
+
+[[bin]]
+name = "soccer_league_train"
+path = "src/bin/soccer_league_train.rs"
+
+[[bin]]
 name = "main_soccer_set_play_learning_run"
 path = "src/bin/main_soccer_set_play_learning_run.rs"
 required-features = ["postgres-persistence"]
@@ -105,3 +114,27 @@ required-features = ["live-server"]
 name = "main_soccer_live_5056"
 path = "src/bin/main_soccer_live_5056.rs"
 required-features = ["live-server"]
+
+[[bin]]
+name = "measure_pass_completion"
+path = "src/bin/measure_pass_completion.rs"
+
+[[bin]]
+name = "rollout_poc"
+path = "src/bin/rollout_poc.rs"
+
+[profile.dev]
+# Cargo defaults to unpacked debug info on macOS, leaving one `*.rcgu.o`
+# per codegen unit. Keep source-line backtraces without that artifact family. Incremental
+# sessions are disabled because their dep-graph.bin and object generations grew into gigabytes.
+debug = "line-tables-only"
+split-debuginfo = "off"
+incremental = false
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "off"
+incremental = false
+
+[profile.release]
+incremental = false

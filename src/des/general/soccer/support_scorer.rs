@@ -42,7 +42,7 @@ use crate::des::general::prng::mulberry32;
 /// Number of features in the off-ball support candidate vector. The ordering is defined
 /// once in [`SupportCandidateFeatures::to_features`] — change it and bump this constant and
 /// any persisted head.
-pub const SUPPORT_CANDIDATE_FEATURE_DIM: usize = 22;
+pub const SUPPORT_CANDIDATE_FEATURE_DIM: usize = 25;
 /// Hidden width of the learned regression head.
 pub const SUPPORT_SCORER_HIDDEN_UNITS: usize = 24;
 /// Reference score magnitude used to normalize the (already-weighted) candidate terms into
@@ -50,14 +50,136 @@ pub const SUPPORT_SCORER_HIDDEN_UNITS: usize = 24;
 const SUPPORT_TERM_REF: f64 = 8.0;
 
 const SUPPORT_SCORER_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_LEARNED_SUPPORT_SCORER";
+const SUPPORT_SCORER_DISABLE_ENV: &str = "DD_SOCCER_DISABLE_LEARNED_SUPPORT_SCORER";
 
-/// Whether the learned support scorer is consulted at the live `open_space_for` chokepoint
-/// this process. Off (unset) ⇒ the analytic seed (the existing fixed-weight sum) stands, so
-/// the ranking is byte-identical.
-pub fn support_scorer_enabled() -> bool {
+/// Opt-in: fold discrete OUTCOME events (turnover / completed forward pass / shot-on-target /
+/// goal) that occur inside a support move's reward window into that move's training reward,
+/// on top of the dense territorial (pitch-control × xT) delta. Off (unset) ⇒ the reward is the
+/// pure territorial delta exactly as before, so the sample stream is byte-identical and this is
+/// a no-op. This is the seam that teaches the off-ball "where to move" decision from what the
+/// move actually *led to*, not just the space it gained. A/B-gated like the other learned heads.
+const SUPPORT_OUTCOME_REWARD_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_SUPPORT_OUTCOME_REWARD";
+/// Env override for the outcome-blend coefficient λ ([`support_outcome_reward_weight`]).
+const SUPPORT_OUTCOME_REWARD_WEIGHT_ENV: &str = "DD_SOCCER_SUPPORT_OUTCOME_REWARD_WEIGHT";
+
+/// Whether outcome events are folded into the support-move reward this process. Off by default;
+/// requires the scorer itself to be on to have any effect (it feeds the same sample stream).
+pub fn support_outcome_reward_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var(SUPPORT_SCORER_ENABLE_ENV).is_ok())
+    *ENABLED.get_or_init(|| support_env_flag(SUPPORT_OUTCOME_REWARD_ENABLE_ENV).unwrap_or(false))
+}
+
+/// Blend coefficient λ applied to a decision's accumulated outcome term before it is added to the
+/// territorial delta: `reward = territorial_delta + λ · outcome_accumulator`. The outcome term is
+/// bounded per [`support_outcome_event_weight`] (a goal contributes ≈ ±1.0 × team weight), so λ
+/// sets outcome shaping on the same order as the territorial base. Tunable via
+/// `DD_SOCCER_SUPPORT_OUTCOME_REWARD_WEIGHT` for A/B sweeps; the default is a deliberately
+/// conservative nudge (territorial stays the dominant dense signal).
+pub fn support_outcome_reward_weight() -> f64 {
+    use std::sync::OnceLock;
+    static WEIGHT: OnceLock<f64> = OnceLock::new();
+    *WEIGHT.get_or_init(|| {
+        std::env::var(SUPPORT_OUTCOME_REWARD_WEIGHT_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(SUPPORT_OUTCOME_REWARD_WEIGHT_DEFAULT)
+    })
+}
+
+/// Default λ for the outcome blend (see [`support_outcome_reward_weight`]).
+pub const SUPPORT_OUTCOME_REWARD_WEIGHT_DEFAULT: f64 = 0.05;
+/// A teammate's outcome event is credited to *this* off-ball mover's decision at this discount
+/// (the mover's OWN events count at full strength). Mirrors the recency/share philosophy of
+/// `BuildupChainCredit` — the whole in-possession unit shares credit for what the move enabled,
+/// but the deciding player owns their own touch outright.
+pub const SUPPORT_OUTCOME_TEAMMATE_DISCOUNT: f64 = 0.35;
+
+/// The mover-weighted + team-discounted contribution of a single outcome event (already reduced to
+/// its emitting player + team + normalized `weight`) to one pending move decision. Pure core of the
+/// credit model, factored out so the weighting is unit-testable without a live match: the deciding
+/// player's own event counts full; a teammate's counts at [`SUPPORT_OUTCOME_TEAMMATE_DISCOUNT`]; an
+/// opponent's counts 0 (a move is trained only from what its OWN team's play led to).
+pub(crate) fn support_outcome_decision_delta(
+    decision_team: Team,
+    decision_player: usize,
+    event_team: Team,
+    event_player: usize,
+    weight: f64,
+) -> f64 {
+    if event_team != decision_team {
+        return 0.0;
+    }
+    let factor = if event_player == decision_player {
+        1.0
+    } else {
+        SUPPORT_OUTCOME_TEAMMATE_DISCOUNT
+    };
+    weight * factor
+}
+
+/// Normalized, signed contribution of one reward-event `kind` to an off-ball move's outcome term.
+/// Decoupled from the engine's internal reward magnitudes (which live on a different scale than the
+/// territorial delta) so the blend is bounded and interpretable: a goal ≈ +1.0, a completed forward
+/// pass ≈ +0.2, a turnover ≈ −0.6. Kinds not tied to a move's downstream outcome return 0.0.
+pub(crate) fn support_outcome_event_weight(kind: SoccerRewardEventKind) -> f64 {
+    match kind {
+        // Terminal / near-terminal attacking payoff.
+        SoccerRewardEventKind::Goal | SoccerRewardEventKind::HeaderGoalFromCross => 1.0,
+        SoccerRewardEventKind::ShotOnTarget => 0.4,
+        SoccerRewardEventKind::ShotAttempt => 0.12,
+        // Successful forward progression / retention of a threatening move.
+        SoccerRewardEventKind::ThreePassForwardNetGain => 0.28,
+        SoccerRewardEventKind::CompletedForwardPass => 0.22,
+        SoccerRewardEventKind::WallPassCombination => 0.22,
+        SoccerRewardEventKind::BuildupChainCredit => 0.20,
+        SoccerRewardEventKind::TwoForwardPasses => 0.18,
+        SoccerRewardEventKind::ReleaseLongInsideOwnHalf => 0.18,
+        SoccerRewardEventKind::ProgressiveCarryIntoAttack => 0.16,
+        // Turnovers / move-killing blunders (the penalties the move should learn to avoid setting up).
+        SoccerRewardEventKind::OverdribbleDispossession => -0.6,
+        SoccerRewardEventKind::BadPassChainPenalty => -0.5,
+        SoccerRewardEventKind::TurnoverChainBlame => -0.5,
+        SoccerRewardEventKind::OffsideInfraction => -0.35,
+        SoccerRewardEventKind::IsolatedCarrierPanicBackPass => -0.3,
+        SoccerRewardEventKind::UnpressuredBackwardPass => -0.2,
+        SoccerRewardEventKind::ShotOffTargetPenalty => -0.15,
+        _ => 0.0,
+    }
+}
+
+fn support_env_flag(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|raw| {
+        let v = raw.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn support_scorer_enabled_from_env() -> bool {
+    if support_env_flag(SUPPORT_SCORER_DISABLE_ENV).unwrap_or(false) {
+        return false;
+    }
+    support_env_flag(SUPPORT_SCORER_ENABLE_ENV).unwrap_or(true)
+}
+
+/// Whether the learned support scorer is consulted at the live `open_space_for` chokepoint
+/// this process. Production default is on (analytic seed until a warm head is installed);
+/// tests default off so the broad movement suite keeps byte-identical parity unless it opts in.
+pub fn support_scorer_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if support_env_flag(SUPPORT_SCORER_DISABLE_ENV).unwrap_or(false) {
+            return false;
+        }
+        support_env_flag(SUPPORT_SCORER_ENABLE_ENV).unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(support_scorer_enabled_from_env)
+    }
 }
 
 /// The per-candidate feature vector for one off-ball destination point. Every field is the
@@ -68,8 +190,11 @@ pub fn support_scorer_enabled() -> bool {
 pub struct SupportCandidateFeatures {
     pub open_space_score: f64,
     pub counterattack_bonus: f64,
+    pub advance_upfield_bonus: f64,
     pub goal_directness_bonus: f64,
     pub vacuum_run_bonus: f64,
+    pub forward_run_bias: f64,
+    pub attacking_spacing_bonus: f64,
     pub forward_term: f64,
     pub forward_from_ball_term: f64,
     pub role_depth_deviation_term: f64,
@@ -97,8 +222,11 @@ impl SupportCandidateFeatures {
     pub fn analytic_score(&self) -> f64 {
         self.open_space_score
             + self.counterattack_bonus
+            + self.advance_upfield_bonus
             + self.goal_directness_bonus
             + self.vacuum_run_bonus
+            + self.forward_run_bias
+            + self.attacking_spacing_bonus
             + self.forward_term
             + self.forward_from_ball_term
             + self.role_depth_deviation_term
@@ -127,8 +255,11 @@ impl SupportCandidateFeatures {
         [
             n(self.open_space_score),
             n(self.counterattack_bonus),
+            n(self.advance_upfield_bonus),
             n(self.goal_directness_bonus),
             n(self.vacuum_run_bonus),
+            n(self.forward_run_bias),
+            n(self.attacking_spacing_bonus),
             n(self.forward_term),
             n(self.forward_from_ball_term),
             n(self.role_depth_deviation_term),
@@ -174,9 +305,16 @@ pub struct SupportMoveSample {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingSupportDecision {
     pub team: Team,
+    /// The off-ball player who made this move decision. Used to credit their OWN outcome events at
+    /// full strength (teammates' at a discount) when `DD_SOCCER_ENABLE_SUPPORT_OUTCOME_REWARD` is on.
+    pub player_id: usize,
     pub features: SupportCandidateFeatures,
     pub decision_territorial: f64,
     pub due_tick: u64,
+    /// Running sum of normalized, mover-/team-weighted outcome-event contributions observed inside
+    /// this decision's reward window. Stays 0.0 (and unused) unless the outcome-reward seam is on,
+    /// preserving byte-identical samples in the default configuration.
+    pub outcome_accumulator: f64,
 }
 
 /// How often (ticks) an off-ball support move is sampled for RL while the scorer is on.
@@ -185,6 +323,9 @@ pub const SUPPORT_MOVE_SAMPLE_INTERVAL_TICKS: u64 = 15;
 pub const SUPPORT_MOVE_REWARD_WINDOW_TICKS: u64 = 45;
 /// Cap on the rolling RL sample buffer (drained by the learner).
 pub const SUPPORT_MOVE_SAMPLE_CAP: usize = 4096;
+/// Minimum training steps before live support ranking trusts the carried head over the
+/// analytic seed. Before that, the seam records samples but keeps the known heuristic.
+pub const SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS: usize = 200;
 
 /// Learned regression head for the candidate value: a `FeedForwardNetwork`
 /// (`DIM → hidden → 1`, linear output) predicting the expected territorial reward of moving
@@ -264,6 +405,32 @@ impl SupportScorerHead {
         mean
     }
 
+    pub fn from_snapshot(snapshot: &SoccerAuxiliaryHeadSnapshot) -> Result<Self, String> {
+        let network = build_soccer_feed_forward_network_from_snapshot(
+            &snapshot.network,
+            SUPPORT_CANDIDATE_FEATURE_DIM,
+            1,
+            &[],
+            "support-scorer head",
+        )?;
+        Ok(SupportScorerHead {
+            network,
+            training_steps: snapshot.training_steps.max(snapshot.network.training_steps),
+            last_loss: snapshot.average_loss.or(snapshot.network.average_loss),
+        })
+    }
+
+    pub(crate) fn to_snapshot(&self) -> SoccerAuxiliaryHeadSnapshot {
+        let mut network = soccer_neural_network_snapshot(&self.network);
+        network.training_steps = self.training_steps;
+        network.average_loss = self.last_loss;
+        SoccerAuxiliaryHeadSnapshot {
+            network,
+            training_steps: self.training_steps,
+            average_loss: self.last_loss,
+        }
+    }
+
     pub fn training_steps(&self) -> usize {
         self.training_steps
     }
@@ -311,13 +478,19 @@ pub fn train_support_scorer_head(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static SUPPORT_SCORER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn baseline_features() -> SupportCandidateFeatures {
         SupportCandidateFeatures {
             open_space_score: 6.0,
             counterattack_bonus: 0.0,
+            advance_upfield_bonus: 0.0,
             goal_directness_bonus: 0.0,
             vacuum_run_bonus: 0.0,
+            forward_run_bias: 0.0,
+            attacking_spacing_bonus: 0.0,
             forward_term: 0.4,
             forward_from_ball_term: 1.2,
             role_depth_deviation_term: -0.3,
@@ -399,5 +572,121 @@ mod tests {
         }];
         assert_eq!(head.train(&bad, 0.05), 0.0);
         assert_eq!(head.training_steps(), 0);
+    }
+
+    #[test]
+    fn installed_warm_head_is_consumed_by_snapshot_scorer() {
+        let _lock = SUPPORT_SCORER_ENV_LOCK
+            .lock()
+            .expect("support scorer env lock");
+        std::env::set_var(SUPPORT_SCORER_ENABLE_ENV, "1");
+        std::env::remove_var(SUPPORT_SCORER_DISABLE_ENV);
+
+        let features = baseline_features();
+        let analytic = analytic_candidate_score(&features);
+        let mut sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let cold_snapshot = WorldSnapshot::from_match(&sim);
+        assert!(
+            (cold_snapshot.support_candidate_score(Team::Home, &features) - analytic).abs() < 1e-9,
+            "no installed head should fall back to analytic seed"
+        );
+
+        let samples: Vec<SupportMoveSample> = (0..SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS)
+            .map(|_| SupportMoveSample {
+                features: features.clone(),
+                reward: analytic + 6.0,
+            })
+            .collect();
+        let mut head = SupportScorerHead::new(19);
+        for _ in 0..6 {
+            head.train(&samples, 0.05);
+        }
+        assert!(head.training_steps() >= SUPPORT_SCORER_HEAD_MIN_TRAINING_STEPS);
+
+        sim.set_support_scorer_head(head);
+        let learned_snapshot = WorldSnapshot::from_match(&sim);
+        let learned = learned_snapshot.support_candidate_score(Team::Home, &features);
+        std::env::remove_var(SUPPORT_SCORER_ENABLE_ENV);
+        assert!(
+            (learned - analytic).abs() > 0.10,
+            "warm installed head should replace the analytic support score: analytic={analytic} learned={learned}"
+        );
+    }
+
+    #[test]
+    fn support_scorer_head_round_trips_through_snapshot() {
+        let features = baseline_features();
+        let mut head = SupportScorerHead::new(23);
+        let samples = vec![SupportMoveSample {
+            features: features.clone(),
+            reward: 1.0,
+        }];
+        head.train(&samples, 0.02);
+        let before = head.predict(&features).expect("prediction before snapshot");
+        let snapshot = head.to_snapshot();
+        let restored = SupportScorerHead::from_snapshot(&snapshot).expect("restore snapshot");
+        let after = restored
+            .predict(&features)
+            .expect("prediction after snapshot");
+        assert_eq!(restored.training_steps(), head.training_steps());
+        assert!(
+            (before - after).abs() < 1e-9,
+            "snapshot should preserve support-scorer prediction: before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn outcome_event_weights_rank_goal_over_pass_over_zero_over_turnover() {
+        // The ladder the off-ball move learns from: scoring ≫ a completed forward pass > neutral,
+        // and turnovers are strictly negative. Neutral/unrelated kinds contribute nothing.
+        let goal = support_outcome_event_weight(SoccerRewardEventKind::Goal);
+        let shot = support_outcome_event_weight(SoccerRewardEventKind::ShotOnTarget);
+        let pass = support_outcome_event_weight(SoccerRewardEventKind::CompletedForwardPass);
+        let chain = support_outcome_event_weight(SoccerRewardEventKind::TwoForwardPasses);
+        let turnover =
+            support_outcome_event_weight(SoccerRewardEventKind::OverdribbleDispossession);
+        assert!(goal > shot && shot > pass && pass > 0.0);
+        assert!(chain > 0.0);
+        assert!(turnover < 0.0);
+        assert_eq!(
+            support_outcome_event_weight(SoccerRewardEventKind::HeaderGoalFromCross),
+            goal,
+            "a headed goal from a cross is still a goal"
+        );
+        assert_eq!(
+            support_outcome_event_weight(SoccerRewardEventKind::Routine),
+            0.0,
+            "routine/unrelated events must not shape the move reward"
+        );
+    }
+
+    #[test]
+    fn outcome_credit_is_mover_full_teammate_discounted_opponent_zero() {
+        let w = 1.0;
+        // The deciding player's own outcome: full weight.
+        let own = support_outcome_decision_delta(Team::Home, 3, Team::Home, 3, w);
+        // A teammate's outcome in the same window: discounted.
+        let teammate = support_outcome_decision_delta(Team::Home, 3, Team::Home, 7, w);
+        // An opponent's outcome: ignored entirely.
+        let opponent = support_outcome_decision_delta(Team::Home, 3, Team::Away, 7, w);
+        assert!((own - 1.0).abs() < 1e-9);
+        assert!((teammate - SUPPORT_OUTCOME_TEAMMATE_DISCOUNT).abs() < 1e-9);
+        assert_eq!(opponent, 0.0);
+        assert!(own > teammate && teammate > 0.0);
+        // A turnover (negative weight) flips sign but keeps the same mover/teammate ordering.
+        let bad = support_outcome_event_weight(SoccerRewardEventKind::TurnoverChainBlame);
+        let own_turnover = support_outcome_decision_delta(Team::Home, 3, Team::Home, 3, bad);
+        assert!(own_turnover < 0.0);
+    }
+
+    #[test]
+    fn outcome_reward_weight_default_is_a_bounded_nonnegative_nudge() {
+        // No env override → the conservative default; territorial stays the dominant dense signal.
+        let w = support_outcome_reward_weight();
+        assert!(w.is_finite() && w >= 0.0);
+        assert!(
+            w <= 1.0,
+            "default outcome blend must not swamp the territorial base: {w}"
+        );
     }
 }

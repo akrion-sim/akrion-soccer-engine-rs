@@ -27,15 +27,18 @@ value head** distilled into the engine's `FeedForwardNetwork`, with **identical 
    (`DenseLayerConfig`, activations) so the trained weights serialize into the existing
    neural-snapshot format and load unchanged at runtime (one dense forward pass).
 4. **Integrate behind a default-OFF gate** (`DD_SOCCER_ENABLE_OFFLINE_DISTILLED_HEAD`).
-   Append channels at the tail; zero-pad old snapshots (already supported, soccer.rs:3675).
+   Append channels at the tail; zero-pad old snapshots (already supported, soccer.rs:4401).
 5. **A/B before promotion** with the existing `soccer_eval_gate` (held-out Elo / cross-play /
    Wilson / exploitability). Promote only on a positive verdict.
 
 **Tooling:** prototype training in Python/numpy for fast iteration, then a small Rust
 `soccer_offline_distill` bin that loads the trained dense weights into a
 `FeedForwardNetwork` and writes the engine snapshot — OR train directly in the Rust FFN
-(`train_sample_clipped`) to guarantee format match. Recommend the Rust-native trainer bin
-to avoid a Python↔Rust weight-format bridge.
+(`train_sample_clipped`) to guarantee format match. `scripts/train_offline_head.py`
+now exports the canonical layout, held-out report, and row-major one-hidden-layer MLP
+weights with `--layout-out`, `--report-out`, and `--weights-out`; the next Rust step is
+to consume those artifacts behind the default-OFF gate or replace the weight bridge with
+a Rust-native trainer.
 
 ### Step 2b — learned relational encoder over the RAW player graph (later)
 Only after 2a proves value. Replace hand-crafted relational bins with a tiny GNN/attention
@@ -44,13 +47,16 @@ shape** (still one forward pass at runtime). This is the audit's #1 done within 
 budget. Larger effort; gated and eval-gated identically.
 
 ## Build order
-1. `soccer_offline_distill` bin scaffold: read JSONL → flatten (emit `feature_layout.json`)
-   → train weighted FFN value head → write engine snapshot + held-out metrics.
+1. `soccer_offline_distill` bin scaffold: read JSONL → flatten using the canonical
+   Python/Rust-compatible `feature_layout.json` → train or load the weighted FFN value
+   head → write engine snapshot + held-out metrics.
 2. Wire a default-OFF consume path for the distilled head in the decision layer.
 3. `soccer_eval_gate` A/B; promote on positive verdict.
 
 ## Non-goals (explicit)
-- No per-tick GNN/RNN/MCTS (blows the 22-agent / 66 ms budget — see architecture-audit.md).
+- No full-state per-tick GNN/RNN/deep MCTS (blows the 22-agent / 66 ms budget — see
+  architecture-audit.md). Bounded MCTS/PUCT remains an opt-in reranker over capped legal
+  candidates, not part of this offline encoder step.
 - No change to the tabular `state_key` encoding (would orphan existing tabular entries).
 
 ## Findings during implementation (2026-06-28) — must resolve before the Rust bin

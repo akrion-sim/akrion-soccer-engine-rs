@@ -16,16 +16,20 @@
 //! [`TournamentMatchRunner`]), ranks with FIFA-style tiebreakers, folds the
 //! knockout bracket, and reports the champion. The real runner that drives the
 //! 2D [`SoccerMatch`] with genuine per-team neural brains lives at the bottom
-//! ([`EngineMatchRunner`]); a deterministic [`StrengthMatchRunner`] backs the
-//! tests and quick what-ifs.
+//! ([`EngineMatchRunner`]); a deterministic test-only runner backs unit tests.
 //!
 //! Everything is seeded and deterministic: the same teams + seed + runner
 //! always produce the same bracket and champion.
 
 use crate::des::general::soccer::{
-    MatchConfig, SoccerMatch, SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot,
-    SoccerQPolicy, SoccerQPolicyOptions, SoccerTeamQPolicies, Team,
+    learned_mpc_objective_enabled, mpc_reject_threshold_model_enabled, MatchConfig, MatchSummary,
+    MpcObjectiveSample, MpcRejectThresholdHead, MpcRejectThresholdSample, SoccerMatch,
+    SoccerMpcObjectiveHead, SoccerNeuralLearningBackend, SoccerNeuralNetworkSnapshot,
+    SoccerQPolicy, SoccerQPolicyOptions, SoccerQTargetEntry, SoccerTeamQPolicies, Team,
+    MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
 };
+#[cfg(test)]
+use crate::des::general::soccer::{MatchStats, MpcRejectFamily, MpcRejectThresholdInputs};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -125,12 +129,17 @@ impl TournamentStage {
 
 /// The persistent, learnable state of a competitor — carried from match to match
 /// so a team improves as the tournament unfolds. The neural value/critic snapshot
-/// is the real learner; tabular Q is intentionally not carried (it is a degenerate
-/// per-match prior that bloats without converging).
+/// is the real learner; action-Q is intentionally not carried (it bloats without
+/// converging), but target-Q is retained because learned plans use it to turn an
+/// action label into a concrete receiver/space target.
 #[derive(Clone, Debug, Default)]
 pub struct TeamBrain {
     /// Trained value/critic network. `None` = start from a fresh net.
     pub neural: Option<SoccerNeuralNetworkSnapshot>,
+    /// Compact learned action-target preferences for this brain when playing as Home.
+    pub home_target_entries: Vec<SoccerQTargetEntry>,
+    /// Compact learned action-target preferences for this brain when playing as Away.
+    pub away_target_entries: Vec<SoccerQTargetEntry>,
     /// Per-team Q options (gamma etc.); carried so brains can differ in horizon.
     pub options: SoccerQPolicyOptions,
     /// How many matches' worth of learning this brain has absorbed.
@@ -165,6 +174,19 @@ impl TeamBrain {
     pub fn from_snapshot(neural: SoccerNeuralNetworkSnapshot) -> Self {
         TeamBrain {
             neural: Some(neural),
+            ..TeamBrain::default()
+        }
+    }
+
+    pub fn from_snapshot_with_targets(
+        neural: SoccerNeuralNetworkSnapshot,
+        home_target_entries: Vec<SoccerQTargetEntry>,
+        away_target_entries: Vec<SoccerQTargetEntry>,
+    ) -> Self {
+        TeamBrain {
+            neural: Some(neural),
+            home_target_entries,
+            away_target_entries,
             ..TeamBrain::default()
         }
     }
@@ -318,6 +340,7 @@ pub struct TournamentMatchContext {
 pub struct MatchOutcome {
     pub home_goals: u32,
     pub away_goals: u32,
+    pub summary: MatchSummary,
     pub home_brain: TeamBrain,
     pub away_brain: TeamBrain,
     pub home_training_steps: usize,
@@ -335,8 +358,19 @@ impl MatchOutcome {
     }
 }
 
-/// Plays a single match. Implementations range from the deterministic
-/// [`StrengthMatchRunner`] (tests) to the full [`EngineMatchRunner`] (real sim).
+#[cfg(test)]
+fn score_only_summary(home_goals: u32, away_goals: u32) -> MatchSummary {
+    MatchSummary {
+        score_home: home_goals,
+        score_away: away_goals,
+        ticks: 0,
+        simulated_seconds: 0.0,
+        stats: MatchStats::default(),
+    }
+}
+
+/// Plays a single match. Production callers use [`EngineMatchRunner`]; tests may
+/// supply deterministic runners to isolate orchestration behavior.
 pub trait TournamentMatchRunner {
     fn play(
         &mut self,
@@ -862,8 +896,8 @@ impl Tournament {
                 .map(|(position, &team_id)| {
                     let team = &self.teams[self.team_index(team_id)];
                     let tied_above = position > 0 && level_with(team_id, ranked[position - 1]);
-                    let tied_below = position + 1 < ranked.len()
-                        && level_with(team_id, ranked[position + 1]);
+                    let tied_below =
+                        position + 1 < ranked.len() && level_with(team_id, ranked[position + 1]);
                     GroupStanding {
                         team_id,
                         name: team.name.clone(),
@@ -1308,18 +1342,21 @@ fn head_to_head_goals_for(
 }
 
 // ---------------------------------------------------------------------------
-// Deterministic stub runner (tests + quick what-ifs)
+// Deterministic test runner
 // ---------------------------------------------------------------------------
 
 /// A runner that decides matches from a fixed per-team "strength" derived from
 /// the team seed, with a seeded jitter so upsets happen. It performs no real
-/// simulation and returns brains unchanged — ideal for exercising the bracket,
-/// standings, tiebreakers, and champion logic deterministically.
+/// simulation and is therefore deliberately unavailable in production builds.
+/// Runtime callers must use [`EngineMatchRunner`], while unit tests can exercise
+/// bracket, standings, tiebreaker, and champion logic deterministically here.
+#[cfg(test)]
 #[derive(Clone)]
 pub struct StrengthMatchRunner {
     strengths: HashMap<usize, f64>,
 }
 
+#[cfg(test)]
 impl StrengthMatchRunner {
     /// Strength in `[0,1]` from each team's seed (stable, well-spread).
     pub fn from_teams(teams: &[TournamentTeam]) -> Self {
@@ -1338,6 +1375,7 @@ impl StrengthMatchRunner {
     }
 }
 
+#[cfg(test)]
 impl TournamentMatchRunner for StrengthMatchRunner {
     fn play(
         &mut self,
@@ -1365,6 +1403,7 @@ impl TournamentMatchRunner for StrengthMatchRunner {
         Ok(MatchOutcome {
             home_goals,
             away_goals,
+            summary: score_only_summary(home_goals, away_goals),
             // Brains "learn" only nominally in the stub: bump counters when the
             // mode says the side learns, so learn-as-they-go bookkeeping is
             // testable without a real sim.
@@ -1376,6 +1415,7 @@ impl TournamentMatchRunner for StrengthMatchRunner {
     }
 }
 
+#[cfg(test)]
 fn advanced_brain(brain: &TeamBrain, learned: bool) -> TeamBrain {
     let mut next = brain.clone();
     if learned {
@@ -1405,6 +1445,10 @@ pub struct EngineMatchRunnerConfig {
     /// aborted: the current score is recorded, pre-match brains are carried
     /// forward, and the tournament keeps moving.
     pub match_wall_time_limit: Option<Duration>,
+    /// Optional learned MPC execution-objective head. When present, the real
+    /// runner installs it into each match so held-out gates exercise the same
+    /// aim/lead refinement used by training rollouts.
+    pub mpc_objective_head: Option<SoccerMpcObjectiveHead>,
 }
 
 impl Default for EngineMatchRunnerConfig {
@@ -1419,14 +1463,14 @@ impl Default for EngineMatchRunnerConfig {
         // Inline keeps each tournament match fully deterministic and reproducible
         // (no background training thread racing the step loop).
         base.neural_learning.backend = SoccerNeuralLearningBackend::Inline;
-        // Critic-only blend: each side is driven purely by its OWN per-team critic.
-        // The actor (`policy_head`) is shared across teams, so leaving actor-critic
-        // on would let one shared net influence both brains and blur "who is best";
-        // disable it so the tournament compares genuinely independent brains.
-        base.neural_blend.actor_critic = false;
+        // Compare each complete learned policy. Joint actor sidecars, like critics and skill
+        // actors, are isolated per team; checkpoints without an actor still fall back to their
+        // own critic without injecting a fresh random actor at evaluation time.
+        base.neural_blend.actor_critic = true;
         EngineMatchRunnerConfig {
             base,
             match_wall_time_limit: None,
+            mpc_objective_head: None,
         }
     }
 }
@@ -1438,15 +1482,140 @@ impl Default for EngineMatchRunnerConfig {
 #[derive(Clone)]
 pub struct EngineMatchRunner {
     config: EngineMatchRunnerConfig,
+    /// Global execution-controller head carried between fixtures. Unlike the team
+    /// actor/critic, this estimates whether an action is physically worth attempting
+    /// from field context and therefore learns from both sides' committed executions.
+    mpc_reject_threshold_head: Option<MpcRejectThresholdHead>,
+}
+
+fn engine_match_uniform_elite_players_enabled() -> bool {
+    std::env::var("SOCCER_ENGINE_UNIFORM_ELITE_PLAYERS")
+        .map(|raw| {
+            let value = raw.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+const ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES: usize = 4;
+const ENGINE_MATCH_MPC_OBJECTIVE_BASE_LR: f64 = 0.05;
+const ENGINE_MATCH_MPC_REJECT_THRESHOLD_TRAIN_PASSES: usize = 4;
+const ENGINE_MATCH_MPC_REJECT_THRESHOLD_BASE_LR: f64 = 0.02;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EngineMpcObjectiveTrainingReport {
+    samples: usize,
+    trained_steps: usize,
+    training_steps: usize,
+    warm: bool,
+}
+
+fn engine_match_trains_mpc_objective(ctx: &TournamentMatchContext) -> bool {
+    learned_mpc_objective_enabled() && (ctx.home_learns || ctx.away_learns)
+}
+
+fn train_engine_match_mpc_objective_head(
+    config: &mut EngineMatchRunnerConfig,
+    samples: &[MpcObjectiveSample],
+    seed: u32,
+) -> Option<EngineMpcObjectiveTrainingReport> {
+    if !learned_mpc_objective_enabled() || samples.is_empty() {
+        return None;
+    }
+    let head = config
+        .mpc_objective_head
+        .get_or_insert_with(|| SoccerMpcObjectiveHead::new(seed));
+    let mut trained_steps = 0usize;
+    for _ in 0..ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES {
+        trained_steps = trained_steps
+            .saturating_add(head.train_rwr(samples, ENGINE_MATCH_MPC_OBJECTIVE_BASE_LR));
+    }
+    Some(EngineMpcObjectiveTrainingReport {
+        samples: samples.len(),
+        trained_steps,
+        training_steps: head.training_steps(),
+        warm: head.is_warm(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EngineMpcRejectThresholdTrainingReport {
+    samples: usize,
+    trained_steps: usize,
+    training_steps: usize,
+    epochs: usize,
+    learning_rate: f64,
+    warm: bool,
+    final_loss: f64,
+}
+
+fn engine_match_trains_mpc_reject_threshold(ctx: &TournamentMatchContext) -> bool {
+    mpc_reject_threshold_model_enabled() && (ctx.home_learns || ctx.away_learns)
+}
+
+fn engine_match_mpc_reject_threshold_train_passes() -> usize {
+    std::env::var("DD_SOCCER_MPC_REJECT_THRESHOLD_EPOCHS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(ENGINE_MATCH_MPC_REJECT_THRESHOLD_TRAIN_PASSES)
+        .clamp(1, 64)
+}
+
+fn engine_match_mpc_reject_threshold_learning_rate() -> f64 {
+    std::env::var("DD_SOCCER_MPC_REJECT_THRESHOLD_LEARNING_RATE")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(ENGINE_MATCH_MPC_REJECT_THRESHOLD_BASE_LR)
+        .clamp(1e-6, 1.0)
+}
+
+fn train_engine_match_mpc_reject_threshold_head(
+    carried_head: &mut Option<MpcRejectThresholdHead>,
+    samples: &[MpcRejectThresholdSample],
+    seed: u32,
+) -> Option<EngineMpcRejectThresholdTrainingReport> {
+    if !mpc_reject_threshold_model_enabled() || samples.is_empty() {
+        return None;
+    }
+    let epochs = engine_match_mpc_reject_threshold_train_passes();
+    let learning_rate = engine_match_mpc_reject_threshold_learning_rate();
+    let head = carried_head.get_or_insert_with(|| MpcRejectThresholdHead::new(seed));
+    let steps_before = head.training_steps();
+    let mut final_loss = 0.0;
+    for _ in 0..epochs {
+        final_loss = head.train_reward_weighted(samples, learning_rate);
+    }
+    let training_steps = head.training_steps();
+    Some(EngineMpcRejectThresholdTrainingReport {
+        samples: samples.len(),
+        trained_steps: training_steps.saturating_sub(steps_before),
+        training_steps,
+        epochs,
+        learning_rate,
+        warm: training_steps >= MPC_REJECT_THRESHOLD_HEAD_MIN_TRAINING_STEPS,
+        final_loss,
+    })
 }
 
 impl EngineMatchRunner {
     pub fn new(config: EngineMatchRunnerConfig) -> Self {
-        EngineMatchRunner { config }
+        EngineMatchRunner {
+            config,
+            mpc_reject_threshold_head: None,
+        }
     }
 
     pub fn with_defaults() -> Self {
         EngineMatchRunner::new(EngineMatchRunnerConfig::default())
+    }
+
+    pub fn set_mpc_objective_head(&mut self, head: Option<SoccerMpcObjectiveHead>) {
+        self.config.mpc_objective_head = head;
+    }
+
+    pub fn set_mpc_reject_threshold_head(&mut self, head: Option<MpcRejectThresholdHead>) {
+        self.mpc_reject_threshold_head = head;
     }
 }
 
@@ -1457,14 +1626,40 @@ impl TournamentMatchRunner for EngineMatchRunner {
         home: &TeamBrain,
         away: &TeamBrain,
     ) -> Result<MatchOutcome, String> {
+        if engine_match_trains_mpc_objective(ctx) && self.config.mpc_objective_head.is_none() {
+            self.config.mpc_objective_head = Some(SoccerMpcObjectiveHead::new(ctx.seed));
+        }
         let mut config = self.config.base.clone();
         config.seed = ctx.seed;
 
-        // Honor each side's own tabular Q options (e.g. discount horizon); the
-        // shared constructor would otherwise apply the home options to both.
-        let mut team_policies = SoccerTeamQPolicies::new(home.options.clone());
-        team_policies.away = SoccerQPolicy::new(away.options.clone());
+        // Honor each side's own target-Q/options (e.g. discount horizon); the
+        // shared constructor would otherwise apply the home options to both, and
+        // target-only policy carry is what lets neural plans execute learned
+        // receiver/space choices without reintroducing action-Q bloat.
+        let team_policies = SoccerTeamQPolicies {
+            home: SoccerQPolicy::from_entries_with_targets(
+                home.options.clone(),
+                &[],
+                &home.home_target_entries,
+            )
+            .map_err(|err| format!("failed to restore home target-Q: {err}"))?,
+            away: SoccerQPolicy::from_entries_with_targets(
+                away.options.clone(),
+                &[],
+                &away.away_target_entries,
+            )
+            .map_err(|err| format!("failed to restore away target-Q: {err}"))?,
+        };
         let mut sim = SoccerMatch::default_11v11(config).with_team_policies(team_policies);
+        if engine_match_uniform_elite_players_enabled() {
+            sim.set_uniform_elite_players();
+        }
+        if let Some(head) = self.config.mpc_objective_head.clone() {
+            sim.set_mpc_objective_head(head);
+        }
+        if let Some(head) = self.mpc_reject_threshold_head.clone() {
+            sim.set_mpc_reject_threshold_head(head);
+        }
 
         // Install each side's brain. `frozen = !learns` so a non-learning side
         // still plays its trained net but takes no gradient steps. Installing the
@@ -1550,6 +1745,7 @@ impl TournamentMatchRunner for EngineMatchRunner {
             return Ok(MatchOutcome {
                 home_goals: sim.score_home,
                 away_goals: sim.score_away,
+                summary: sim.summary(),
                 home_brain: home.clone(),
                 away_brain: away.clone(),
                 home_training_steps: 0,
@@ -1558,11 +1754,42 @@ impl TournamentMatchRunner for EngineMatchRunner {
         }
         // Flush any in-flight neural training so extracted brains are current.
         sim.drain_neural_learning(Duration::from_millis(500));
+        let mpc_objective_samples = if engine_match_trains_mpc_objective(ctx) {
+            sim.drain_mpc_objective_samples()
+        } else {
+            Vec::new()
+        };
+        let mpc_objective_training = train_engine_match_mpc_objective_head(
+            &mut self.config,
+            &mpc_objective_samples,
+            ctx.seed,
+        );
+        let mpc_reject_threshold_samples = if engine_match_trains_mpc_reject_threshold(ctx) {
+            sim.drain_mpc_reject_threshold_samples()
+        } else {
+            Vec::new()
+        };
+        let mpc_reject_threshold_training = train_engine_match_mpc_reject_threshold_head(
+            &mut self.mpc_reject_threshold_head,
+            &mpc_reject_threshold_samples,
+            ctx.seed,
+        );
 
         let home_goals = sim.score_home;
         let away_goals = sim.score_away;
+        let summary = sim.summary();
         let home_training_steps = sim.neural_training_steps_for(Team::Home);
         let away_training_steps = sim.neural_training_steps_for(Team::Away);
+        let learned_target_entries = (self.config.base.policy_train_max_transitions_per_tick > 0)
+            .then(|| {
+                sim.team_policies().map(|policies| {
+                    (
+                        policies.home.target_entries(),
+                        policies.away.target_entries(),
+                    )
+                })
+            })
+            .flatten();
         eprintln!(
             "tournament_match_finish home={} away={} score={}-{} wall_secs={:.1} ticks={} home_training_steps={} away_training_steps={}",
             ctx.home_id,
@@ -1574,17 +1801,50 @@ impl TournamentMatchRunner for EngineMatchRunner {
             home_training_steps,
             away_training_steps
         );
+        if let Some(report) = mpc_objective_training {
+            eprintln!(
+                "tournament_mpc_objective_training home={} away={} samples={} trained_steps={} training_steps={} warm={}",
+                ctx.home_id,
+                ctx.away_id,
+                report.samples,
+                report.trained_steps,
+                report.training_steps,
+                report.warm
+            );
+        }
+        if let Some(report) = mpc_reject_threshold_training {
+            eprintln!(
+                "tournament_mpc_reject_threshold_training home={} away={} samples={} trained_steps={} training_steps={} epochs={} learning_rate={:.6} warm={} final_loss={:.6}",
+                ctx.home_id,
+                ctx.away_id,
+                report.samples,
+                report.trained_steps,
+                report.training_steps,
+                report.epochs,
+                report.learning_rate,
+                report.warm,
+                report.final_loss
+            );
+        }
 
         // Carry forward each side's (possibly updated) brain.
         let home_brain = carry_brain(
             home,
             sim.neural_network_snapshot_for(Team::Home),
+            Team::Home,
+            learned_target_entries
+                .as_ref()
+                .map(|(home_targets, _)| home_targets.clone()),
             ctx.home_learns,
             home_training_steps as u64,
         );
         let away_brain = carry_brain(
             away,
             sim.neural_network_snapshot_for(Team::Away),
+            Team::Away,
+            learned_target_entries
+                .as_ref()
+                .map(|(_, away_targets)| away_targets.clone()),
             ctx.away_learns,
             away_training_steps as u64,
         );
@@ -1592,6 +1852,7 @@ impl TournamentMatchRunner for EngineMatchRunner {
         Ok(MatchOutcome {
             home_goals,
             away_goals,
+            summary,
             home_brain,
             away_brain,
             home_training_steps,
@@ -1603,6 +1864,8 @@ impl TournamentMatchRunner for EngineMatchRunner {
 fn carry_brain(
     previous: &TeamBrain,
     snapshot: Option<SoccerNeuralNetworkSnapshot>,
+    side: Team,
+    target_entries: Option<Vec<SoccerQTargetEntry>>,
     learned: bool,
     match_training_steps: u64,
 ) -> TeamBrain {
@@ -1613,6 +1876,12 @@ fn carry_brain(
         next.neural = Some(snapshot);
     }
     if learned {
+        if let Some(target_entries) = target_entries {
+            match side {
+                Team::Home => next.home_target_entries = target_entries,
+                Team::Away => next.away_target_entries = target_entries,
+            }
+        }
         next.matches_learned += 1;
         // Accumulate this match's gradient steps so the brain's lineage (persisted
         // to Postgres) reflects its total training, not just match count.
@@ -1624,6 +1893,35 @@ fn carry_brain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::des::general::soccer::{Vec2, MPC_OBJECTIVE_FEATURE_DIM};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(previous) => std::env::set_var(self.key, previous),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     fn fresh_teams(count: usize, seed: u32) -> Vec<TournamentTeam> {
         (0..count)
@@ -1653,6 +1951,83 @@ mod tests {
             crate::des::general::soccer::DEFAULT_DT_SECONDS
         );
         assert_eq!(config.base.total_ticks(), 18_000);
+        assert!(
+            config.base.neural_blend.actor_critic,
+            "independent tournament brains should serve their complete actor-critic policies"
+        );
+    }
+
+    #[test]
+    fn engine_runner_trains_carried_mpc_objective_head_from_match_samples() {
+        let _lock = env_lock().lock().unwrap();
+        let _guard = EnvVarGuard::set("DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE", "1");
+        let mut config = EngineMatchRunnerConfig::default();
+        let sample = MpcObjectiveSample {
+            features: vec![0.3f32; MPC_OBJECTIVE_FEATURE_DIM],
+            applied_residual: Vec2 { x: 0.75, y: 1.0 },
+            applied_bend: 0.0,
+            reward: 1.25,
+        };
+
+        let report = train_engine_match_mpc_objective_head(&mut config, &[sample], 91)
+            .expect("enabled MPC objective samples should train the carried head");
+
+        assert!(config.mpc_objective_head.is_some());
+        assert_eq!(report.samples, 1);
+        assert_eq!(
+            report.trained_steps,
+            ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES
+        );
+        assert_eq!(
+            report.training_steps,
+            ENGINE_MATCH_MPC_OBJECTIVE_TRAIN_PASSES
+        );
+    }
+
+    #[test]
+    fn engine_runner_trains_and_carries_contextual_mpc_reject_threshold_head() {
+        let _lock = env_lock().lock().unwrap();
+        let _gate = EnvVarGuard::set("DD_SOCCER_ENABLE_MPC_REJECT_THRESHOLD_MODEL", "1");
+        let _epochs = EnvVarGuard::set("DD_SOCCER_MPC_REJECT_THRESHOLD_EPOCHS", "2");
+        let inputs = MpcRejectThresholdInputs {
+            family: MpcRejectFamily::Pass,
+            actor_threat: 0.55,
+            nearest_opponent_pressure: 0.35,
+            team_control_at_actor: 0.62,
+            ball_speed: 8.0,
+            ball_altitude: 0.0,
+            role_defender: 0.0,
+            role_midfielder: 1.0,
+            role_forward: 0.0,
+            base_threshold: 0.18,
+        };
+        let samples = [
+            MpcRejectThresholdSample {
+                inputs: inputs.clone(),
+                committed_probability: 0.24,
+                reward: 1.0,
+            },
+            MpcRejectThresholdSample {
+                inputs: MpcRejectThresholdInputs {
+                    nearest_opponent_pressure: 0.9,
+                    team_control_at_actor: 0.2,
+                    ..inputs
+                },
+                committed_probability: 0.52,
+                reward: -1.0,
+            },
+        ];
+        let mut carried = None;
+
+        let report = train_engine_match_mpc_reject_threshold_head(&mut carried, &samples, 92)
+            .expect("enabled committed-action samples should train the carried head");
+
+        assert!(carried.is_some());
+        assert_eq!(report.samples, 2);
+        assert_eq!(report.epochs, 2);
+        assert_eq!(report.trained_steps, 4);
+        assert_eq!(report.training_steps, 4);
+        assert!(report.final_loss.is_finite());
     }
 
     fn small_format() -> TournamentFormat {
@@ -1849,6 +2224,7 @@ mod tests {
             Ok(MatchOutcome {
                 home_goals: 1,
                 away_goals: 1,
+                summary: score_only_summary(1, 1),
                 home_brain: advanced_brain(home, ctx.home_learns),
                 away_brain: advanced_brain(away, ctx.away_learns),
                 home_training_steps: usize::from(ctx.home_learns),
@@ -1871,7 +2247,9 @@ mod tests {
                 7,
             )
             .unwrap();
-            tournament.run(&mut AllDrawsRunner).expect("tournament runs")
+            tournament
+                .run(&mut AllDrawsRunner)
+                .expect("tournament runs")
         };
         let report = run_once();
 
@@ -1914,7 +2292,9 @@ mod tests {
             11,
         )
         .unwrap();
-        let report = tournament.run(&mut AllDrawsRunner).expect("tournament runs");
+        let report = tournament
+            .run(&mut AllDrawsRunner)
+            .expect("tournament runs");
 
         // Exactly one champion, distinct runner-up and third place.
         assert!(report.team(report.champion_id).is_some());
@@ -1928,7 +2308,9 @@ mod tests {
             .iter()
             .filter(|m| matches!(m.stage, TournamentStage::Knockout { .. }))
         {
-            let sw = m.shootout_winner.expect("level knockout must go to a shootout");
+            let sw = m
+                .shootout_winner
+                .expect("level knockout must go to a shootout");
             assert!(sw == m.home_id || sw == m.away_id);
             assert_eq!(m.winner_id(), Some(sw));
         }
@@ -2179,6 +2561,7 @@ mod tests {
         let mut runner = EngineMatchRunner::new(EngineMatchRunnerConfig {
             base,
             match_wall_time_limit: None,
+            mpc_objective_head: None,
         });
 
         let report = tournament.run(&mut runner).expect("engine tournament runs");
@@ -2227,6 +2610,7 @@ mod tests {
         let mut runner = EngineMatchRunner::new(EngineMatchRunnerConfig {
             base,
             match_wall_time_limit: Some(Duration::ZERO),
+            mpc_objective_head: None,
         });
 
         let outcome = runner

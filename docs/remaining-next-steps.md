@@ -1,7 +1,8 @@
 # Remaining next steps (roadmap)
 
 Master checklist of outstanding work, prioritized. Detailed designs live in the
-referenced docs; this is the actionable index. Status as of 2026-06-28.
+referenced docs; this is the actionable index. Operational cluster facts drift quickly;
+verify current learner/tournament status through the runbook, DB, and rollout checks.
 
 ## Done & deployed (for context — no action)
 - Live `/soccer/` jumpiness fixed: WebSocket endpoint + **server-authoritative push**
@@ -11,6 +12,28 @@ referenced docs; this is the actionable index. Status as of 2026-06-28.
 - Pass-eval dedup (byte-identical, ~1.3%) merged into `learning`.
 - Offline-encoder **Step 1** (dataset export) and **Step 2a prototype** (numpy trainer,
   ~47% held-out gain) — `scripts/export_offline_dataset.sh`, `scripts/train_offline_head.py`.
+
+## P0 — Break the analytic-parity plateau (ACTIVE — top priority)
+The north star is a neural policy that beats the **pure-analytic engine**; it is stuck at
+~0.28–0.44 forward-pass payoff vs analytic (REJECT). Reward-shaping arms (spatial / forward-primacy
+/ de-timid) are falsified; the plateau is **structural**. Current working hypothesis (2026-07-09,
+Codex-adjudicated): the net may not **causally own the executed action** — exploration is off and the
+downstream analytic/execution layers may override it. **Plan (instrument-first) →
+[`climb-reframe-2026-07-09.md`](climb-reframe-2026-07-09.md):**
+1. Build the **net-influence instrument** (pure measurement, default-off): fraction of decisions on
+   which the net's score changes the executed action vs the tabular/heuristic argmax. Sites: scorer
+   `neural_blended_action` (world.rs:15659/15961) + final commit (world.rs:20126/20150). Report exact
+   vs family, on-/off-ball, chosen-candidate score entropy, and selected kick-speed-bucket entropy.
+2. Baseline it, then **flip exploration on** (`DD_SOCCER_ENABLE_STOCHASTIC_POLICY_TOPK=1` +
+   `policy_selection.boltzmann_temperature`>0, annealed) and remeasure.
+3. Add the adjacent health counters before changing PPO/MAPPO math or widening capacity:
+   `confidence_gate_open_rate`, old-prob missing rate, ratio mean, clip fraction, entropy by
+   role/family, raw/scaled target histograms, target clip fraction, and advantage mean/std.
+4. Keep a frozen eval ladder: analytic baseline, protected local best, past checkpoints, and
+   weaker/randomized opponents on held-out seeds.
+5. Only then **resume reward work** (the r19 carrot / learned receiver / target-point aim).
+See also the shipped-but-unevaluated capacity/action-space work on
+`feature/action-param-features-and-capacity` (`learning-breakthrough-priority1-action-space.md`).
 
 ## P1 — Offline distilled value head, productionized (`offline-encoder-step2-plan.md`)
 The prototype proved the data is learnable; turn it into a shippable, gated head.
@@ -37,14 +60,11 @@ slow WAN load on `:5099`).
 3. Re-enable a high `SOCCER_LIVE_POLICY_MIN_VISITS` / top-N load; re-measure `:5099` load time.
 
 ## P3 — Cluster learning ops
-- **Hetzner `dd-soccer-learning-queue` is failing** (Error pods seen this session; node SSH
-  was also refusing connections). Diagnose: `kubectl logs` the failed jobs, check the
-  cronjob, confirm the node/SSH. The AWS `dd-soccer-learning-rds-continuous` is healthy;
-  the Hetzner queue is the gap.
-- Roll status (2026-06-28): **AWS `dd-soccer-rs` = 1/1 with the jitter-buffer build ✓**.
-  **Hetzner SSH is timing out** (banner-exchange timeouts/resets) — can't verify its roll or
-  queue, and that node connectivity issue is almost certainly why the Hetzner learning-queue
-  is failing. First ops step: restore Hetzner node/SSH reachability, then re-check the queue.
+- Treat the AWS continuous learner as the canonical RDS self-play lane, then verify its
+  current health from live rollout/log/DB state before changing it.
+- Hetzner is primarily the tournament farm unless a queue learner is explicitly enabled.
+  If queue pods are failing, diagnose live: pod logs, cronjob config, node reachability,
+  and whether the queue deployment is expected to be on for this experiment.
 
 ## P4 — Step 2b (later): learned relational encoder
 Only after P1 proves value. Tiny GNN/attention encoder over the raw 22-body graph, trained
@@ -52,7 +72,9 @@ offline and **distilled into the same dense head shape** (still one forward pass
 Gated + eval-gated identically. The audit's #1 done within the 66 ms / 22-agent budget.
 
 ## Cross-cutting constraints (do not violate)
-- **66 ms / 15 Hz / 22-agent real-time budget** — no per-tick GNN/RNN/MCTS (`architecture-audit.md`).
+- **66 ms / 15 Hz / 22-agent real-time budget** — no full-state per-tick GNN/RNN/deep MCTS;
+  bounded neural MCTS/PUCT may only rerank an already-legal, hard-capped candidate set
+  (`architecture-audit.md`).
 - **Determinism** — new learnable paths land **default-OFF / byte-identical**; A/B behind the eval gate.
 - **New variables** — append at the tail (zero-pad old neural snapshots); keep them OUT of the
   tabular `state_key` unless re-accumulating that experiment.

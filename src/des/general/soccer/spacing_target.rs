@@ -410,6 +410,32 @@ impl AttackSpacingHead {
         mean
     }
 
+    pub fn from_snapshot(snapshot: &SoccerAuxiliaryHeadSnapshot) -> Result<Self, String> {
+        let network = build_soccer_feed_forward_network_from_snapshot(
+            &snapshot.network,
+            ATTACK_SPACING_FEATURE_DIM,
+            1,
+            &[],
+            "attack-spacing head",
+        )?;
+        Ok(AttackSpacingHead {
+            network,
+            training_steps: snapshot.training_steps.max(snapshot.network.training_steps),
+            last_loss: snapshot.average_loss.or(snapshot.network.average_loss),
+        })
+    }
+
+    pub(crate) fn to_snapshot(&self) -> SoccerAuxiliaryHeadSnapshot {
+        let mut network = soccer_neural_network_snapshot(&self.network);
+        network.training_steps = self.training_steps;
+        network.average_loss = self.last_loss;
+        SoccerAuxiliaryHeadSnapshot {
+            network,
+            training_steps: self.training_steps,
+            average_loss: self.last_loss,
+        }
+    }
+
     pub fn training_steps(&self) -> usize {
         self.training_steps
     }
@@ -733,7 +759,7 @@ mod tests {
         let (ctx, _held) = snapshot
             .attack_spacing_team_context(Team::Home)
             .expect("team spacing context");
-        let analytic = snapshot.resolved_attack_spacing_target(&ctx);
+        let analytic = snapshot.resolved_attack_spacing_target(Team::Home, &ctx);
         let samples: Vec<AttackSpacingSample> = (0..ATTACK_SPACING_HEAD_MIN_TRAINING_STEPS)
             .map(|_| AttackSpacingSample {
                 context: ctx,
@@ -751,10 +777,31 @@ mod tests {
 
         sim.set_attack_spacing_head(head);
         let learned_snapshot = WorldSnapshot::from_match(&sim);
-        let learned = learned_snapshot.resolved_attack_spacing_target(&ctx);
+        let learned = learned_snapshot.resolved_attack_spacing_target(Team::Home, &ctx);
         assert!(
             learned.ideal > analytic.ideal + 0.25,
             "warm installed head should move the served band: analytic={analytic:?} learned={learned:?}"
+        );
+    }
+
+    #[test]
+    fn attack_spacing_head_round_trips_through_snapshot() {
+        let ctx = neutral_context();
+        let mut head = AttackSpacingHead::new(31);
+        let samples = vec![AttackSpacingSample {
+            context: ctx,
+            held_spacing_yards: 9.0,
+            reward: 1.0,
+        }];
+        head.train(&samples, 0.02);
+        let before = head.predict(&ctx).expect("prediction before snapshot");
+        let snapshot = head.to_snapshot();
+        let restored = AttackSpacingHead::from_snapshot(&snapshot).expect("restore snapshot");
+        let after = restored.predict(&ctx).expect("prediction after snapshot");
+        assert_eq!(restored.training_steps(), head.training_steps());
+        assert!(
+            (before - after).abs() < 1e-9,
+            "snapshot should preserve attack-spacing prediction: before={before} after={after}"
         );
     }
 }

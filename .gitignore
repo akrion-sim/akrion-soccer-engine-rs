@@ -1,7 +1,14 @@
 target/
 Cargo.lock
+!standalone-5v5/Cargo.lock
 out/
 tmp
 
 # local per-worktree cargo target dirs
 .cargo-target-*/
+
+.claude/worktrees/
+
+__pycache__/
+*.pyc
+viz/tune_log.csv

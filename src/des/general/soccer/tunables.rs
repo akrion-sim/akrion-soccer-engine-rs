@@ -40,8 +40,7 @@ pub(crate) const KILLER_PASS_OVER_TOP_PASS_FLIGHT_ALIASES: &[&str] = &[
 ];
 pub(crate) const KILLER_PASS_OVER_TOP_DISTANCE_BINS_YARDS: [f64; 4] = [25.0, 28.0, 32.0, 35.0];
 pub(crate) const KILLER_PASS_OVER_TOP_HEIGHT_BINS_YARDS: [f64; 4] = [2.0, 3.4, 4.6, 6.0];
-pub(crate) const KILLER_PASS_OVER_TOP_LATERAL_OFFSET_BINS_YARDS: [f64; 4] =
-    [1.0, 3.0, 5.0, 8.0];
+pub(crate) const KILLER_PASS_OVER_TOP_LATERAL_OFFSET_BINS_YARDS: [f64; 4] = [1.0, 3.0, 5.0, 8.0];
 pub(crate) const KILLER_PASS_OVER_TOP_BACK_LINE_CLEARANCE_BINS_YARDS: [f64; 4] =
     [0.5, 2.0, 4.0, 7.0];
 pub(crate) const KILLER_PASS_OVER_TOP_GOALKEEPER_AVOIDANCE_BINS_YARDS: [f64; 4] =
@@ -74,6 +73,11 @@ pub struct Tunables {
     pub defensive_shape: DefensiveShapeTunables,
     /// Ball-carrier anti-stutter / keep-rolling thresholds.
     pub carrier_keep_rolling: CarrierKeepRollingTunables,
+    /// Good-dribbling knobs: touch DIRECTION weighting, touch LENGTH (how far the ball rolls per
+    /// touch), and carry SPEED (the forward-drive gait floor). Read by both the deterministic/MPC
+    /// touch-decision path and tunable from the learning store's policy overlay (the POMDP tuning
+    /// row), so dribbling can be tuned via MPC and POMDP both. See [`DribbleTuning`].
+    pub dribble: DribbleTuning,
     /// Freshly-won possession escape burst thresholds.
     pub fresh_possession_escape: FreshPossessionEscapeTunables,
     /// Goalkeeper positioning shaping (resting line, alignment score, buildup
@@ -106,6 +110,7 @@ impl Default for Tunables {
             shooting: ShootingTunables::default(),
             defensive_shape: DefensiveShapeTunables::default(),
             carrier_keep_rolling: CarrierKeepRollingTunables::default(),
+            dribble: DribbleTuning::default(),
             fresh_possession_escape: FreshPossessionEscapeTunables::default(),
             goalkeeper: GoalkeeperTunables::default(),
             killer_pass_over_top: KillerPassOverTopTunables::default(),
@@ -266,9 +271,12 @@ impl PolicySelectionTunables {
 impl Default for PolicySelectionTunables {
     fn default() -> Self {
         PolicySelectionTunables {
-            top1_weight: 0.70,
-            top2_weight: 0.20,
-            top3_weight: 0.10,
+            // PLATEAU-BREAK: flattened 70/20/10 -> 50/30/20 so the policy commits LESS to its
+            // current-optimal choice and explores 2nd/3rd more — with the outcome-dominant win
+            // reward, this broader search can find aggressive play the tidy local-optimum never tries.
+            top1_weight: 0.50,
+            top2_weight: 0.30,
+            top3_weight: 0.20,
             boltzmann_temperature: 0.0,
         }
     }
@@ -477,13 +485,27 @@ impl Default for FlankCrossTunables {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RewardTunables {
-    /// Reward added per goal the actor's team scores this transition. Was `100.0`.
+    /// Compatibility/reporting copy of the fixed 500-point goal anchor. Loaded
+    /// legacy values are projected back to 500 during sanitization; subordinate
+    /// contextual rewards remain tunable.
     pub goal_scored_points: f64,
     /// Penalty when conceding, for a goalkeeper or defender (heavier — it's their
     /// job to prevent it). Was `8.0`.
     pub concede_keeper_defender_penalty: f64,
     /// Penalty when conceding, for an outfield non-defender. Was `2.0`.
     pub concede_outfield_penalty: f64,
+    /// Concede penalty for a goalkeeper/defender when the **concede-symmetry rebalance** is
+    /// active (`DD_SOCCER_ENABLE_CONCEDE_SYMMETRY`). Moves the concede *stick* toward the
+    /// fixed goal *carrot* so conceding is a genuine counterweight rather than a token cost.
+    /// Unused unless the gate is on. Default `100.0` assigns the back line one fifth of the
+    /// fixed goal anchor while preserving role-sensitive blame.
+    pub concede_keeper_defender_penalty_symmetric: f64,
+    /// Concede penalty for an outfield non-defender under the concede-symmetry rebalance:
+    /// meaningful but below the back line's share (an outfielder is less responsible for a
+    /// concede, mirroring how the back line is less responsible for a goal — the goal carrot is
+    /// flat team-wide, so the concede stick keeps a role gradient). Unused unless
+    /// `DD_SOCCER_ENABLE_CONCEDE_SYMMETRY` is on. Default `60.0`.
+    pub concede_outfield_penalty_symmetric: f64,
     /// Shaping reward for easing out of a sustained teammate overlap. Was the
     /// `TEAMMATE_SPACING_OVERLAP_RELIEF_REWARD` const.
     pub teammate_overlap_relief_reward: f64,
@@ -499,6 +521,40 @@ pub struct RewardTunables {
     /// Penalty for a forced pass played under low pressure (no need to rush). Was
     /// `LOW_PRESSURE_FORCED_PASS_PENALTY_POINTS`.
     pub low_pressure_forced_pass_penalty_points: f64,
+    /// Flat penalty for giving the ball straight to the opponent (a turnover with
+    /// no intentional-long-ball exemption) from a hold in the actor's OWN half —
+    /// the most expensive giveaway, as it exposes the goal. The danger-scaled
+    /// follow-on cost (the opponent then advancing) is priced separately and
+    /// continuously by the net-Φ pitch-value term; this is the flat decision-step
+    /// price of the giveaway itself. Was the inline `3.5`.
+    pub giveaway_to_opponent_own_half_penalty: f64,
+    /// Flat penalty for giving the ball straight to the opponent from a hold in
+    /// the OPPONENT's half (less exposed than an own-half giveaway). Was the inline
+    /// `2.2`.
+    pub giveaway_to_opponent_opp_half_penalty: f64,
+    /// Flat penalty for losing the ball into a loose/contested state (no team in
+    /// settled possession after the touch) from the actor's OWN half — softer than
+    /// a clean giveaway because the ball is still up for grabs. Was the inline
+    /// `0.85`.
+    pub giveaway_to_loose_own_half_penalty: f64,
+    /// Flat penalty for losing the ball into a loose/contested state from the
+    /// OPPONENT's half. Was the inline `0.55`.
+    pub giveaway_to_loose_opp_half_penalty: f64,
+    /// Per-second magnitude of the **both-teams loose-ball contest pressure**
+    /// penalty: charged to every outfield player on BOTH teams for each tick an
+    /// unpossessed ball is left uncontested beyond the grace, so standing off a
+    /// loose ball is never free for either side. Symmetric across teams, so it
+    /// biases only the urgency of contesting, not the match outcome. Gated by
+    /// `DD_SOCCER_ENABLE_LOOSE_BALL_CONTEST_PRESSURE` (default-on).
+    pub loose_ball_uncontested_penalty_per_second: f64,
+    /// Cap (points) on the per-tick loose-ball uncontested-time penalty, so a ball
+    /// left sitting can't runaway-dominate the sparse signal.
+    pub loose_ball_uncontested_penalty_max: f64,
+    /// Reward for **winning the unclaimed/loose ball** — the actor's team takes
+    /// controlled possession of a previously-unheld ball. Scaled up the longer the
+    /// ball had gone uncontested (winning a genuinely loose ball is decisive) and
+    /// down for a teammate who forced it loose but did not personally secure it.
+    pub loose_ball_win_points: f64,
     /// Scale on the dense **territorial pitch-control × expected-threat** delta
     /// reward (see [`crate::des::general::soccer::pitch_value`]). Multiplies the
     /// net change in the acting team's controlled threat between the before/after
@@ -518,14 +574,23 @@ pub struct RewardTunables {
 impl Default for RewardTunables {
     fn default() -> Self {
         RewardTunables {
-            goal_scored_points: 100.0,
+            goal_scored_points: 500.0,
             concede_keeper_defender_penalty: 8.0,
             concede_outfield_penalty: 2.0,
+            concede_keeper_defender_penalty_symmetric: 100.0,
+            concede_outfield_penalty_symmetric: 60.0,
             teammate_overlap_relief_reward: 0.06,
             teammate_overlap_camp_penalty: 0.03,
             center_back_ahead_of_wingback_penalty_per_yard: 0.11,
             blocked_lane_floor_pass_penalty_points: 6.0,
             low_pressure_forced_pass_penalty_points: 1.75,
+            giveaway_to_opponent_own_half_penalty: 3.5,
+            giveaway_to_opponent_opp_half_penalty: 2.2,
+            giveaway_to_loose_own_half_penalty: 0.85,
+            giveaway_to_loose_opp_half_penalty: 0.55,
+            loose_ball_uncontested_penalty_per_second: 0.30,
+            loose_ball_uncontested_penalty_max: 1.2,
+            loose_ball_win_points: 1.5,
             pitch_value_threat_delta_points: 12.0,
             dense_shaping_budget_points: 12.0,
         }
@@ -619,8 +684,8 @@ impl Default for DefensiveShapeTunables {
         DefensiveShapeTunables {
             defensive_line_max_into_opp_half_yards: 5.0,
             back_four_block_width_yards: 22.0,
-            back_four_horizontal_min_gap_yards: 1.5,
-            back_four_horizontal_max_gap_yards: 8.0,
+            back_four_horizontal_min_gap_yards: 6.0,
+            back_four_horizontal_max_gap_yards: 15.0,
             wingback_defensive_pinch_target_seconds: 3.0,
             wingback_defensive_pinch_opponent_half_margin_yards: 8.0,
             defensive_goal_side_min_yards: 1.5,
@@ -654,6 +719,74 @@ impl Default for CarrierKeepRollingTunables {
             carry_target_yards: 4.2,
             carry_min_step_yards: 2.25,
             momentum_yps: 0.6,
+        }
+    }
+}
+
+/// Good-dribbling knobs grouped along the three axes the carrier controls: which DIRECTION the ball
+/// is knocked (touch angle), how far it rolls per touch (touch LENGTH), and how fast the carrier
+/// drives with it (carry SPEED / gait floor). The deterministic touch-decision path and the MPC
+/// control estimate read these, and the learning store can override them through the policy tuning
+/// overlay — so dribbling is tunable from MPC and POMDP/learned both. Defaults reproduce the prior
+/// hard-coded literals exactly (an unconfigured process is byte-identical).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DribbleTuning {
+    // --- DIRECTION: touch-angle bucket scoring in `agentic_dribble_touch_bucket_for`. ---
+    /// Weight on the MPC ball-control probability when scoring a touch direction (how much MPC
+    /// execution feasibility steers which way the ball is knocked).
+    pub direction_mpc_control_weight: f64,
+    /// Weight on the MPC QP acceleration fit in the direction score.
+    pub direction_mpc_accel_weight: f64,
+    /// Weight on the kind-appropriate angle prior in the direction score.
+    pub direction_angle_fit_weight: f64,
+    /// Open-grass scale on the forward-component reward in the direction score (a clearer lane ahead
+    /// pulls the touch more forward).
+    pub direction_forward_open_grass_scale: f64,
+    // --- LENGTH: touch distance in `dribble_touch_distance_for` (how far the ball rolls). ---
+    /// Base touch length in yards before skill/space/intent terms.
+    pub touch_length_base_yards: f64,
+    /// Yards of touch length added per unit of ball-control skill.
+    pub touch_length_control_scale: f64,
+    /// Yards of touch length added per unit of open grass ahead.
+    pub touch_length_open_grass_scale: f64,
+    /// Yards of touch length added per unit of touch intent.
+    pub touch_length_intent_scale: f64,
+    // --- SPEED: carrier forward-drive gait floor (see `carrier_forward_drive_gait_floor`). ---
+    /// An opponent at/inside this radius keeps the carrier on close control (no speed floor).
+    pub carry_tight_pressure_yards: f64,
+    /// Open forward space (yards) at/above which the carrier is floored to at least a jog.
+    pub carry_jog_space_yards: f64,
+    /// Open forward space (yards) at/above which the carrier is floored to a run.
+    pub carry_run_space_yards: f64,
+    /// Open forward space (yards) at/above which the carrier is floored to a sprint.
+    pub carry_sprint_space_yards: f64,
+    /// Above this fatigue the open-field carry floor caps at a run rather than a sprint.
+    pub carry_sprint_max_fatigue: f64,
+    /// Minimum forward component (yards) of the intended move for the carry floor to engage.
+    pub carry_min_forward_yards: f64,
+    /// Half-width (yards) of the carry lane used to measure open forward space.
+    pub carry_lane_half_width_yards: f64,
+}
+
+impl Default for DribbleTuning {
+    fn default() -> Self {
+        DribbleTuning {
+            direction_mpc_control_weight: 0.48,
+            direction_mpc_accel_weight: 0.30,
+            direction_angle_fit_weight: 1.18,
+            direction_forward_open_grass_scale: 0.68,
+            touch_length_base_yards: 0.78,
+            touch_length_control_scale: 0.86,
+            touch_length_open_grass_scale: 1.05,
+            touch_length_intent_scale: 0.52,
+            carry_tight_pressure_yards: 2.5,
+            carry_jog_space_yards: 3.0,
+            carry_run_space_yards: 9.0,
+            carry_sprint_space_yards: 18.0,
+            carry_sprint_max_fatigue: 0.80,
+            carry_min_forward_yards: 1.0,
+            carry_lane_half_width_yards: 4.0,
         }
     }
 }
@@ -2826,10 +2959,10 @@ impl RewardTunables {
             "reward.goal_scored_points",
             &mut self.goal_scored_points,
             default.goal_scored_points,
-            -1000.0,
-            1000.0,
-            0.0,
-            250.0,
+            500.0,
+            500.0,
+            500.0,
+            500.0,
         );
         sanitize_f64(
             "reward.concede_keeper_defender_penalty",
@@ -2848,6 +2981,24 @@ impl RewardTunables {
             200.0,
             0.0,
             25.0,
+        );
+        sanitize_f64(
+            "reward.concede_keeper_defender_penalty_symmetric",
+            &mut self.concede_keeper_defender_penalty_symmetric,
+            default.concede_keeper_defender_penalty_symmetric,
+            0.0,
+            250.0,
+            0.0,
+            150.0,
+        );
+        sanitize_f64(
+            "reward.concede_outfield_penalty_symmetric",
+            &mut self.concede_outfield_penalty_symmetric,
+            default.concede_outfield_penalty_symmetric,
+            0.0,
+            250.0,
+            0.0,
+            150.0,
         );
         sanitize_f64(
             "reward.teammate_overlap_relief_reward",
@@ -2895,6 +3046,69 @@ impl RewardTunables {
             25.0,
         );
         sanitize_f64(
+            "reward.giveaway_to_opponent_own_half_penalty",
+            &mut self.giveaway_to_opponent_own_half_penalty,
+            default.giveaway_to_opponent_own_half_penalty,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
+            "reward.giveaway_to_opponent_opp_half_penalty",
+            &mut self.giveaway_to_opponent_opp_half_penalty,
+            default.giveaway_to_opponent_opp_half_penalty,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
+            "reward.giveaway_to_loose_own_half_penalty",
+            &mut self.giveaway_to_loose_own_half_penalty,
+            default.giveaway_to_loose_own_half_penalty,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
+            "reward.giveaway_to_loose_opp_half_penalty",
+            &mut self.giveaway_to_loose_opp_half_penalty,
+            default.giveaway_to_loose_opp_half_penalty,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
+            "reward.loose_ball_uncontested_penalty_per_second",
+            &mut self.loose_ball_uncontested_penalty_per_second,
+            default.loose_ball_uncontested_penalty_per_second,
+            0.0,
+            50.0,
+            0.0,
+            10.0,
+        );
+        sanitize_f64(
+            "reward.loose_ball_uncontested_penalty_max",
+            &mut self.loose_ball_uncontested_penalty_max,
+            default.loose_ball_uncontested_penalty_max,
+            0.0,
+            100.0,
+            0.0,
+            20.0,
+        );
+        sanitize_f64(
+            "reward.loose_ball_win_points",
+            &mut self.loose_ball_win_points,
+            default.loose_ball_win_points,
+            0.0,
+            200.0,
+            0.0,
+            25.0,
+        );
+        sanitize_f64(
             "reward.pitch_value_threat_delta_points",
             &mut self.pitch_value_threat_delta_points,
             default.pitch_value_threat_delta_points,
@@ -2919,8 +3133,8 @@ impl RewardTunables {
             prefix,
             "goal_scored_points",
             self.goal_scored_points,
-            -1000.0,
-            1000.0,
+            500.0,
+            500.0,
             errors,
         );
         validate_f64(
@@ -2975,6 +3189,62 @@ impl RewardTunables {
             prefix,
             "low_pressure_forced_pass_penalty_points",
             self.low_pressure_forced_pass_penalty_points,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "giveaway_to_opponent_own_half_penalty",
+            self.giveaway_to_opponent_own_half_penalty,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "giveaway_to_opponent_opp_half_penalty",
+            self.giveaway_to_opponent_opp_half_penalty,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "giveaway_to_loose_own_half_penalty",
+            self.giveaway_to_loose_own_half_penalty,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "giveaway_to_loose_opp_half_penalty",
+            self.giveaway_to_loose_opp_half_penalty,
+            0.0,
+            200.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "loose_ball_uncontested_penalty_per_second",
+            self.loose_ball_uncontested_penalty_per_second,
+            0.0,
+            50.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "loose_ball_uncontested_penalty_max",
+            self.loose_ball_uncontested_penalty_max,
+            0.0,
+            100.0,
+            errors,
+        );
+        validate_f64(
+            prefix,
+            "loose_ball_win_points",
+            self.loose_ball_win_points,
             0.0,
             200.0,
             errors,
@@ -3466,7 +3736,14 @@ impl CarrierKeepRollingTunables {
     }
 
     fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
-        validate_f64(prefix, "stop_target_yards", self.stop_target_yards, 0.0, 6.0, errors);
+        validate_f64(
+            prefix,
+            "stop_target_yards",
+            self.stop_target_yards,
+            0.0,
+            6.0,
+            errors,
+        );
         validate_f64(
             prefix,
             "min_opponent_distance_yards",
@@ -3475,7 +3752,14 @@ impl CarrierKeepRollingTunables {
             15.0,
             errors,
         );
-        validate_f64(prefix, "min_space_yards", self.min_space_yards, 0.0, 40.0, errors);
+        validate_f64(
+            prefix,
+            "min_space_yards",
+            self.min_space_yards,
+            0.0,
+            40.0,
+            errors,
+        );
         validate_f64(
             prefix,
             "carry_target_yards",
@@ -3617,7 +3901,14 @@ impl FreshPossessionEscapeTunables {
     }
 
     fn validate_strict(&self, prefix: &str, errors: &mut Vec<String>) {
-        validate_f64(prefix, "fresh_seconds", self.fresh_seconds, 0.0, 5.0, errors);
+        validate_f64(
+            prefix,
+            "fresh_seconds",
+            self.fresh_seconds,
+            0.0,
+            5.0,
+            errors,
+        );
         validate_f64(prefix, "min_pressure", self.min_pressure, 0.0, 1.0, errors);
         validate_f64(
             prefix,
@@ -3759,7 +4050,9 @@ impl KillerPassOverTopTunables {
             + self.fit_line_weight
             + self.fit_keeper_weight;
         if fit_weight_sum <= 1e-9 {
-            eprintln!("soccer tunables: killer_pass_over_top fit weights sum to zero; using defaults");
+            eprintln!(
+                "soccer tunables: killer_pass_over_top fit weights sum to zero; using defaults"
+            );
             self.fit_distance_weight = default.fit_distance_weight;
             self.fit_angle_weight = default.fit_angle_weight;
             self.fit_line_weight = default.fit_line_weight;
@@ -4012,6 +4305,55 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn reward_giveaway_penalty_defaults_match_historical_literals() {
+        // The four flat turnover-penalty magnitudes were bare literals in
+        // `dense_soccer_transition_reward` before extraction; defaults must
+        // reproduce them exactly so the training baseline stays byte-identical.
+        let r = RewardTunables::default();
+        assert_eq!(r.giveaway_to_opponent_own_half_penalty, 3.5);
+        assert_eq!(r.giveaway_to_opponent_opp_half_penalty, 2.2);
+        assert_eq!(r.giveaway_to_loose_own_half_penalty, 0.85);
+        assert_eq!(r.giveaway_to_loose_opp_half_penalty, 0.55);
+        // The ordering the turnover model encodes: an own-half giveaway straight to
+        // the opponent is the most expensive; a loose ball lost in the opponent's
+        // half the least. Locking it in stops a future retune from inverting it.
+        assert!(r.giveaway_to_opponent_own_half_penalty > r.giveaway_to_opponent_opp_half_penalty);
+        assert!(r.giveaway_to_opponent_opp_half_penalty > r.giveaway_to_loose_own_half_penalty);
+        assert!(r.giveaway_to_loose_own_half_penalty > r.giveaway_to_loose_opp_half_penalty);
+    }
+
+    #[test]
+    fn reward_giveaway_penalties_are_sanitized_and_validated() {
+        // Defaults pass through sanitize untouched and validate cleanly.
+        let mut r = RewardTunables::default();
+        r.sanitize();
+        assert_eq!(r.giveaway_to_opponent_own_half_penalty, 3.5);
+        assert_eq!(r.giveaway_to_loose_opp_half_penalty, 0.55);
+        let mut errors = Vec::new();
+        r.validate_strict("reward", &mut errors);
+        assert!(
+            errors.is_empty(),
+            "default reward tunables must validate: {errors:?}"
+        );
+
+        // A degenerate config can never inject a non-finite or wild penalty into a
+        // gradient: non-finite is repaired to the default, out-of-range is clamped
+        // to the hard bound.
+        let mut bad = RewardTunables::default();
+        bad.giveaway_to_opponent_own_half_penalty = f64::NAN;
+        bad.giveaway_to_loose_opp_half_penalty = 10_000.0;
+        bad.sanitize();
+        assert_eq!(
+            bad.giveaway_to_opponent_own_half_penalty, 3.5,
+            "NaN -> default"
+        );
+        assert_eq!(
+            bad.giveaway_to_loose_opp_half_penalty, 200.0,
+            "out-of-range -> hard cap"
+        );
+    }
+
+    #[test]
     fn defaults_match_historical_literals() {
         let t = Tunables::default();
         assert_eq!(t.tracking.moved_dt_multiplier, 1.2);
@@ -4034,8 +4376,8 @@ mod tests {
             5.0
         );
         assert_eq!(t.defensive_shape.back_four_block_width_yards, 22.0);
-        assert_eq!(t.defensive_shape.back_four_horizontal_min_gap_yards, 1.5);
-        assert_eq!(t.defensive_shape.back_four_horizontal_max_gap_yards, 8.0);
+        assert_eq!(t.defensive_shape.back_four_horizontal_min_gap_yards, 6.0);
+        assert_eq!(t.defensive_shape.back_four_horizontal_max_gap_yards, 15.0);
         assert_eq!(
             t.defensive_shape.wingback_defensive_pinch_target_seconds,
             3.0
@@ -4090,46 +4432,33 @@ mod tests {
         assert_eq!(t.pomdp_perception.ball_holder_shoulder_confidence, 0.70);
         assert_eq!(t.pomdp_perception.ball_holder_side_scan_confidence, 0.52);
         assert_eq!(t.pomdp_perception.ball_holder_rear_scan_confidence, 0.38);
-        assert_eq!(
-            t.pomdp_perception.ball_holder_head_scan_min_seconds,
-            0.75
-        );
-        assert_eq!(
-            t.pomdp_perception.ball_holder_head_scan_max_seconds,
-            1.85
-        );
+        assert_eq!(t.pomdp_perception.ball_holder_head_scan_min_seconds, 0.75);
+        assert_eq!(t.pomdp_perception.ball_holder_head_scan_max_seconds, 1.85);
         assert_eq!(
             t.pomdp_perception
                 .ball_holder_head_scan_vision_relief_seconds,
             0.35
         );
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_scan_confidence_vision_bonus,
+            t.pomdp_perception.ball_holder_scan_confidence_vision_bonus,
             0.08
         );
         assert_eq!(t.pomdp_perception.ball_holder_scan_confidence_cap, 0.62);
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_base,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_base,
             0.24
         );
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_span,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_span,
             0.42
         );
         assert_eq!(t.pomdp_perception.kalman_point_match_radius_yards, 0.35);
         assert_eq!(t.pomdp_perception.kalman_min_history_samples, 2);
-        assert_eq!(
-            t.pomdp_perception.kalman_current_sample_epsilon_yards,
-            0.15
-        );
+        assert_eq!(t.pomdp_perception.kalman_current_sample_epsilon_yards, 0.15);
         assert_eq!(t.pomdp_perception.kalman_base_sigma_yards, 0.85);
         assert_eq!(t.pomdp_perception.kalman_speed_sigma_per_yps, 0.10);
         assert_eq!(
-            t.pomdp_perception
-                .kalman_velocity_disagreement_sigma_yards,
+            t.pomdp_perception.kalman_velocity_disagreement_sigma_yards,
             0.14
         );
         assert_eq!(t.pomdp_perception.kalman_visible_max_confidence, 0.96);
@@ -4192,8 +4521,7 @@ mod tests {
         assert_eq!(t.pomdp_perception.ball_holder_head_scan_max_seconds, 2.0);
         assert_eq!(t.pomdp_perception.ball_holder_side_scan_confidence, 0.55);
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_span,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_span,
             0.50
         );
         assert_eq!(t.pomdp_perception.kalman_min_history_samples, 3);
@@ -4238,6 +4566,7 @@ mod tests {
     #[test]
     fn overlays_are_sanitized_to_hard_bounds() {
         let t = Tunables::from_overlays([json!({
+            "reward": { "goal_scored_points": 42.0 },
             "decision_mpc": { "reselect_min_execution_confidence": -1.0 },
             "shooting": { "shot_block_bailout_max_probability": 4.0 },
             "defensive_shape": {
@@ -4290,6 +4619,7 @@ mod tests {
                 "kalman_visible_max_confidence": 3.0
             }
         })]);
+        assert_eq!(t.reward.goal_scored_points, 500.0);
         assert_eq!(t.decision_mpc.reselect_min_execution_confidence, 0.0);
         assert_eq!(t.shooting.shot_block_bailout_max_probability, 1.0);
         assert_eq!(t.defensive_shape.back_four_horizontal_min_gap_yards, 4.0);
@@ -4320,36 +4650,24 @@ mod tests {
         assert_eq!(t.pomdp_perception.player_reaction_max_seconds, 1.0);
         assert_eq!(t.pomdp_perception.ball_holder_core_degrees, 1.0);
         assert_eq!(t.pomdp_perception.ball_holder_side_scan_confidence, 1.0);
+        assert_eq!(t.pomdp_perception.ball_holder_head_scan_min_seconds, 3.0);
+        assert_eq!(t.pomdp_perception.ball_holder_head_scan_max_seconds, 3.0);
         assert_eq!(
-            t.pomdp_perception.ball_holder_head_scan_min_seconds,
-            3.0
-        );
-        assert_eq!(
-            t.pomdp_perception.ball_holder_head_scan_max_seconds,
-            3.0
-        );
-        assert_eq!(
-            t.pomdp_perception
-                .ball_holder_scan_confidence_vision_bonus,
+            t.pomdp_perception.ball_holder_scan_confidence_vision_bonus,
             0.25
         );
         assert_eq!(t.pomdp_perception.ball_holder_scan_confidence_cap, 0.0);
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_base,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_base,
             1.0
         );
         assert_eq!(
-            t.pomdp_perception
-                .ball_holder_head_scan_drift_risk_span,
+            t.pomdp_perception.ball_holder_head_scan_drift_risk_span,
             0.0
         );
         assert_eq!(t.pomdp_perception.kalman_point_match_radius_yards, 5.0);
         assert_eq!(t.pomdp_perception.kalman_min_history_samples, 10);
-        assert_eq!(
-            t.pomdp_perception.kalman_current_sample_epsilon_yards,
-            0.0
-        );
+        assert_eq!(t.pomdp_perception.kalman_current_sample_epsilon_yards, 0.0);
         assert_eq!(t.pomdp_perception.kalman_base_sigma_yards, 0.01);
         assert_eq!(t.pomdp_perception.kalman_visible_max_confidence, 1.0);
     }
@@ -4391,9 +4709,7 @@ mod tests {
             "pomdp_perception.player_reaction_max_seconds < pomdp_perception.player_reaction_min_seconds"
         ));
         assert!(err.contains("pomdp_perception.ball_holder_side_scan_confidence"));
-        assert!(err.contains(
-            "pomdp_perception.ball_holder_head_scan_drift_risk_base"
-        ));
+        assert!(err.contains("pomdp_perception.ball_holder_head_scan_drift_risk_base"));
         assert!(err.contains("pomdp_perception.kalman_min_history_samples"));
         assert!(err.contains(
             "pomdp_perception.ball_holder_head_scan_max_seconds < pomdp_perception.ball_holder_head_scan_min_seconds"

@@ -3,22 +3,23 @@
 How the engine learns: from source build, through the self-play loop and the
 per-tick decision stack, into the learners, the Postgres-backed policy store, and
 finally the live inference server. Grounded in the running continuous learner
-(`main_soccer_learning_run`, generation ~362) and its live config.
+(`main_soccer_learning_run`) and its live config. Generation numbers drift quickly;
+query Postgres or `/soccer/inspect` for the current active/candidate generation.
 
 ## End-to-end flow
 
 ```mermaid
 flowchart TB
     subgraph SRC["Source &amp; build (GitOps)"]
-        GH["GitHub: soccer-sim-game-engine.rs @ main<br/>+ discrete-event-system.rs (des_engine)"]
-        CW["commit-watcher pod<br/>(rebuilds main from feature/* branches)"]
+        GH["GitHub: soccer-sim-game-engine.rs @ configured SOCCER_SOURCE_REF<br/>+ discrete-event-system.rs (des_engine)"]
+        CW["commit-watcher pod<br/>(rebuilds the configured learner ref)"]
         BUILD["learner entrypoint:<br/>git clone soccer + des -&gt; cargo build --release<br/>main_soccer_learning_run"]
         GH --> CW
         CW --> GH
         GH --> BUILD
     end
 
-    subgraph LOOP["Self-play learning loop — per cycle, parallel_games=1"]
+    subgraph LOOP["Self-play learning loop — per cycle, SOCCER_PARALLEL_GAMES"]
         CUR["Curriculum stage<br/>locomotion -&gt; ball-skills -&gt; duels -&gt; small-sided -&gt; team-shape -&gt; full-match"]
         OPP["Adversarial / self-play opponent<br/>(resumed policy, adversarial embedding)"]
         GAME["Self-play match (home policy vs away policy)"]
@@ -48,15 +49,15 @@ flowchart TB
     TICK --> REW
 
     subgraph LEARN["Update / optimization"]
-        NEU["Neural learner (threaded)<br/>actor-critic + GAE advantage, PPO clip (multi-epoch)<br/>replay 2048, batch 32, lr 0.015, hidden 24"]
-        GA["Evolution / GA self-play<br/>every 5 games: mutate / crossover / elite (pop 16)"]
+        NEU["Neural learner (threaded)<br/>actor-critic + GAE advantage, PPO clip (multi-epoch)<br/>replay 512, batch 16, lr 0.015, hidden 128"]
+        GA["Evolution / GA self-play<br/>every 10 games: mutate / crossover / elite (pop 6, max 16)"]
         GATE["Policy promotion gate<br/>min fitness, max conceded, play quality"]
     end
 
     subgraph AUX["Auxiliary learned models"]
         VAL["Value / critic head"]
-        PASS["Pass-completion head<br/>(TRAINED, not yet consumed live)"]
-        LINE["Line-depth heads — back four + midfield<br/>(merged, GATED off, corpus not yet wired)"]
+        PASS["Pass-completion head<br/>(trained, gated live blend once warm)"]
+        LINE["Line-depth heads — back four + midfield<br/>(samples drained/trained, gated live consumption)"]
         CFG["Config-similarity retrieval<br/>(HNSW over 22+ball embedding)"]
     end
 
@@ -98,7 +99,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     subgraph AWS["AWS EC2 k8s (kubeadm)"]
-        AL["continuous neural learner<br/>dd-soccer-learning-rds-continuous (gen ~362)"]
+        AL["continuous neural learner<br/>dd-soccer-learning-rds-continuous"]
         AT["nightly tournaments"]
         AR["live server (dd-soccer-rs)"]
         ACW["commit-watcher"]
@@ -123,19 +124,21 @@ flowchart LR
 
 ## How a generation advances (the loop in words)
 
-1. **Build** — the learner pod clones `main` (soccer + des), `cargo build`s
-   `main_soccer_learning_run`, and resumes the latest policy + neural network from
-   Postgres.
+1. **Build** — the learner pod clones the configured `SOCCER_SOURCE_REF`
+   (soccer + des), `cargo build`s `main_soccer_learning_run`, and resumes the
+   latest policy + neural network from Postgres.
 2. **Curriculum** — each cycle picks a stage (locomotion → … → full-match) that
    reshapes the drill (players-per-team, duration, pitch).
-3. **Self-play** — one match (`parallel_games=1`) of the current policy vs an
-   adversarial/resumed opponent. Each tick, every player runs the decision stack:
-   POMDP belief + world model + formation LP feed the **policy head (actor)**;
-   the chosen action is executed through **per-player MPC**.
+3. **Self-play** — `SOCCER_PARALLEL_GAMES` matches of the current policy vs an
+   adversarial/resumed opponent. The deployed continuous learner is commonly kept
+   at `1` for deterministic progress, while queue/worker topology is separate.
+   Each tick, every player runs the decision stack: POMDP belief + world model +
+   formation LP feed the **policy head (actor)**; the chosen action is executed
+   through **per-player MPC**.
 4. **Reward** — event rewards (goals, passes, shots, chains) + tactical-learning
    shaping, with an **optional** dense pitch-control × xT territorial term.
 5. **Update** — the **neural learner** does actor-critic + GAE with PPO-clipped
-   multi-epoch updates over a replay buffer; **GA evolution** (every 5 games)
+   multi-epoch updates over a replay buffer; **GA evolution** (every 10 games)
    mutates/crosses/selects the population.
 6. **Promotion gate** — a candidate policy is promoted to a new **generation**
    only if it clears fitness / goals-conceded / play-quality thresholds.
@@ -149,19 +152,23 @@ flowchart LR
 
 - **Live & advancing:** policy head (actor-critic + GAE + PPO-clip), GA evolution,
   curriculum, promotion gate, Postgres policy store, live serving — all running on
-  AWS (gen ~362), the *deterministic / formation-LP-off* experiment.
+  AWS when the continuous learner deployment is scaled and healthy. Use the DB,
+  logs, or inspect endpoint for the exact generation.
 - **Dashed = dormant / gated (capacity built, not yet learning):**
-  - **Pass-completion head** — trained on the corpus but **not consumed live**
-    (the analytic estimate still drives passes).
-  - **Line-depth head** (back four) — now wired **end-to-end** (collect RL samples →
-    territorial reward → reward-weighted train → live consumption once trained), but
-    **gated off** (`DD_SOCCER_ENABLE_BACK_FOUR_LINE_MODEL`) and carried **in-memory**
-    in the learner (resets on pod restart; cross-restart Postgres persistence is the
-    remaining durability step). The midfield line keeps the analytic seed.
+  - **Pass-completion head** — trained on the corpus and blended live only when
+    `learned_pass_completion_enabled()` is on and the head has enough training
+    steps; otherwise the analytic estimate remains the fallback.
+  - **Line-depth heads** (back four + midfield) — the learner drains samples,
+    reward-weights them, trains a carried head, and the runtime consumes it only
+    once the gate/head warm-up checks pass. The back-four vector is the full
+    169-feature 22-player+ball field-motion view; the head is currently carried
+    in memory across games, with cross-restart Postgres durability still the
+    remaining hardening step.
   - **Pitch-control × xT reward** — implemented, **gated off** by default.
   - **PUCT re-ranker** — present, off by default.
 - **Not learning:** Hetzner runs tournaments + serving but **no neural learner**;
-  localhost serves only. The AWS learner is **single-game** (`parallel_games=1`).
+  localhost serves only. The AWS continuous learner is usually deployed with
+  `SOCCER_PARALLEL_GAMES=1`.
 
 See [back-four-line-model.md](back-four-line-model.md) and
 [learnability-conversion-roadmap.md](learnability-conversion-roadmap.md) for the

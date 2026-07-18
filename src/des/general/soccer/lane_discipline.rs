@@ -29,27 +29,31 @@
 //!
 //! ## Parity
 //!
-//! Everything here is gated behind [`lane_discipline_v2_enabled`]
-//! (`DD_SOCCER_ENABLE_LANE_DISCIPLINE_V2`, **off by default**). The producer
-//! functions fall back to their verbatim legacy formulas when the gate is off, so
-//! an unconfigured process is byte-identical to before this module existed. The
-//! tunable weights live in [`LaneDisciplineTunables`] (env-/Postgres-overridable
-//! via the [`tunables`] registry), so the discipline is "optionally learnable"
-//! without touching code.
+//! Everything here is selected by [`lane_discipline_v2_enabled`]. The 12-lane
+//! re-derived path is on by default; set `DD_SOCCER_DISABLE_LANE_DISCIPLINE_V2`
+//! for a legacy A/B run. `DD_SOCCER_ENABLE_LANE_DISCIPLINE_V2=0` is also honored
+//! for old launch scripts that already write the enable flag. The tunable weights
+//! live in [`LaneDisciplineTunables`] (env-/Postgres-overridable via the
+//! [`tunables`] registry).
 
 use super::*;
 
-/// Env gate selecting the centralized, 12-lane-re-derived lane-discipline path.
-/// Off (unset) by default ⇒ the legacy inline formulas run unchanged.
+/// Env controls for the centralized, 12-lane-re-derived lane-discipline path.
 const LANE_DISCIPLINE_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_LANE_DISCIPLINE_V2";
+const LANE_DISCIPLINE_V2_DISABLE_ENV: &str = "DD_SOCCER_DISABLE_LANE_DISCIPLINE_V2";
 
-fn env_flag_on(name: &str) -> bool {
-    std::env::var(name)
-        .map(|raw| {
-            let v = raw.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+fn env_flag(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|raw| {
+        let v = raw.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+fn lane_discipline_v2_enabled_from_env() -> bool {
+    if env_flag(LANE_DISCIPLINE_V2_DISABLE_ENV).unwrap_or(false) {
+        return false;
+    }
+    env_flag(LANE_DISCIPLINE_V2_ENABLE_ENV).unwrap_or(true)
 }
 
 /// Whether the centralized lane-discipline path is active this process. Tests
@@ -57,13 +61,13 @@ fn env_flag_on(name: &str) -> bool {
 pub fn lane_discipline_v2_enabled() -> bool {
     #[cfg(test)]
     {
-        env_flag_on(LANE_DISCIPLINE_V2_ENABLE_ENV)
+        lane_discipline_v2_enabled_from_env()
     }
     #[cfg(not(test))]
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| env_flag_on(LANE_DISCIPLINE_V2_ENABLE_ENV))
+        *ENABLED.get_or_init(lane_discipline_v2_enabled_from_env)
     }
 }
 
@@ -135,22 +139,57 @@ pub fn lane_clamp_blend(commitment: f64, relief: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     // A 12-lane / 80yd pitch ⇒ 6.667yd lanes. The v2 defaults are tuned to
     // reproduce the legacy reach at this width, then stay invariant to it.
     const W: f64 = 80.0;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_LOCK.lock().expect("lane-discipline env lock poisoned");
+        f()
+    }
 
     fn with_v2<R>(f: impl FnOnce() -> R) -> R {
-        std::env::set_var(LANE_DISCIPLINE_V2_ENABLE_ENV, "1");
-        let r = f();
-        std::env::remove_var(LANE_DISCIPLINE_V2_ENABLE_ENV);
-        r
+        with_env_lock(|| {
+            std::env::remove_var(LANE_DISCIPLINE_V2_DISABLE_ENV);
+            std::env::set_var(LANE_DISCIPLINE_V2_ENABLE_ENV, "1");
+            let r = f();
+            std::env::remove_var(LANE_DISCIPLINE_V2_ENABLE_ENV);
+            r
+        })
     }
 
     #[test]
-    fn strength_is_identity_when_gate_off() {
-        std::env::remove_var(LANE_DISCIPLINE_V2_ENABLE_ENV);
-        assert_eq!(strength(), 1.0);
+    fn lane_discipline_v2_is_default() {
+        with_env_lock(|| {
+            std::env::remove_var(LANE_DISCIPLINE_V2_ENABLE_ENV);
+            std::env::remove_var(LANE_DISCIPLINE_V2_DISABLE_ENV);
+            assert!(lane_discipline_v2_enabled());
+            assert_eq!(strength(), params().strength);
+        });
+    }
+
+    #[test]
+    fn strength_is_identity_when_v2_is_disabled() {
+        with_env_lock(|| {
+            std::env::remove_var(LANE_DISCIPLINE_V2_ENABLE_ENV);
+            std::env::set_var(LANE_DISCIPLINE_V2_DISABLE_ENV, "1");
+            assert!(!lane_discipline_v2_enabled());
+            assert_eq!(strength(), 1.0);
+            std::env::remove_var(LANE_DISCIPLINE_V2_DISABLE_ENV);
+        });
+    }
+
+    #[test]
+    fn enable_env_false_keeps_legacy_ab_path_available() {
+        with_env_lock(|| {
+            std::env::remove_var(LANE_DISCIPLINE_V2_DISABLE_ENV);
+            std::env::set_var(LANE_DISCIPLINE_V2_ENABLE_ENV, "0");
+            assert!(!lane_discipline_v2_enabled());
+            std::env::remove_var(LANE_DISCIPLINE_V2_ENABLE_ENV);
+        });
     }
 
     #[test]
@@ -188,7 +227,10 @@ mod tests {
             assert!((none - 1.0).abs() < 1e-9, "unrelieved ⇒ hard lock");
             assert!(none > mild && mild > lots, "monotone taper, not a cliff");
             let soft_floor = 0.9 * params().soft_blend_max;
-            assert!(lots >= soft_floor - 1e-9, "never below the legacy soft blend");
+            assert!(
+                lots >= soft_floor - 1e-9,
+                "never below the legacy soft blend"
+            );
         });
     }
 }

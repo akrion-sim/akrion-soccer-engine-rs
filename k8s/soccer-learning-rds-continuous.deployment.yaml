@@ -65,6 +65,10 @@ spec:
                 repo="$1"; ref="$2"; dir="$3"
                 if [ -d "${dir}/.git" ]; then
                   echo "source_checkout_mode=fetch dir=${dir} ref=${ref}"
+                  # The checkout lives on a persistent hostPath and can outlive source-repo
+                  # migrations. Reconcile origin before every warm fetch so an old clone cannot
+                  # keep fetching a same-named or branch-incomplete repository indefinitely.
+                  git -C "${dir}" remote set-url origin "${repo}"
                   git -C "${dir}" fetch --depth 1 origin "${ref}"
                   git -C "${dir}" switch --detach FETCH_HEAD
                 else
@@ -88,6 +92,24 @@ spec:
               require_value SOCCER_REQUIRE_POSTGRES true
               require_value SOCCER_NEURAL_LEARNING_ENABLED true
               require_value SOCCER_NEURAL_LEARNING_BACKEND threaded
+              require_value SOCCER_NEURAL_LEARNING_RATE 0.0003
+              require_value SOCCER_NEURAL_HIDDEN_UNITS 128
+              require_value SOCCER_NEURAL_BLEND_MODE authoritative
+              require_value SOCCER_NEURAL_BLEND_LAMBDA 8
+              require_value SOCCER_NEURAL_BLEND_WARMUP_STEPS 0
+              require_value SOCCER_MARL_ALGORITHM mappo
+              require_value SOCCER_MAPPO_TEAM_REWARD_SHARE 0.6
+              require_value SOCCER_MARL_TEAM_REWARD_WEIGHT 0.55
+              require_value SOCCER_LEARNING_MPC_ENABLED true
+              require_value SOCCER_LEARNING_MPC_FIELD_AWARE_ENABLED true
+              require_value SOCCER_LEARNING_MPC_RECONCILE_ENABLED true
+              require_value SOCCER_LEARNING_MPC_LATENT_OBJECTIVE_ENABLED true
+              require_value SOCCER_LEARNING_MPC_PLAYER_HORIZON 30
+              require_value SOCCER_BATCH_CURRICULUM_BALL_SKILLS_AFTER_GAMES 0
+              require_value SOCCER_BATCH_CURRICULUM_DUELS_AFTER_GAMES 0
+              require_value SOCCER_BATCH_CURRICULUM_SMALL_SIDED_AFTER_GAMES 0
+              require_value SOCCER_BATCH_CURRICULUM_TEAM_SHAPE_AFTER_GAMES 0
+              require_value SOCCER_BATCH_CURRICULUM_FULL_MATCH_AFTER_GAMES 0
               require_value SOCCER_PARALLEL_GAMES 1
               require_value SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES 1
               require_value SOCCER_POSTGRES_COMPLETED_RUN_BATCH_GAMES 1
@@ -95,9 +117,62 @@ spec:
               require_value SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT true
               require_value SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM true
               require_value SOCCER_EVOLUTION_ENABLED true
+              require_value DD_SOCCER_ENABLE_FIELD_VECTOR_V2 true
+              require_value DD_SOCCER_ENABLE_CENTRAL_CRITIC_V2 true
+              require_value SOCCER_POLICY_HIDDEN_UNITS 128
               require_value SOCCER_EVOLUTION_INTERVAL_GAMES 5
               require_value DD_SOCCER_ENABLE_LOOSE_BALL_COMMIT_MODEL true
               require_value DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET true
+              require_value DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE true
+              require_value DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD true
+              require_value DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER true
+              require_value DD_SOCCER_ENABLE_NEURAL_PASS_SPACE true
+              require_value DD_SOCCER_ENABLE_DISCRETIZED_KICK false
+              require_value DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT true
+              require_value DD_SOCCER_ENABLE_TARGET_STANDARDIZATION true
+              require_value DD_SOCCER_ENABLE_DP_BOOTSTRAP true
+              require_value DD_SOCCER_ENABLE_DP_CRITIC_TARGET true
+              require_value DD_SOCCER_DP_BOOTSTRAP_HORIZON 64
+              require_value DD_SOCCER_DP_BOOTSTRAP_SWEEPS 200
+              require_value SOCCER_APPROX_DP_REPLAY_PASSES 8
+              require_value SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT 0.5
+              require_value DD_SOCCER_ENABLE_MC_CRITIC_TARGET true
+              require_value DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP true
+              require_value DD_SOCCER_ENABLE_MAXA_BOOTSTRAP true
+              require_value DD_SOCCER_ENABLE_NOVELTY_BONUS true
+              require_value DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM true
+              require_value DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM true
+              require_value DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT true
+              require_value DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE 1.0
+              require_value SOCCER_NEURAL_TARGET_SCALE 30
+              require_value SOCCER_NEURAL_TARGET_CLIP 15
+              require_value SOCCER_NEURAL_TARGET_POPART true
+              require_value SOCCER_NEURAL_ACTOR_CRITIC true
+              require_value SOCCER_ENABLE_ACTOR_CRITIC true
+              require_value SOCCER_NEURAL_LP_COUPLING_ENABLED true
+              require_value SOCCER_NEURAL_MCTS_ENABLED false
+              require_value SOCCER_NEURAL_MCTS_CANDIDATES 8
+              require_value SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES 8
+              require_value DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD true
+              require_value DD_SOCCER_ENABLE_SKILL_POLICY_HEADS true
+              require_value DD_SOCCER_FORWARD_PASS_REWARD_SCALE 6
+              require_value DD_SOCCER_SHOT_SHAPING_REWARD_SCALE 0.4
+              require_value SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB true
+              require_value SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN 0
+              require_value SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN 0
+              require_value SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN 0.0
+              require_value SOCCER_EVAL_MIN_PASS_GAIN_YARDS_MARGIN 0
+              require_value SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB true
+              require_value SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN 0
+              require_value SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN 0
+              require_value SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN 0.0
+              require_value SOCCER_LEARNING_ANALYTIC_OPPONENT true
+              require_value SOCCER_LEAGUE_ANALYTIC_OPPONENTS true
+              require_value SOCCER_ANCHOR_PROMOTION_GATE_ENABLED true
+              require_value SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_NON_REGRESSION true
+              require_value SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_GAMES 4
+              require_value SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION 0.0
+              require_value DD_SOCCER_ENABLE_LEARNED_EPV true
 
               echo "continuous_started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
               echo "postgres_required=${SOCCER_REQUIRE_POSTGRES}"
@@ -110,6 +185,56 @@ spec:
               echo "completed_batch_games=${SOCCER_POSTGRES_COMPLETED_RUN_BATCH_GAMES}"
               echo "flush_before_new_sim=${SOCCER_POSTGRES_FLUSH_POLICY_VERSIONS_BEFORE_NEW_SIM}"
               echo "refresh_with_resume=${SOCCER_POSTGRES_REFRESH_WITH_RESUME_ARTIFACT}"
+              echo "learned_mpc_objective=${DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE}"
+              echo "chance_quality_reward=${DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD}"
+              echo "learned_pass_receiver=${DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER}"
+              echo "neural_pass_space=${DD_SOCCER_ENABLE_NEURAL_PASS_SPACE}"
+              echo "discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK}"
+              echo "scored_shot_placement=${DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT}"
+              echo "target_standardization=${DD_SOCCER_ENABLE_TARGET_STANDARDIZATION}"
+              echo "dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP}"
+              echo "dp_critic_target=${DD_SOCCER_ENABLE_DP_CRITIC_TARGET}"
+              echo "dp_bootstrap_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON}"
+              echo "dp_bootstrap_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS}"
+              echo "approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES}"
+              echo "approx_dp_policy_prior_weight=${SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT}"
+              echo "mc_critic_target=${DD_SOCCER_ENABLE_MC_CRITIC_TARGET}"
+              echo "neural_self_bootstrap=${DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP}"
+              echo "maxa_bootstrap=${DD_SOCCER_ENABLE_MAXA_BOOTSTRAP}"
+              echo "novelty_bonus=${DD_SOCCER_ENABLE_NOVELTY_BONUS}"
+              echo "specialist_curriculum=${DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM}"
+              echo "forward_pass_climb_curriculum=${DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM}"
+              echo "deferred_pass_credit=${DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT}"
+              echo "quick_forward_release_reward_scale=${DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE}"
+              echo "neural_target_scale=${SOCCER_NEURAL_TARGET_SCALE}"
+              echo "neural_target_clip=${SOCCER_NEURAL_TARGET_CLIP}"
+              echo "neural_target_popart=${SOCCER_NEURAL_TARGET_POPART}"
+              echo "actor_critic=${SOCCER_NEURAL_ACTOR_CRITIC}"
+              echo "actor_critic_legacy=${SOCCER_ENABLE_ACTOR_CRITIC}"
+              echo "lp_coupling=${SOCCER_NEURAL_LP_COUPLING_ENABLED}"
+              echo "neural_mcts=${SOCCER_NEURAL_MCTS_ENABLED}"
+              echo "neural_mcts_candidates=${SOCCER_NEURAL_MCTS_CANDIDATES}"
+              echo "neural_mcts_pass_target_candidates=${SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES}"
+              echo "keeper_policy_head=${DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD}"
+              echo "skill_policy_heads=${DD_SOCCER_ENABLE_SKILL_POLICY_HEADS}"
+              echo "forward_pass_reward_scale=${DD_SOCCER_FORWARD_PASS_REWARD_SCALE}"
+              echo "shot_shaping_reward_scale=${DD_SOCCER_SHOT_SHAPING_REWARD_SCALE}"
+              echo "eval_forward_pass_climb=${SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB}"
+              echo "eval_forward_pass_margin=${SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN}"
+              echo "eval_net_forward_pass_margin=${SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN}"
+              echo "eval_forward_pass_rate_margin=${SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN}"
+              echo "population_forward_pass_climb=${SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB}"
+              echo "population_forward_pass_margin=${SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN}"
+              echo "population_net_forward_pass_margin=${SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN}"
+              echo "population_forward_pass_rate_margin=${SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN}"
+              echo "learning_analytic_opponent=${SOCCER_LEARNING_ANALYTIC_OPPONENT}"
+              echo "league_analytic_opponents=${SOCCER_LEAGUE_ANALYTIC_OPPONENTS}"
+              echo "anchor_promotion_gate=${SOCCER_ANCHOR_PROMOTION_GATE_ENABLED}"
+              echo "anchor_analytic_non_regression=${SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_NON_REGRESSION}"
+              echo "anchor_analytic_games=${SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_GAMES}"
+              echo "anchor_analytic_max_goal_diff_regression=${SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION}"
+              echo "learned_epv=${DD_SOCCER_ENABLE_LEARNED_EPV}"
+              echo "learned_epv_grid_path=${DD_SOCCER_LEARNED_EPV_GRID_PATH:-unset}"
               echo "source_ref=${source_ref}"
               echo "engine_ref=${engine_ref}"
 
@@ -127,6 +252,31 @@ spec:
                 # shellcheck disable=SC1091
                 source scripts/all-gates-on.sh
               fi
+              # The deferred-credit climb lineage is not a blind all-gates run: keep the
+              # confirmed target window and non-discretized kick interface after the helper.
+              export DD_SOCCER_ENABLE_DISCRETIZED_KICK=false
+              export DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD=true
+              export DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM=true
+              export DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD=true
+              export DD_SOCCER_ENABLE_SKILL_POLICY_HEADS=true
+              export SOCCER_NEURAL_TARGET_SCALE=30
+              export SOCCER_NEURAL_TARGET_CLIP=15
+              export SOCCER_NEURAL_TARGET_POPART=true
+              export DD_SOCCER_ENABLE_DP_BOOTSTRAP=true
+              export DD_SOCCER_ENABLE_DP_CRITIC_TARGET=true
+              export DD_SOCCER_DP_BOOTSTRAP_HORIZON=64
+              export DD_SOCCER_DP_BOOTSTRAP_SWEEPS=200
+              export SOCCER_APPROX_DP_REPLAY_PASSES=8
+              export SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT=0.5
+              # Move 1a: learned EPV potential — swap the hand-built xT seed inside the
+              # PBRS territorial reward with a fitted-from-outcomes EPV grid. The grid is
+              # committed to scripts/epv_grid.json and copied to a stable path here.
+              export DD_SOCCER_ENABLE_LEARNED_EPV=true
+              if [ -f scripts/epv_grid.json ]; then
+                cp scripts/epv_grid.json /tmp/epv_grid.json
+                export DD_SOCCER_LEARNED_EPV_GRID_PATH=/tmp/epv_grid.json
+              fi
+              echo "deferred_credit_stack_final discretized_kick=${DD_SOCCER_ENABLE_DISCRETIZED_KICK} chance_quality_reward=${DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD} specialist_curriculum=${DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM} keeper_policy_head=${DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD} skill_policy_heads=${DD_SOCCER_ENABLE_SKILL_POLICY_HEADS} target_scale=${SOCCER_NEURAL_TARGET_SCALE} target_clip=${SOCCER_NEURAL_TARGET_CLIP} target_popart=${SOCCER_NEURAL_TARGET_POPART} dp_bootstrap=${DD_SOCCER_ENABLE_DP_BOOTSTRAP} dp_critic_target=${DD_SOCCER_ENABLE_DP_CRITIC_TARGET} dp_horizon=${DD_SOCCER_DP_BOOTSTRAP_HORIZON} dp_sweeps=${DD_SOCCER_DP_BOOTSTRAP_SWEEPS} approx_dp_replay_passes=${SOCCER_APPROX_DP_REPLAY_PASSES} approx_dp_policy_prior_weight=${SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT} learned_epv=${DD_SOCCER_ENABLE_LEARNED_EPV}"
               actual_commit="$(git rev-parse HEAD)"
               engine_commit="$(git -C "${engine}" rev-parse HEAD)"
               echo "source_commit_actual=${actual_commit}"
@@ -180,11 +330,8 @@ spec:
               value: http://dd-soccer-otel-collector.default.svc.cluster.local:4318/v1/traces
             - name: SOCCER_SOURCE_REPO
               value: https://github.com/ORESoftware/soccer-sim-game-engine.rs.git
-            # Dedicated branch for the all-gates-on lineage so it builds the
-            # source that contains scripts/all-gates-on.sh + this session's new gates,
-            # WITHOUT disturbing the `learning` branch the gen-372 deployment builds from.
             - name: SOCCER_SOURCE_REF
-              value: learning-all-gates-on
+              value: learning
             - name: SOCCER_ENGINE_SOURCE_REPO
               value: https://github.com/ORESoftware/discrete-event-system.rs.git
             - name: SOCCER_ENGINE_SOURCE_REF
@@ -204,47 +351,110 @@ spec:
               value: "2026"
             - name: SOCCER_SEED_STRIDE
               value: "1000"
-            # Fresh lineage: all-gates-on trains its OWN slug so it does not clobber
-            # the gen-372 `soccer-self-play-k8s-overnight` weights (the encoding/reward
-            # gates change feature & objective semantics — incompatible to resume).
             - name: SOCCER_EXPERIMENT_SLUG
-              value: soccer-all-gates-on
+              value: soccer-self-play-k8s-overnight
             - name: SOCCER_EXPERIMENT_NAME
-              value: Soccer all-gates-on kitchen-sink learning lineage
+              value: Soccer self-play k8s overnight evolutionary learning
             - name: SOCCER_GAMES
-              value: "100"
+              value: "8"
+            # Each cycle is a fresh process.  Without an explicit full-match profile the
+            # episode-local curriculum counter restarts at zero every cycle, so the
+            # continuous 11v11 learner repeatedly trains the opening skill drill instead
+            # of the 22-player match used by promotion and live evaluation.
+            - name: SOCCER_BATCH_CURRICULUM_BALL_SKILLS_AFTER_GAMES
+              value: "0"
+            - name: SOCCER_BATCH_CURRICULUM_DUELS_AFTER_GAMES
+              value: "0"
+            - name: SOCCER_BATCH_CURRICULUM_SMALL_SIDED_AFTER_GAMES
+              value: "0"
+            - name: SOCCER_BATCH_CURRICULUM_TEAM_SHAPE_AFTER_GAMES
+              value: "0"
+            - name: SOCCER_BATCH_CURRICULUM_FULL_MATCH_AFTER_GAMES
+              value: "0"
+            - name: SOCCER_CYCLE_SLEEP_SECONDS
+              value: "1"
             - name: SOCCER_PARALLEL_GAMES
               value: "1"
             - name: SOCCER_HALVES
               value: "2"
             - name: SOCCER_HALF_MINUTES
-              value: "45"
+              value: "6"
             - name: SOCCER_MINUTES
-              value: "90"
+              value: "12"
             - name: SOCCER_PERIOD_BREAK_RECOVERY_SECONDS
               value: "900"
             - name: SOCCER_DT_SECONDS
               value: "0.2"
             - name: SOCCER_LEARNING_INTERVAL_TICKS
-              value: "4"
+              value: "1"
             - name: SOCCER_NEURAL_LEARNING_ENABLED
               value: "true"
             - name: SOCCER_NEURAL_LEARNING_BACKEND
               value: threaded
+            - name: SOCCER_NEURAL_LEARNING_RATE
+              value: "0.0003"
+            - name: SOCCER_NEURAL_HIDDEN_UNITS
+              value: "128"
+            - name: SOCCER_NEURAL_BLEND_MODE
+              value: authoritative
+            - name: SOCCER_NEURAL_BLEND_LAMBDA
+              value: "8"
+            - name: SOCCER_NEURAL_BLEND_WARMUP_STEPS
+              value: "0"
+            - name: SOCCER_MARL_ALGORITHM
+              value: mappo
+            - name: SOCCER_MAPPO_TEAM_REWARD_SHARE
+              value: "0.6"
+            - name: SOCCER_MARL_TEAM_REWARD_WEIGHT
+              value: "0.55"
+            - name: SOCCER_LEARNING_MPC_ENABLED
+              value: "true"
+            - name: SOCCER_LEARNING_MPC_FIELD_AWARE_ENABLED
+              value: "true"
+            - name: SOCCER_LEARNING_MPC_RECONCILE_ENABLED
+              value: "true"
+            - name: SOCCER_LEARNING_MPC_LATENT_OBJECTIVE_ENABLED
+              value: "true"
+            - name: SOCCER_LEARNING_MPC_PLAYER_HORIZON
+              value: "30"
             - name: SOCCER_NEURAL_BATCH_SIZE
-              value: "32"
+              value: "64"
             - name: SOCCER_NEURAL_TRAIN_EVERY_TICKS
               value: "1"
             - name: SOCCER_NEURAL_MAX_BATCHES_PER_TICK
-              value: "2"
+              value: "6"
             - name: SOCCER_NEURAL_REPLAY_CAPACITY
-              value: "2048"
+              value: "8192"
             - name: SOCCER_NEURAL_REPLAY_SAMPLES_PER_TICK
-              value: "32"
+              value: "128"
             - name: SOCCER_NEURAL_MAX_PENDING_BATCHES
+              value: "128"
+            - name: SOCCER_NEURAL_TARGET_SCALE
+              value: "30"
+            - name: SOCCER_NEURAL_TARGET_CLIP
+              value: "15"
+            - name: SOCCER_NEURAL_TARGET_POPART
+              value: "true"
+            - name: DD_SOCCER_ENABLE_FIELD_VECTOR_V2
+              value: "true"
+            - name: DD_SOCCER_ENABLE_CENTRAL_CRITIC_V2
+              value: "true"
+            - name: SOCCER_POLICY_HIDDEN_UNITS
+              value: "128"
+            - name: DD_SOCCER_ENABLE_DP_BOOTSTRAP
+              value: "true"
+            - name: DD_SOCCER_ENABLE_DP_CRITIC_TARGET
+              value: "true"
+            - name: DD_SOCCER_DP_BOOTSTRAP_HORIZON
               value: "64"
+            - name: DD_SOCCER_DP_BOOTSTRAP_SWEEPS
+              value: "200"
+            - name: SOCCER_APPROX_DP_REPLAY_PASSES
+              value: "8"
+            - name: SOCCER_APPROX_DP_POLICY_PRIOR_WEIGHT
+              value: "0.5"
             - name: SOCCER_NEURAL_SNAPSHOT_EVERY_BATCHES
-              value: "16"
+              value: "8"
             - name: SOCCER_NEURAL_DRAIN_TIMEOUT_MS
               value: "60000"
             - name: SOCCER_POSTGRES_POLICY_VERSION_INTERVAL_GAMES
@@ -290,9 +500,9 @@ spec:
             - name: SOCCER_EVOLUTION_SEED_BASE
               value: "20260608"
             - name: SOCCER_MAX_POLICY_ENTRIES_PER_TEAM
-              value: "250000"
+              value: "120000"
             - name: SOCCER_MAX_POLICY_TARGET_ENTRIES_PER_TEAM
-              value: "250000"
+              value: "120000"
             - name: SOCCER_MIN_POLICY_VISITS
               value: "1"
             - name: SOCCER_GAME_ARTIFACT_MODE
@@ -327,6 +537,88 @@ spec:
               value: "true"
             - name: DD_SOCCER_ENABLE_LEARNED_SPACING_TARGET
               value: "true"
+            - name: DD_SOCCER_ENABLE_LEARNED_MPC_OBJECTIVE
+              value: "true"
+            - name: DD_SOCCER_ENABLE_CHANCE_QUALITY_REWARD
+              value: "true"
+            - name: DD_SOCCER_ENABLE_LEARNED_PASS_RECEIVER
+              value: "true"
+            - name: DD_SOCCER_ENABLE_NEURAL_PASS_SPACE
+              value: "true"
+            - name: DD_SOCCER_ENABLE_DISCRETIZED_KICK
+              value: "false"
+            - name: DD_SOCCER_ENABLE_SCORED_SHOT_PLACEMENT
+              value: "true"
+            - name: DD_SOCCER_ENABLE_TARGET_STANDARDIZATION
+              value: "true"
+            - name: DD_SOCCER_ENABLE_MC_CRITIC_TARGET
+              value: "true"
+            - name: DD_SOCCER_ENABLE_NEURAL_SELF_BOOTSTRAP
+              value: "true"
+            - name: DD_SOCCER_ENABLE_MAXA_BOOTSTRAP
+              value: "true"
+            - name: DD_SOCCER_ENABLE_NOVELTY_BONUS
+              value: "true"
+            - name: DD_SOCCER_ENABLE_SPECIALIST_CURRICULUM
+              value: "true"
+            - name: DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM
+              value: "true"
+            - name: DD_SOCCER_ENABLE_DEFERRED_PASS_CREDIT
+              value: "true"
+            - name: DD_SOCCER_QUICK_FORWARD_RELEASE_REWARD_SCALE
+              value: "1.0"
+            - name: SOCCER_NEURAL_ACTOR_CRITIC
+              value: "true"
+            - name: SOCCER_ENABLE_ACTOR_CRITIC
+              value: "true"
+            - name: SOCCER_NEURAL_LP_COUPLING_ENABLED
+              value: "true"
+            - name: SOCCER_NEURAL_MCTS_ENABLED
+              value: "false"
+            - name: SOCCER_NEURAL_MCTS_CANDIDATES
+              value: "8"
+            - name: SOCCER_NEURAL_MCTS_PASS_TARGET_CANDIDATES
+              value: "8"
+            - name: DD_SOCCER_ENABLE_KEEPER_POLICY_HEAD
+              value: "true"
+            - name: DD_SOCCER_ENABLE_SKILL_POLICY_HEADS
+              value: "true"
+            - name: DD_SOCCER_FORWARD_PASS_REWARD_SCALE
+              value: "6"
+            - name: DD_SOCCER_SHOT_SHAPING_REWARD_SCALE
+              value: "0.4"
+            - name: SOCCER_EVAL_REQUIRE_FORWARD_PASS_CLIMB
+              value: "true"
+            - name: SOCCER_EVAL_MIN_FORWARD_PASS_MARGIN
+              value: "0"
+            - name: SOCCER_EVAL_MIN_NET_FORWARD_PASS_MARGIN
+              value: "0"
+            - name: SOCCER_EVAL_MIN_FORWARD_PASS_RATE_MARGIN
+              value: "0.0"
+            - name: SOCCER_EVAL_MIN_PASS_GAIN_YARDS_MARGIN
+              value: "0"
+            - name: SOCCER_NEURAL_POPULATION_REQUIRE_FORWARD_PASS_CLIMB
+              value: "true"
+            - name: SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_MARGIN
+              value: "0"
+            - name: SOCCER_NEURAL_POPULATION_MIN_NET_FORWARD_PASS_MARGIN
+              value: "0"
+            - name: SOCCER_NEURAL_POPULATION_MIN_FORWARD_PASS_RATE_MARGIN
+              value: "0.0"
+            - name: SOCCER_LEARNING_ANALYTIC_OPPONENT
+              value: "true"
+            - name: SOCCER_LEAGUE_ANALYTIC_OPPONENTS
+              value: "true"
+            - name: SOCCER_ANCHOR_PROMOTION_GATE_ENABLED
+              value: "true"
+            - name: SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_NON_REGRESSION
+              value: "true"
+            - name: SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_GAMES
+              value: "4"
+            - name: SOCCER_ANCHOR_PROMOTION_GATE_ANALYTIC_MAX_GOAL_DIFF_REGRESSION
+              value: "0.0"
+            - name: DD_SOCCER_ENABLE_LEARNED_EPV
+              value: "true"
             - name: SOCCER_PG_PASS_COMPLETION_SAMPLE_LIMIT
               value: "50000"
             - name: SOCCER_PG_PASS_COMPLETION_EPOCHS
@@ -355,7 +647,7 @@ spec:
               command:
                 - /bin/bash
                 - -lc
-                - 'test -f "/tmp/codex-soccer-learning-overnight-ready-${HOSTNAME:-pod}"'
+                - 'test -f "/tmp/${SOCCER_RUN_ID_PREFIX:-codex-soccer-learning-continuous}-ready-${HOSTNAME:-pod}"'
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 90

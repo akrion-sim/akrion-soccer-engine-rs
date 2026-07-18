@@ -14,17 +14,40 @@ const STEAL_RISK_BAD_OUTLET_ESCAPE_LIFT: f64 = 0.82;
 // so keep both.
 const STEAL_RISK_BAD_OUTLET_PANIC_PASS_DAMP_STRENGTH: f64 = 16.80;
 const STEAL_RISK_BAD_OUTLET_PANIC_PASS_MIN_MULTIPLIER: f64 = 0.045;
+const BAD_OUTLET_ESCAPE_PANIC_CAP_MAX_RATIO: f64 = 0.68;
+const LOW_COMPLETION_PASS_CARRY_FALLBACK_MAX_COMPLETION: f64 = 0.34;
+const LOW_COMPLETION_PASS_CARRY_FALLBACK_MIN_CARRY_SCORE: f64 = 4.0;
+const LOW_COMPLETION_PASS_CARRY_FALLBACK_MIN_FORWARD_SPACE_YARDS: f64 = 6.0;
+const LOW_COMPLETION_PASS_CARRY_FALLBACK_MIN_SCORE_RATIO: f64 = 1.15;
 // Turning your body to SHIELD a pinned ball needs no dribbling skill, so under genuine steal
 // pressure with no good outlet the protect-ball score gets a floor INDEPENDENT of the
 // (pressure-damped) dribble base — otherwise the one correct action collapses with the
 // carrier's dribble score and loses to a release-urgency-lifted panic pass into traffic.
 const PINNED_SHIELD_FLOOR_LIFT: f64 = 1.20;
+const LEARNED_POLICY_OPTION_SAFETY_MIN_BEST_SCORE: f64 = 4.0;
+const LEARNED_POLICY_OPTION_SAFETY_MIN_MARGIN: f64 = 3.0;
+const LEARNED_POLICY_OPTION_SAFETY_MIN_RATIO: f64 = 0.50;
+const FLOOR_TO_AERIAL_PROMOTION_MAX_FLOOR_COMPLETION: f64 = 0.42;
+const FLOOR_TO_AERIAL_PROMOTION_MIN_AERIAL_COMPLETION: f64 = 0.58;
+const FLOOR_TO_AERIAL_PROMOTION_MIN_COMPLETION_EDGE: f64 = 0.22;
+const FLOOR_TO_AERIAL_PROMOTION_MAX_INTERCEPTION_RISK: f64 = 0.56;
+const FLOOR_TO_AERIAL_PROMOTION_MIN_FORWARD_YARDS: f64 = 5.5;
+const FLOOR_TO_AERIAL_PROMOTION_LONG_FORWARD_YARDS: f64 = 18.0;
+const FLOOR_TO_AERIAL_PROMOTION_MIN_STRESS: f64 = 0.50;
+const OPTION_SCORE_AERIAL_REPLACEMENT_MAX_FLOOR_COMPLETION: f64 = 0.30;
+const OPTION_SCORE_AERIAL_REPLACEMENT_MIN_AERIAL_COMPLETION: f64 = 0.62;
+const OPTION_SCORE_AERIAL_REPLACEMENT_MIN_COMPLETION_EDGE: f64 = 0.32;
+const OPTION_SCORE_AERIAL_REPLACEMENT_MAX_INTERCEPTION_RISK: f64 = 0.42;
+const OPTION_SCORE_AERIAL_REPLACEMENT_MIN_FORWARD_YARDS: f64 = 8.0;
+const OPTION_SCORE_AERIAL_REPLACEMENT_MIN_STRESS: f64 = 0.50;
 // First-touch escape (selector side): a pressed receiver with a real, DEFENDER-AWARE lateral lane
 // (observation `pressured_escape_lane_yards`, not pitch-edge room) should break contact with the
 // dedicated evade rather than dwell on a static shield. A full lane is this many yards.
 const FIRST_TOUCH_ESCAPE_LANE_MIN_YARDS: f64 = 4.0;
 const FIRST_TIME_PASS_MIN_FIELD_FEASIBILITY: f64 = 0.26;
 const FIRST_TIME_PASS_LOW_FIT_CONTROL_LIFT: f64 = 0.18;
+const FIRST_TOUCH_COMPLETION_GUARD_MIN_SAFE_FLOOR_COMPLETION: f64 = 0.48;
+const FIRST_TOUCH_COMPLETION_GUARD_OPENNESS_SLACK: f64 = 0.12;
 // Floor lift for the side-step escape (analogue of PINNED_SHIELD_FLOOR_LIFT): sized so a strong
 // fresh-receipt-escape signal floors the evade above the pinned no-outlet shield.
 const FIRST_TOUCH_ESCAPE_SIDE_STEP_FLOOR_LIFT: f64 = 2.7;
@@ -41,6 +64,19 @@ fn dd_soccer_disable_first_touch_escape() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_FIRST_TOUCH_ESCAPE").is_ok())
 }
+
+fn dd_soccer_enable_neural_pass_space() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE"))
+    }
+}
 /// Gate (default-ON) for the crowded won-ball escape floor: a player who has just won possession in
 /// traffic gets a probability floor on the break-into-space action family so it accelerates AWAY
 /// from the nearest presser into the open lane instead of settling into a shield/recycle. Set
@@ -49,6 +85,197 @@ fn dd_soccer_disable_won_ball_pressure_escape() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_WON_BALL_PRESSURE_ESCAPE").is_ok())
+}
+/// Gate (default-OFF) for the **graded, overridable formation nudge**. Off-ball, the formation-LP
+/// shape target currently REPLACES a player's own POMDP/learned destination outright at the
+/// support-/defend-shape chokepoints. With this on, the LP target instead becomes a *bounded nudge*
+/// whose weight falls as the player's own decision confidence rises — so a convinced internal read
+/// overrides the shape signal (the "formation is a signal, internals can override" contract). Off ⇒
+/// the LP target is used directly, byte-identical to the prior authoritative behaviour.
+fn graded_formation_nudge_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_GRADED_FORMATION_NUDGE").is_ok())
+}
+fn formation_nudge_env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+/// Nudge weight at ZERO conviction — the most the LP can pull a fully-unsure player toward its shape
+/// target; scaled by `(1 - decision_confidence)`. Env-override `DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT`.
+fn formation_nudge_base_weight() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_BASE_WEIGHT", 0.6).clamp(0.0, 1.0)
+    })
+}
+/// Hard cap (yards) on how far the nudge may displace a player from their own chosen destination —
+/// keeps it a nudge, never a yank, however far the LP target sits. Env `DD_SOCCER_FORMATION_NUDGE_MAX_YARDS`.
+fn formation_nudge_max_yards() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| formation_nudge_env_f64("DD_SOCCER_FORMATION_NUDGE_MAX_YARDS", 6.0).max(0.0))
+}
+/// Pure blend core: move the player's OWN destination `own` toward the formation-LP shape target
+/// `lp` by `base_weight · (1 - conviction)`, capped to `max_yards`. Conviction 1 ⇒ no pull (internal
+/// override); conviction 0 ⇒ full base pull, still bounded. Factored out for hermetic unit testing.
+fn formation_nudge_blend(
+    decision_confidence: f64,
+    own: Vec2,
+    lp: Vec2,
+    base_weight: f64,
+    max_yards: f64,
+) -> Vec2 {
+    let conviction = decision_confidence.clamp(0.0, 1.0);
+    let weight = (base_weight * (1.0 - conviction)).clamp(0.0, 1.0);
+    own + limit_vec2_len((lp - own) * weight, max_yards.max(0.0))
+}
+/// Gated wrapper: the graded formation nudge as consumed at the live off-ball chokepoints. Callers
+/// pass the LP shape target as `lp`, so when the gate is off this returns `lp` unchanged and the
+/// path is byte-identical to the prior authoritative behaviour.
+fn formation_nudged_target(decision_confidence: f64, own: Vec2, lp: Vec2) -> Vec2 {
+    if !graded_formation_nudge_enabled() {
+        return lp;
+    }
+    formation_nudge_blend(
+        decision_confidence,
+        own,
+        lp,
+        formation_nudge_base_weight(),
+        formation_nudge_max_yards(),
+    )
+}
+fn learned_policy_option_score_safety_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| gate_default_on("DD_SOCCER_ENABLE_LEARNED_POLICY_OPTION_SCORE_SAFETY"))
+}
+fn learned_policy_option_score_safety_env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(default)
+}
+fn learned_policy_option_score_safety_min_best_score() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        learned_policy_option_score_safety_env_f64(
+            "SOCCER_LEARNED_POLICY_OPTION_SAFETY_MIN_BEST_SCORE",
+            LEARNED_POLICY_OPTION_SAFETY_MIN_BEST_SCORE,
+        )
+        .clamp(0.0, 200.0)
+    })
+}
+fn learned_policy_option_score_safety_min_margin() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        learned_policy_option_score_safety_env_f64(
+            "SOCCER_LEARNED_POLICY_OPTION_SAFETY_MIN_MARGIN",
+            LEARNED_POLICY_OPTION_SAFETY_MIN_MARGIN,
+        )
+        .clamp(0.0, 200.0)
+    })
+}
+fn learned_policy_option_score_safety_min_ratio() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        learned_policy_option_score_safety_env_f64(
+            "SOCCER_LEARNED_POLICY_OPTION_SAFETY_MIN_RATIO",
+            LEARNED_POLICY_OPTION_SAFETY_MIN_RATIO,
+        )
+        .clamp(0.0, 1.0)
+    })
+}
+fn learned_policy_option_score_safety_trips_with_thresholds(
+    chosen_score: f64,
+    best_score: f64,
+    min_best_score: f64,
+    min_margin: f64,
+    min_ratio: f64,
+) -> bool {
+    let chosen_score = soccer_finite_nonnegative_metric(chosen_score);
+    let best_score = soccer_finite_nonnegative_metric(best_score);
+    best_score >= min_best_score.max(0.0)
+        && best_score - chosen_score >= min_margin.max(0.0)
+        && chosen_score < best_score * min_ratio.clamp(0.0, 1.0)
+}
+fn learned_policy_option_score_safety_trips(chosen_score: f64, best_score: f64) -> bool {
+    learned_policy_option_score_safety_trips_with_thresholds(
+        chosen_score,
+        best_score,
+        learned_policy_option_score_safety_min_best_score(),
+        learned_policy_option_score_safety_min_margin(),
+        learned_policy_option_score_safety_min_ratio(),
+    )
+}
+fn learned_policy_option_score_safety_rejected_execution_probability(
+    chosen_score: f64,
+    best_score: f64,
+) -> f64 {
+    let chosen_score = soccer_finite_nonnegative_metric(chosen_score);
+    let best_score = soccer_finite_nonnegative_metric(best_score);
+    if best_score <= f64::EPSILON {
+        return 0.0;
+    }
+    (chosen_score / best_score).clamp(0.0, 1.0)
+}
+fn learned_policy_option_score_safety_replan_trace(
+    original_label: &str,
+    replacement_label: &str,
+    rejected_execution_probability: f64,
+    action_options: &[AgentActionOptionTrace],
+) -> Option<SoccerLearnedMpcReplanTrace> {
+    let original_action = learned_mpc_action_label_key(original_label);
+    let replacement_action = learned_mpc_action_label_key(replacement_label);
+    if original_action == replacement_action {
+        return None;
+    }
+    Some(SoccerLearnedMpcReplanTrace {
+        original_action,
+        replacement_action,
+        source: SoccerLearnedMpcReplanSource::OptionScoreSafety,
+        rejected_execution_probability: rejected_execution_probability.clamp(0.0, 1.0),
+        candidate_count: action_options.iter().filter(|option| option.legal).count(),
+    })
+}
+fn suppress_mpc_reselected_action_option(
+    options: &mut [AgentActionOptionTrace],
+    candidate_label: &str,
+) {
+    for option in options {
+        if option.legal && mpc_reselect_rejects_option_label(&option.label, candidate_label) {
+            option.legal = false;
+            option.score = 0.0;
+            option.probability = 0.0;
+            option.tick_probability = 0.0;
+        }
+    }
+}
+fn mpc_reselect_rejection_label_key(label: &str) -> String {
+    let trimmed = label.trim();
+    if let Some((base, _)) = learned_discretized_kick_suffix_parts(trimmed) {
+        if ranked_pass_action_label(base) {
+            return base.to_string();
+        }
+    }
+    learned_mpc_action_label_key(trimmed)
+}
+fn mpc_reselect_rejects_option_label(option_label: &str, rejected_label: &str) -> bool {
+    let rejected_key = mpc_reselect_rejection_label_key(rejected_label);
+    if ranked_pass_action_label(&rejected_key) {
+        return mpc_reselect_rejection_label_key(option_label) == rejected_key;
+    }
+    let rejected_family = normalize_soccer_action_label(rejected_label);
+    normalize_soccer_action_label(option_label) == rejected_family
+        || learned_mpc_action_labels_match(option_label, rejected_label)
 }
 const COMMITTED_LOOSE_BALL_SPRINT_MAX_DISTANCE_YARDS: f64 = 18.0;
 const COMMITTED_LOOSE_BALL_SPRINT_BALL_SPEED_YPS: f64 = 1.15;
@@ -120,6 +347,50 @@ struct RoundGoalkeeperDribblePlan {
     touch: DribbleTouchDecision,
     score: f64,
     sprint: bool,
+}
+
+pub(crate) fn possession_ranked_pass_target_for(
+    rank: usize,
+    pass_targets: &[usize],
+    strategic_pass_targets: &[usize],
+    quick_forward_pass_target: Option<usize>,
+) -> Option<usize> {
+    let ranked_target = *pass_targets.get(rank)?;
+    if rank == 0 {
+        if let Some(target) =
+            quick_forward_pass_target.filter(|id| strategic_pass_targets.contains(id))
+        {
+            return Some(target);
+        }
+    }
+    Some(ranked_target)
+}
+
+pub(crate) fn possession_curriculum_forward_pass_target_for(
+    snapshot: &WorldSnapshot,
+    passer_id: usize,
+    strategic_pass_targets: &[usize],
+) -> Option<usize> {
+    let passer = snapshot.players.get(passer_id)?;
+    let mut best: Option<(usize, f64)> = None;
+    for target_id in strategic_pass_targets.iter().copied() {
+        let Some(receiver) = snapshot.players.get(target_id) else {
+            continue;
+        };
+        if receiver.team != passer.team {
+            continue;
+        }
+        let delta = receiver.position - passer.position;
+        let forward_yards = delta.y * passer.team.attack_dir();
+        if forward_yards < COMPLETED_FORWARD_PASS_COUNT_MIN_YARDS {
+            continue;
+        }
+        let score = forward_yards - delta.x.abs() * 0.08;
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((target_id, score));
+        }
+    }
+    best.map(|(target_id, _)| target_id)
 }
 
 fn open_pass_lane_touch_for_target(
@@ -618,6 +889,37 @@ struct ShirtAccent {
 }
 
 impl SkillProfile {
+    /// Multiply the performance attributes by `factor` (clamped to the 1-10 skill scale),
+    /// leaving physical constants (height/weight) and behavioural fields untouched. Used for an
+    /// asymmetric TEAM HANDICAP: a factor < 1 makes that side genuinely weaker, so the learner
+    /// must find superior tactics to still win — a curriculum pressure to escape the parity
+    /// plateau, rather than more of the same self-play against an equal analytic engine.
+    pub(crate) fn handicap_scaled(mut self, factor: f64) -> Self {
+        if !factor.is_finite() || (factor - 1.0).abs() <= f64::EPSILON {
+            return self;
+        }
+        let s = |x: f64| (x * factor).clamp(1.0, 10.0);
+        self.top_speed = s(self.top_speed);
+        self.acceleration = s(self.acceleration);
+        self.strength = s(self.strength);
+        self.shooting = s(self.shooting);
+        self.right_foot_shot_power = s(self.right_foot_shot_power);
+        self.left_foot_shot_power = s(self.left_foot_shot_power);
+        self.passing = s(self.passing);
+        self.passing_completion_rate = s(self.passing_completion_rate);
+        self.flair_passing = s(self.flair_passing);
+        self.crossing_left = s(self.crossing_left);
+        self.crossing_right = s(self.crossing_right);
+        self.dribbling = s(self.dribbling);
+        self.first_touch = s(self.first_touch);
+        self.defending = s(self.defending);
+        self.goalkeeping = s(self.goalkeeping);
+        self.defensive_tracking = s(self.defensive_tracking);
+        self.stamina = s(self.stamina);
+        self.vision = s(self.vision);
+        self
+    }
+
     /// Balanced per-role attribute baseline (14-tuple): top_speed, acceleration,
     /// strength, height, shooting, passing, dribbling, first_touch, defending,
     /// stamina, vision, aggression, goalkeeping, defensive_tracking_base. Shared by
@@ -1042,6 +1344,10 @@ pub struct WallPassPlan {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocomotionCommitment {
+    /// Desired effort tier carried by the locomotion commitment. This is intentionally
+    /// separate from `PlayerAgent::movement_gait`, which is resolved from physical speed.
+    #[serde(default)]
+    pub committed_gait: MovementGait,
     /// Seconds the player has continuously held the current gait effort tier, summed
     /// per movement step from `dt`. Reset when the tier changes; gates downshifts.
     pub gait_held_seconds: f64,
@@ -1109,6 +1415,22 @@ pub struct PlayerAgent {
     /// `sustained_sprint_seconds` (reset together). See its note for the gating contract.
     #[serde(default)]
     pub sustained_sprint_distance_yards: f64,
+    /// Nested same-team-proximity dwell timers (seconds) for the GRACE window on the graduated
+    /// same-team separation penalty. Each accumulates while the nearest NON-EXEMPT teammate is
+    /// within the named radius and resets the instant the player is farther than that radius —
+    /// so they never reset when merely crossing into a TIGHTER band (the user's spec: time does
+    /// not reset moving inward). The graduated penalty only accrues once ANY timer passes its
+    /// band's grace: `< 7yd → 3s`, `< 6yd → 2s`, `< 5yd → 1s`. Because the bands nest
+    /// (`lt5 ≤ lt6 ≤ lt7`), a player who eases in slowly is caught by the 7yd/3s timer while one
+    /// who dives straight inside 5yd is caught by the 5yd/1s timer. Maintained only while the
+    /// separation floor is enabled; otherwise they stay 0 and are read by nothing, so the
+    /// simulation trajectory is byte-identical. Never gate a decision off these.
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt7_seconds: f64,
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt6_seconds: f64,
+    #[serde(default)]
+    pub same_team_proximity_dwell_lt5_seconds: f64,
     #[serde(default)]
     pub incoming_ball: Option<IncomingBallContext>,
     pub skills: SkillProfile,
@@ -1168,11 +1490,605 @@ fn soccer_pressured_contested_pass_damp_enabled() -> bool {
     *V.get_or_init(|| std::env::var("DD_SOCCER_DISABLE_PRESSURED_PASS_DAMP").is_err())
 }
 
+fn pass_completion_primary_score_weight() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DD_SOCCER_PASS_COMPLETION_SCORE_WEIGHT")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 3.0)
+    })
+}
+
+fn pass_completion_primary_multiplier(completion: f64, weight: f64) -> f64 {
+    if weight <= 1e-9 {
+        return 1.0;
+    }
+    let completion = completion.clamp(0.0, 1.0);
+    (1.0 + (completion - 0.72) * weight).clamp(0.25, 1.35)
+}
+
+fn floor_pass_label_rank(label: &str) -> Option<usize> {
+    let base = learned_discretized_kick_suffix_parts(label)
+        .map(|(base, _)| base)
+        .unwrap_or(label);
+    base.strip_prefix("pass")
+        .and_then(|rank| rank.parse::<usize>().ok())
+        .and_then(|rank| rank.checked_sub(1))
+}
+
+fn apply_pass_completion_primary_scores(
+    options: &mut [AgentActionOptionTrace],
+    observation: &SoccerPomdpObservation,
+) {
+    let weight = pass_completion_primary_score_weight();
+    if weight <= 1e-9 {
+        return;
+    }
+    let floor_multiplier =
+        pass_completion_primary_multiplier(observation.expected_pass_completion, weight);
+    let aerial_multiplier = pass_completion_primary_multiplier(
+        observation
+            .expected_aerial_pass_completion
+            .max(observation.expected_pass_completion * 0.72),
+        weight,
+    );
+    let killer_multiplier = pass_completion_primary_multiplier(
+        observation
+            .threaded_goal_pass_expected_completion
+            .max(observation.expected_pass_completion),
+        weight * 0.65,
+    );
+    for option in options.iter_mut().filter(|option| option.legal) {
+        let label = normalize_soccer_action_label(&option.label);
+        let multiplier = if label == "pass"
+            || matches!(
+                option.label.as_str(),
+                "recycle-reset" | "switch-play" | "surprise-pass" | "wall-pass"
+            ) {
+            floor_multiplier
+        } else if matches!(
+            option.label.as_str(),
+            "route-one" | "flank-high-cross" | "scoop-pass" | "flick-on"
+        ) {
+            aerial_multiplier
+        } else if matches!(option.label.as_str(), "killer-pass" | "flank-low-cross") {
+            killer_multiplier.max(floor_multiplier * 0.82)
+        } else {
+            continue;
+        };
+        option.score *= multiplier;
+    }
+}
+
+fn forward_pass_turnover_risk_gate_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_PASS_TURNOVER_RISK_GATE")
+    }
+    #[cfg(not(test))]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_PASS_TURNOVER_RISK_GATE")
+    }
+}
+
+fn severe_forward_pass_score_cap_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_SEVERE_FORWARD_PASS_SCORE_CAP")
+    }
+    #[cfg(not(test))]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_SEVERE_FORWARD_PASS_SCORE_CAP")
+    }
+}
+
+fn bad_outlet_escape_panic_cap_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_BAD_OUTLET_ESCAPE_PANIC_CAP")
+    }
+    #[cfg(not(test))]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_BAD_OUTLET_ESCAPE_PANIC_CAP")
+    }
+}
+
+fn low_completion_pass_carry_fallback_cap_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LOW_COMPLETION_PASS_CARRY_FALLBACK_CAP")
+    }
+    #[cfg(not(test))]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_LOW_COMPLETION_PASS_CARRY_FALLBACK_CAP")
+    }
+}
+
+fn first_touch_completion_guard_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FIRST_TOUCH_COMPLETION_GUARD")
+    }
+    #[cfg(not(test))]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FIRST_TOUCH_COMPLETION_GUARD")
+    }
+}
+
+fn pressured_hold_for_support_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_PRESSURED_HOLD_FOR_SUPPORT")
+    }
+    #[cfg(not(test))]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_PRESSURED_HOLD_FOR_SUPPORT")
+    }
+}
+
+pub(crate) fn first_touch_completion_guard_values(
+    enabled: bool,
+    pass_has_target: bool,
+    floor_completion: f64,
+    floor_openness: f64,
+) -> (f64, bool, f64) {
+    let floor_completion = floor_completion.clamp(0.0, 1.0);
+    let floor_openness = floor_openness.clamp(0.0, 1.0);
+    let guarded_quality = if enabled {
+        floor_completion
+            .max(floor_openness.min(floor_completion + FIRST_TOUCH_COMPLETION_GUARD_OPENNESS_SLACK))
+    } else {
+        floor_openness.max(floor_completion)
+    };
+    let safe_floor = !enabled
+        || floor_completion >= FIRST_TOUCH_COMPLETION_GUARD_MIN_SAFE_FLOOR_COMPLETION
+        || (floor_completion >= FIRST_TOUCH_COMPLETION_GUARD_MIN_SAFE_FLOOR_COMPLETION - 0.10
+            && floor_openness >= 0.88);
+    let score_multiplier = if enabled && pass_has_target {
+        let safe_fit = (floor_completion / FIRST_TOUCH_COMPLETION_GUARD_MIN_SAFE_FLOOR_COMPLETION)
+            .clamp(0.0, 1.0);
+        if safe_fit >= 1.0 {
+            1.0
+        } else {
+            (0.16 + safe_fit * 0.78).clamp(0.16, 0.94)
+        }
+    } else {
+        1.0
+    };
+    (guarded_quality, safe_floor, score_multiplier)
+}
+
+fn cap_bad_outlet_escape_panic_options(
+    options: &mut [AgentActionOptionTrace],
+    bad_outlet_pressure: f64,
+) {
+    if bad_outlet_pressure < 0.24 {
+        return;
+    }
+    let escape_score = action_option_score(options, "protect-ball")
+        .max(action_option_score(options, "side-step"))
+        .max(action_option_score(options, "carry-out-left"))
+        .max(action_option_score(options, "carry-out-right"))
+        .max(action_option_score(options, "left-cut"))
+        .max(action_option_score(options, "right-cut"));
+    if !escape_score.is_finite() || escape_score <= 0.0 {
+        return;
+    }
+    let cap_ratio = (BAD_OUTLET_ESCAPE_PANIC_CAP_MAX_RATIO - bad_outlet_pressure * 0.18)
+        .clamp(0.48, BAD_OUTLET_ESCAPE_PANIC_CAP_MAX_RATIO);
+    let panic_cap = soccer_finite_nonnegative_metric(escape_score * cap_ratio);
+    for label in [
+        "pass1",
+        "aerial-pass1",
+        "shoot",
+        "dribble",
+        "carry-forward",
+        "vertical-attack",
+        "turnover-burst",
+    ] {
+        if let Some(option) = options
+            .iter_mut()
+            .find(|option| option.legal && option.label == label)
+        {
+            option.score = soccer_finite_nonnegative_metric(option.score.min(panic_cap));
+        }
+    }
+}
+
+fn cap_low_completion_floor_passes_against_carry(
+    options: &mut [AgentActionOptionTrace],
+    observation: &SoccerPomdpObservation,
+) {
+    if !low_completion_pass_carry_fallback_cap_enabled() || !observation.has_ball {
+        return;
+    }
+    let completion = observation.expected_pass_completion.clamp(0.0, 1.0);
+    if completion > LOW_COMPLETION_PASS_CARRY_FALLBACK_MAX_COMPLETION {
+        return;
+    }
+    let carry_score = action_option_score(options, "carry-forward")
+        .max(action_option_score(options, "vertical-attack"));
+    if !carry_score.is_finite()
+        || carry_score < LOW_COMPLETION_PASS_CARRY_FALLBACK_MIN_CARRY_SCORE
+        || observation.forward_dribble_space_yards
+            < LOW_COMPLETION_PASS_CARRY_FALLBACK_MIN_FORWARD_SPACE_YARDS
+    {
+        return;
+    }
+    let pressure = observation
+        .perceived_pressure
+        .max(observation.pressure_urgency)
+        .max(observation.immediate_dispossession_risk)
+        .clamp(0.0, 1.0);
+    if observation.immediate_dispossession_risk >= 0.68
+        && observation.forward_dribble_space_yards < 12.0
+        && pressure >= 0.70
+    {
+        return;
+    }
+    let completion_deficit = ((LOW_COMPLETION_PASS_CARRY_FALLBACK_MAX_COMPLETION - completion)
+        / LOW_COMPLETION_PASS_CARRY_FALLBACK_MAX_COMPLETION)
+        .clamp(0.0, 1.0);
+    let cap_ratio = (0.86 - completion_deficit * 0.22 - pressure * 0.10).clamp(0.54, 0.82);
+    let carry_relative_cap = soccer_finite_nonnegative_metric(carry_score * cap_ratio);
+    let minimum_score_to_cap = carry_score * LOW_COMPLETION_PASS_CARRY_FALLBACK_MIN_SCORE_RATIO;
+
+    for option in options.iter_mut().filter(|option| option.legal) {
+        let normalized = normalize_soccer_action_label(&option.label);
+        let floor_pass_like = normalized == "pass"
+            || matches!(
+                option.label.as_str(),
+                "first-time-pass" | "surprise-pass" | "flank-low-cross"
+            );
+        if floor_pass_like && option.score > minimum_score_to_cap {
+            option.score = soccer_finite_nonnegative_metric(option.score.min(carry_relative_cap));
+        }
+    }
+}
+
+fn floor_to_aerial_pass_promotion_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FLOOR_TO_AERIAL_PASS_PROMOTION")
+    }
+    #[cfg(not(test))]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FLOOR_TO_AERIAL_PASS_PROMOTION")
+    }
+}
+
+fn option_score_aerial_replacement_enabled() -> bool {
+    #[cfg(test)]
+    {
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_OPTION_SCORE_AERIAL_REPLACEMENT")
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static V: OnceLock<bool> = OnceLock::new();
+        *V.get_or_init(|| {
+            soccer_env_flag_enabled("DD_SOCCER_ENABLE_OPTION_SCORE_AERIAL_REPLACEMENT")
+        })
+    }
+}
+
+fn floor_pass_should_promote_to_aerial(
+    observation: &SoccerPomdpObservation,
+    forward_yards: f64,
+) -> bool {
+    if !floor_to_aerial_pass_promotion_enabled() {
+        return false;
+    }
+    let floor_completion = observation.expected_pass_completion.clamp(0.0, 1.0);
+    let aerial_completion = observation.expected_aerial_pass_completion.clamp(0.0, 1.0);
+    let aerial_risk = observation.aerial_pass_interception_risk.clamp(0.0, 1.0);
+    let stress = observation
+        .perceived_pressure
+        .max(observation.pressure_urgency)
+        .max(observation.immediate_dispossession_risk)
+        .max(observation.excessive_hold_pressure)
+        .clamp(0.0, 1.0);
+
+    floor_completion <= FLOOR_TO_AERIAL_PROMOTION_MAX_FLOOR_COMPLETION
+        && aerial_completion >= FLOOR_TO_AERIAL_PROMOTION_MIN_AERIAL_COMPLETION
+        && aerial_completion >= floor_completion + FLOOR_TO_AERIAL_PROMOTION_MIN_COMPLETION_EDGE
+        && aerial_risk <= FLOOR_TO_AERIAL_PROMOTION_MAX_INTERCEPTION_RISK
+        && forward_yards >= FLOOR_TO_AERIAL_PROMOTION_MIN_FORWARD_YARDS
+        && (stress >= FLOOR_TO_AERIAL_PROMOTION_MIN_STRESS
+            || forward_yards >= FLOOR_TO_AERIAL_PROMOTION_LONG_FORWARD_YARDS)
+}
+
+fn option_score_replacement_should_promote_to_aerial(
+    observation: &SoccerPomdpObservation,
+    forward_yards: f64,
+) -> bool {
+    if !option_score_aerial_replacement_enabled() {
+        return false;
+    }
+    let floor_completion = observation.expected_pass_completion.clamp(0.0, 1.0);
+    let aerial_completion = observation.expected_aerial_pass_completion.clamp(0.0, 1.0);
+    let aerial_risk = observation.aerial_pass_interception_risk.clamp(0.0, 1.0);
+    let stress = observation
+        .perceived_pressure
+        .max(observation.pressure_urgency)
+        .max(observation.immediate_dispossession_risk)
+        .max(observation.excessive_hold_pressure)
+        .clamp(0.0, 1.0);
+
+    floor_completion <= OPTION_SCORE_AERIAL_REPLACEMENT_MAX_FLOOR_COMPLETION
+        && aerial_completion >= OPTION_SCORE_AERIAL_REPLACEMENT_MIN_AERIAL_COMPLETION
+        && aerial_completion
+            >= floor_completion + OPTION_SCORE_AERIAL_REPLACEMENT_MIN_COMPLETION_EDGE
+        && aerial_risk <= OPTION_SCORE_AERIAL_REPLACEMENT_MAX_INTERCEPTION_RISK
+        && forward_yards >= OPTION_SCORE_AERIAL_REPLACEMENT_MIN_FORWARD_YARDS
+        && stress >= OPTION_SCORE_AERIAL_REPLACEMENT_MIN_STRESS
+}
+
+fn forward_pass_turnover_risk_pressure(observation: &SoccerPomdpObservation) -> f64 {
+    observation
+        .immediate_dispossession_risk
+        .max(observation.perceived_pressure)
+        .max(observation.pressure_urgency)
+        .clamp(0.0, 1.0)
+}
+
+fn forward_pass_turnover_risk_multiplier(
+    completion: f64,
+    lane_risk: f64,
+    pressure: f64,
+    option_quality: f64,
+    min_multiplier: f64,
+) -> f64 {
+    let completion = completion.clamp(0.0, 1.0);
+    let lane_risk = lane_risk.clamp(0.0, 1.0);
+    let pressure = pressure.clamp(0.0, 1.0);
+    let option_quality = option_quality.clamp(0.0, 1.0);
+    if completion >= 0.70 && lane_risk <= 0.55 {
+        return 1.0;
+    }
+    let completion_deficit = ((0.64 - completion) / 0.64).clamp(0.0, 1.0);
+    let risk_fit = ((lane_risk.max(pressure * 0.82) - 0.30) / 0.52).clamp(0.0, 1.0);
+    let quality_gap = ((0.66 - option_quality) / 0.66).clamp(0.0, 1.0);
+    let strength =
+        (completion_deficit * 0.70 + risk_fit * 0.22 + quality_gap * 0.08).clamp(0.0, 1.0);
+    let extreme_low_completion = ((0.22 - completion) / 0.22).clamp(0.0, 1.0)
+        * ((lane_risk.max(pressure) - 0.45) / 0.35).clamp(0.0, 1.0);
+    let severe_clamp = (1.0 - extreme_low_completion * 0.70).clamp(0.24, 1.0);
+    ((1.0 - strength * (0.58 + risk_fit * 0.28)) * severe_clamp)
+        .clamp(min_multiplier.clamp(0.02, 1.0), 1.0)
+}
+
+fn forward_pass_turnover_risk_score_cap(
+    completion: f64,
+    lane_risk: f64,
+    pressure: f64,
+    option_quality: f64,
+    cap_min: f64,
+    cap_max: f64,
+) -> Option<f64> {
+    let completion = completion.clamp(0.0, 1.0);
+    let lane_risk = lane_risk.clamp(0.0, 1.0);
+    let pressure = pressure.clamp(0.0, 1.0);
+    let option_quality = option_quality.clamp(0.0, 1.0);
+    let risky = completion < 0.38 || (completion < 0.58 && lane_risk.max(pressure) >= 0.58);
+    if !risky {
+        return None;
+    }
+    let severe_risk = lane_risk.max(pressure);
+    if completion < 0.18 && severe_risk >= 0.48 {
+        let hard_cap = 0.30 + completion * 1.5 + option_quality * 0.15 + (1.0 - severe_risk) * 0.10;
+        return Some(hard_cap.clamp(0.28, cap_max.max(0.28)));
+    }
+    let pressure_relief = (1.0 - pressure.max(lane_risk)).clamp(0.0, 1.0);
+    let cap =
+        1.6 + completion * 22.0 + option_quality * 4.0 + pressure_relief * 3.0 - lane_risk * 2.2;
+    Some(cap.clamp(cap_min.max(0.1), cap_max.max(cap_min.max(0.1))))
+}
+
+fn severe_forward_pass_turnover_score_cap(
+    completion: f64,
+    lane_risk: f64,
+    pressure: f64,
+    option_quality: f64,
+    current_score: f64,
+    cap_min: f64,
+    cap_max: f64,
+) -> Option<f64> {
+    if !current_score.is_finite() || current_score <= 0.0 {
+        return None;
+    }
+    let completion = completion.clamp(0.0, 1.0);
+    let lane_risk = lane_risk.clamp(0.0, 1.0);
+    let pressure = pressure.clamp(0.0, 1.0);
+    let option_quality = option_quality.clamp(0.0, 1.0);
+    let severe_risk = lane_risk.max(pressure);
+
+    if completion <= 0.30 && severe_risk >= 0.55 {
+        let relief = (1.0 - severe_risk).clamp(0.0, 1.0);
+        let cap = 0.35 + completion * 3.0 + option_quality * 0.80 + relief * 1.0;
+        return Some(cap.clamp(cap_min.max(0.25), cap_max.min(4.8).max(cap_min.max(0.25))));
+    }
+
+    if current_score >= 24.0 && completion <= 0.52 && severe_risk >= 0.65 {
+        let relief = (1.0 - severe_risk).clamp(0.0, 1.0);
+        let cap = 4.5 + completion * 16.0 + option_quality * 2.2 + relief * 2.4 - lane_risk * 1.4;
+        return Some(cap.clamp(cap_min.max(2.5), cap_max.min(16.0).max(cap_min.max(2.5))));
+    }
+
+    None
+}
+
+fn apply_forward_pass_turnover_risk_gate(
+    options: &mut [AgentActionOptionTrace],
+    observation: &SoccerPomdpObservation,
+) {
+    let broad_gate = forward_pass_turnover_risk_gate_enabled();
+    let severe_score_cap = severe_forward_pass_score_cap_enabled();
+    if (!broad_gate && !severe_score_cap) || !observation.has_ball {
+        return;
+    }
+    let pressure = forward_pass_turnover_risk_pressure(observation);
+    let floor_completion = observation.expected_pass_completion.clamp(0.0, 1.0);
+    let aerial_completion = observation
+        .expected_aerial_pass_completion
+        .max(observation.expected_pass_completion * 0.62)
+        .clamp(0.0, 1.0);
+    let lane_risk = observation.aerial_pass_interception_risk.clamp(0.0, 1.0);
+    let forward_quality = observation
+        .best_forward_pass_option_quality
+        .max(observation.best_forward_pass_receiver_openness)
+        .max(observation.best_pass_receiver_openness * 0.78)
+        .clamp(0.0, 1.0);
+    let floor_multiplier = if broad_gate {
+        forward_pass_turnover_risk_multiplier(
+            floor_completion,
+            lane_risk,
+            pressure,
+            forward_quality,
+            0.10,
+        )
+    } else {
+        1.0
+    };
+    let aerial_quality = observation
+        .best_aerial_pass_receiver_openness
+        .max(forward_quality * 0.82);
+    let aerial_multiplier = if broad_gate {
+        forward_pass_turnover_risk_multiplier(
+            aerial_completion,
+            lane_risk,
+            pressure,
+            aerial_quality,
+            0.16,
+        )
+    } else {
+        1.0
+    };
+    let killer_completion = observation
+        .threaded_goal_pass_expected_completion
+        .max(floor_completion)
+        .max(aerial_completion * 0.72);
+    let killer_quality = observation
+        .threaded_goal_pass_reception_window_score
+        .max(observation.threaded_goal_pass_receiver_openness)
+        .max(observation.threaded_goal_pass_stride_fit)
+        .max(forward_quality * 0.86)
+        .clamp(0.0, 1.0);
+    let killer_multiplier = if broad_gate {
+        forward_pass_turnover_risk_multiplier(
+            killer_completion,
+            lane_risk,
+            pressure,
+            killer_quality,
+            0.12,
+        )
+    } else {
+        1.0
+    };
+    let floor_cap = if broad_gate {
+        forward_pass_turnover_risk_score_cap(
+            floor_completion,
+            lane_risk,
+            pressure,
+            forward_quality,
+            1.8,
+            22.0,
+        )
+    } else {
+        None
+    };
+    let aerial_cap = if broad_gate {
+        forward_pass_turnover_risk_score_cap(
+            aerial_completion,
+            lane_risk,
+            pressure,
+            aerial_quality,
+            1.6,
+            20.0,
+        )
+    } else {
+        None
+    };
+    let killer_cap = if broad_gate {
+        forward_pass_turnover_risk_score_cap(
+            killer_completion,
+            lane_risk,
+            pressure,
+            killer_quality,
+            2.0,
+            24.0,
+        )
+    } else {
+        None
+    };
+
+    for option in options.iter_mut().filter(|option| option.legal) {
+        let label = normalize_soccer_action_label(&option.label);
+        let (multiplier, base_cap, severe_cap) = if label == "pass"
+            || matches!(
+                option.label.as_str(),
+                "wall-pass" | "first-time-pass" | "surprise-pass" | "flank-low-cross"
+            ) {
+            let severe = severe_score_cap
+                .then(|| {
+                    severe_forward_pass_turnover_score_cap(
+                        floor_completion,
+                        lane_risk,
+                        pressure,
+                        forward_quality,
+                        option.score,
+                        0.6,
+                        14.0,
+                    )
+                })
+                .flatten();
+            (floor_multiplier, floor_cap, severe)
+        } else if label == "aerial-pass"
+            || matches!(
+                option.label.as_str(),
+                "route-one" | "flank-high-cross" | "scoop-pass" | "flick-on"
+            )
+        {
+            (aerial_multiplier, aerial_cap, None)
+        } else if option.label == "killer-pass" {
+            let severe = severe_score_cap
+                .then(|| {
+                    severe_forward_pass_turnover_score_cap(
+                        killer_completion,
+                        lane_risk,
+                        pressure,
+                        killer_quality,
+                        option.score,
+                        0.9,
+                        18.0,
+                    )
+                })
+                .flatten();
+            (killer_multiplier, killer_cap, severe)
+        } else {
+            continue;
+        };
+        let scaled = soccer_finite_nonnegative_metric(option.score * multiplier);
+        let cap = match (base_cap, severe_cap) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        option.score = cap.map_or(scaled, |cap| scaled.min(cap));
+    }
+}
+
 fn mpc_reselect_candidate_label(label: &str) -> bool {
     matches!(
         label,
         "shoot"
             | "wall-pass"
+            | "wall-return"
             | "corner-flag-cross"
             | "vertical-attack"
             | "vacate-space"
@@ -1208,12 +2124,30 @@ fn mpc_reselect_candidate_label(label: &str) -> bool {
             | "protect-ball"
             | "side-step"
             | "hold-up-flank"
+            | "wait-for-support"
+            | "check-to-ball"
             | "run-in-behind"
+            | "one-two-run"
+            | "exploit-space-run"
+            | "wide-outlet"
             | "shot-creation-run"
+            | "pinch-cross-arrival"
             | "overlap-run"
+            | "support-screen"
             | "support-push-up"
             | "support-roam"
             | "support-shape"
+            | "dummy-clear-lane"
+            | "dummy-let-run"
+            | "lane-yield"
+            | "set-play-run"
+            | "buildup-receive"
+            | "defend-shape"
+            | "defend-roam"
+            | "press-cover"
+            | "slide-tackle"
+            | "blindside-steal"
+            | ACTION_LABEL_RECOVER
     )
 }
 
@@ -1234,8 +2168,8 @@ fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
                 + ability01(player.skills.first_touch) * 0.34
                 + ability01(player.skills.passing_completion_rate) * 0.24
         }
-        "wall-pass" | "pass" | "pass1" | "first-time-pass" | "killer-pass" | "switch-play"
-        | "recycle-reset" | "aerial-pass" | "aerial-pass1" => {
+        "wall-pass" | "wall-return" | "pass" | "pass1" | "first-time-pass" | "killer-pass"
+        | "switch-play" | "recycle-reset" | "aerial-pass" | "aerial-pass1" => {
             ability01(player.skills.passing_completion_rate) * 0.56
                 + ability01(player.skills.vision) * 0.28
                 + ability01(player.skills.first_touch) * 0.16
@@ -1250,6 +2184,13 @@ fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
                 ) * 0.32
                 + ability01(player.skills.first_touch) * 0.26
         }
+        "tackle" | "slide-tackle" | "blindside-steal" | "defend-shape" | "defend-roam"
+        | "press-cover" => {
+            ability01(player.skills.defending) * 0.48
+                + ability01(player.skills.acceleration) * 0.22
+                + ability01(player.skills.strength) * 0.18
+                + ability01(player.skills.aggression) * 0.12
+        }
         _ => {
             ability01(player.skills.acceleration) * 0.42
                 + ability01(player.skills.top_speed) * 0.34
@@ -1262,21 +2203,33 @@ fn mpc_execution_skill_for_label(player: &PlayerAgent, label: &str) -> f64 {
 const SHORT_UPFIELD_GROUND_PASS_MIN_YARDS: f64 = 5.0;
 const SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS: f64 = 15.0;
 const SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS: f64 = 5.0;
+const SHORT_FORWARD_PASS_URGENCY_MIN_PLAYERS_AHEAD: usize = 3;
+const SHORT_FORWARD_PASS_URGENCY_MIN_OPTION_QUALITY: f64 = 0.38;
+const SHORT_FORWARD_PASS_URGENCY_MIN_RELEASE_FIT: f64 = 0.42;
+
+fn nearest_short_upfield_forward_yards(observation: &SoccerPomdpObservation) -> f64 {
+    let forward_yards = observation.nearest_forward_teammate_forward_yards;
+    if forward_yards.is_finite() && forward_yards > 0.0 {
+        forward_yards
+    } else {
+        observation.nearest_forward_teammate_distance_yards
+    }
+}
 
 fn short_upfield_ground_pass_fit(observation: &SoccerPomdpObservation) -> f64 {
     if observation.visible_forward_pass_options == 0 {
         return 0.0;
     }
-    let distance = observation.nearest_forward_teammate_distance_yards;
-    if !distance.is_finite() || distance <= 0.0 {
+    let forward_yards = nearest_short_upfield_forward_yards(observation);
+    if !forward_yards.is_finite() || forward_yards <= 0.0 {
         return 0.0;
     }
-    let distance_fit = if distance < SHORT_UPFIELD_GROUND_PASS_MIN_YARDS {
-        (distance / SHORT_UPFIELD_GROUND_PASS_MIN_YARDS).clamp(0.0, 1.0) * 0.82
-    } else if distance <= SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS {
+    let distance_fit = if forward_yards < SHORT_UPFIELD_GROUND_PASS_MIN_YARDS {
+        (forward_yards / SHORT_UPFIELD_GROUND_PASS_MIN_YARDS).clamp(0.0, 1.0) * 0.82
+    } else if forward_yards <= SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS {
         1.0
     } else {
-        (1.0 - (distance - SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS)
+        (1.0 - (forward_yards - SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS)
             / SHORT_UPFIELD_GROUND_PASS_TAPER_YARDS)
             .clamp(0.0, 1.0)
     };
@@ -1288,6 +2241,191 @@ fn short_upfield_ground_pass_fit(observation: &SoccerPomdpObservation) -> f64 {
         + observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.32)
         .clamp(0.0, 1.0);
     (distance_fit * (0.42 + outlet_fit * 0.58)).clamp(0.0, 1.0)
+}
+
+pub(crate) fn short_forward_pass_release_urgency(observation: &SoccerPomdpObservation) -> f64 {
+    if !observation.has_ball || observation.visible_forward_pass_options == 0 {
+        return 0.0;
+    }
+    let players_ahead = observation
+        .field_players_ahead
+        .max(observation.field_teammates_ahead)
+        .max(observation.teammates_ahead);
+    if players_ahead < SHORT_FORWARD_PASS_URGENCY_MIN_PLAYERS_AHEAD {
+        return 0.0;
+    }
+    let forward_yards = nearest_short_upfield_forward_yards(observation);
+    if !forward_yards.is_finite()
+        || forward_yards < SHORT_UPFIELD_GROUND_PASS_MIN_YARDS
+        || forward_yards > SHORT_UPFIELD_GROUND_PASS_IDEAL_MAX_YARDS
+    {
+        return 0.0;
+    }
+    let option_quality = observation
+        .best_forward_pass_option_quality
+        .max(observation.best_forward_pass_receiver_openness)
+        .max(observation.expected_pass_completion.clamp(0.0, 1.0) * 0.90)
+        .max(observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.84)
+        .clamp(0.0, 1.0);
+    if option_quality < SHORT_FORWARD_PASS_URGENCY_MIN_OPTION_QUALITY {
+        return 0.0;
+    }
+    let release_fit = short_upfield_ground_pass_fit(observation)
+        .max(observation.quick_forward_pass_value.clamp(0.0, 1.0))
+        .max(option_quality * 0.80)
+        .clamp(0.0, 1.0);
+    if release_fit < SHORT_FORWARD_PASS_URGENCY_MIN_RELEASE_FIT {
+        return 0.0;
+    }
+    let support_fit =
+        ((players_ahead as f64 - SHORT_FORWARD_PASS_URGENCY_MIN_PLAYERS_AHEAD as f64 + 1.0) / 4.0)
+            .clamp(0.0, 1.0);
+    let dwell_fit = (observation.perceived_time_on_ball_seconds / 1.0).clamp(0.0, 1.0);
+    let pressure_fit = observation
+        .decision_urgency
+        .max(observation.pressure_urgency)
+        .max(observation.immediate_dispossession_risk)
+        .clamp(0.0, 1.0);
+    (0.40
+        + release_fit * 0.34
+        + option_quality * 0.18
+        + support_fit * 0.14
+        + dwell_fit * 0.08
+        + pressure_fit * 0.06)
+        .clamp(0.0, 1.0)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PressureUrgencyActionProfile {
+    pressure: f64,
+    good_release: f64,
+    bad_outlet_pressure: f64,
+    pass_multiplier: f64,
+    panic_pass_multiplier: f64,
+    dribble_multiplier: f64,
+    carry_forward_multiplier: f64,
+    shot_multiplier: f64,
+    escape_floor: f64,
+    shot_release: f64,
+}
+
+fn pressure_urgency_action_profile(
+    observation: &SoccerPomdpObservation,
+    role: PlayerRole,
+    dribbling: f64,
+    shooting: f64,
+    floor_pass_quality: f64,
+    aerial_pass_quality: f64,
+    advanced_dribbler_fit: f64,
+    good_escape_outlet_fit: f64,
+) -> PressureUrgencyActionProfile {
+    let pressure = observation
+        .perceived_pressure
+        .max(observation.pressure_urgency)
+        .max(observation.decision_urgency * 0.82)
+        .max(observation.immediate_dispossession_risk)
+        .max(observation.excessive_hold_pressure)
+        .max(excessive_hold_pressure(observation, dribbling))
+        .max(observation.stale_dribble_steal_risk * 0.82)
+        .max(
+            observation
+                .neural_extended
+                .surprise_behind_steal_threat
+                .clamp(0.0, 1.0)
+                * 0.88,
+        )
+        .clamp(0.0, 1.0);
+    let floor_release_quality = floor_pass_quality
+        .max(observation.expected_pass_completion.clamp(0.0, 1.0) * 0.84)
+        .max(observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.80)
+        .max(observation.floor_pass_lane_score.clamp(0.0, 1.0) * 0.78)
+        .max(observation.best_forward_pass_option_quality.clamp(0.0, 1.0) * 0.84)
+        .max(short_upfield_ground_pass_fit(observation) * 0.88);
+    let aerial_release_quality = aerial_pass_quality
+        .max(observation.expected_aerial_pass_completion.clamp(0.0, 1.0) * 0.72)
+        .max(
+            observation
+                .best_aerial_pass_receiver_openness
+                .clamp(0.0, 1.0)
+                * 0.68,
+        )
+        .max(observation.aerial_pass_bypass_score.clamp(0.0, 1.0) * 0.56);
+    let outlet_quality = good_escape_outlet_fit
+        .max(floor_release_quality)
+        .max(aerial_release_quality * 0.92)
+        .max(open_support_outlet_fit(observation) * 0.70)
+        .clamp(0.0, 1.0);
+    let release_signal = pressure_release_signal(observation).clamp(0.0, 1.0);
+    let good_release = (pressure * release_signal.max(0.42) * outlet_quality).clamp(0.0, 1.0);
+    let bad_outlet_pressure = (pressure * (1.0 - outlet_quality).powi(2)).clamp(0.0, 1.0);
+    let pass_multiplier = (1.0 + good_release * 0.34).clamp(1.0, 1.38);
+    let panic_pass_multiplier = (1.0 / (1.0 + bad_outlet_pressure * 1.46)).clamp(0.40, 1.0);
+    let forward_blocked = (1.0 - observation.forward_dribble_space_yards / 6.0).clamp(0.0, 1.0);
+    let role_take_on_relief = match role {
+        PlayerRole::Forward => 0.14,
+        PlayerRole::Midfielder => 0.06,
+        PlayerRole::Defender | PlayerRole::Goalkeeper => 0.0,
+    };
+    let dribble_confidence =
+        (advanced_dribbler_fit * 0.58 + dribbling * 0.30 + role_take_on_relief).clamp(0.0, 0.92);
+    let dribble_multiplier = (1.0
+        - pressure
+            * (1.0 - dribble_confidence)
+            * (0.26 + forward_blocked * 0.24 + outlet_quality * 0.12))
+        .clamp(0.34, 1.0);
+    let carry_forward_multiplier = (1.0
+        - pressure
+            * (1.0 - dribble_confidence * 0.88)
+            * (0.20 + forward_blocked * 0.34 + outlet_quality * 0.16))
+        .clamp(0.32, 1.0);
+    let shot_lane_quality = (observation.shot_on_frame_probability.clamp(0.0, 1.0) * 0.38
+        + observation.shot_beat_goalkeeper_probability.clamp(0.0, 1.0) * 0.34
+        + (1.0 - observation.shot_block_probability.clamp(0.0, 1.0)) * 0.28)
+        .clamp(0.0, 1.0);
+    let close_shot_fit = (1.0 - observation.yards_to_goal / 24.0).clamp(0.0, 1.0);
+    let long_shot_fit = ((observation.yards_to_goal - 18.0) / 14.0).clamp(0.0, 1.0);
+    let bad_shot_fit = (1.0 - shot_lane_quality)
+        .max(observation.shot_block_probability.clamp(0.0, 1.0) * 0.76)
+        .max(long_shot_fit * (1.0 - shot_lane_quality * 0.58))
+        .clamp(0.0, 1.0);
+    let shot_release = (pressure
+        * shot_lane_quality
+        * close_shot_fit
+        * (0.66 + shooting * 0.34)
+        * if observation.shot_lane_open {
+            1.0
+        } else {
+            0.42
+        })
+    .clamp(0.0, 1.0);
+    let shot_multiplier = ((1.0 + shot_release * 0.24)
+        * (1.0 - pressure * bad_shot_fit * 0.42).clamp(0.48, 1.0))
+    .clamp(0.42, 1.22);
+    let no_good_release =
+        (1.0 - outlet_quality.max(shot_lane_quality * close_shot_fit)).clamp(0.0, 1.0);
+    let escape_floor = if no_good_release >= 0.42 {
+        (0.10
+            + pressure * 0.30
+            + bad_outlet_pressure * 0.30
+            + forward_blocked * 0.14
+            + observation.immediate_dispossession_risk.clamp(0.0, 1.0) * 0.10)
+            .clamp(0.0, 0.66)
+    } else {
+        0.0
+    };
+
+    PressureUrgencyActionProfile {
+        pressure,
+        good_release,
+        bad_outlet_pressure,
+        pass_multiplier,
+        panic_pass_multiplier,
+        dribble_multiplier,
+        carry_forward_multiplier,
+        shot_multiplier,
+        escape_floor,
+        shot_release,
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1305,6 +2443,7 @@ struct MpcExecutionEstimate {
     recommended_curve_bend_yards: f64,
     recommended_spin_rps: f64,
     recommended_curve: &'static str,
+    recommended_curve_technique: &'static str,
     horizon_seconds: f64,
     reselect_reason: &'static str,
     /// MPC shot foot choice: which foot the strike is taken with ("right"/"left"), and
@@ -1328,6 +2467,16 @@ const SHOT_FOOT_MAX_SKILL: f64 = 10.0;
 const SHOT_FOOT_POWER_BIAS_WEIGHT: f64 = 2.0;
 /// Power margin (rating points) below the strong foot that flags the chosen foot as "weak".
 const SHOT_FOOT_WEAK_MARGIN: f64 = 1.0;
+const DECISION_MPC_EXECUTION_MIN_HORIZON_SECONDS: f64 = 0.80;
+const DECISION_MPC_EXECUTION_MAX_HORIZON_SECONDS: f64 = 2.40;
+
+pub(crate) fn decision_mpc_execution_horizon_seconds(dt: f64) -> f64 {
+    let tick_seconds = sane_dt_seconds(dt, DEFAULT_DT_SECONDS).max(1e-6);
+    (tick_seconds * default_soccer_mpc_player_horizon() as f64).clamp(
+        DECISION_MPC_EXECUTION_MIN_HORIZON_SECONDS,
+        DECISION_MPC_EXECUTION_MAX_HORIZON_SECONDS,
+    )
+}
 
 /// MPC shot foot choice: pick which foot to strike with from the ball-vs-body geometry
 /// and the per-foot power. The ball sitting on a given side of the body, and a target
@@ -1534,7 +2683,7 @@ fn mpc_execution_estimate_for_action(
     let label = normalize_soccer_action_label(action_label);
     let mut estimate = MpcExecutionEstimate {
         execution_probability: movement_execution_confidence,
-        horizon_seconds: (dt * 2.0).clamp(2.0 / 15.0, 0.24),
+        horizon_seconds: decision_mpc_execution_horizon_seconds(dt),
         ..MpcExecutionEstimate::default()
     };
     let ball_context = mpc_ball_execution_context_for_player(
@@ -1732,11 +2881,23 @@ fn mpc_execution_estimate_for_action(
             DiscretizedKickCurve::Right => "right",
             DiscretizedKickCurve::None => "none",
         };
+        let curve_technique = if curve == DiscretizedKickCurve::None {
+            DiscretizedKickTechnique::None
+        } else {
+            pass_curve_technique_for_player(
+                &player.skills,
+                flight,
+                is_cross,
+                distance,
+                1.0 - lane_margin_fit,
+                curl_probability,
+            )
+        };
+        estimate.recommended_curve_technique = curve_technique.as_str();
         estimate.recommended_curve_bend_yards = if curve == DiscretizedKickCurve::None {
             0.0
         } else {
-            (0.55 + distance / 24.0).clamp(0.55, 2.8)
-                * (0.72 + ability01(player.skills.flair_passing) * 0.56)
+            pass_curve_bend_yards_for_player(&player.skills, flight, distance, curve_technique)
         };
         estimate.recommended_spin_rps =
             (estimate.recommended_curve_bend_yards / distance.max(1.0) * speed.max(1.0) * 0.42)
@@ -1811,6 +2972,7 @@ fn mpc_execution_estimate_for_action(
             shot_speed,
             first_time,
             observation.perceived_pressure,
+            None,
         );
         let frame_fit = (observation.shot_on_frame_probability.clamp(0.0, 1.0) * 0.64
             + shot_mpc.accuracy_probability * 0.36)
@@ -1868,10 +3030,22 @@ fn mpc_execution_estimate_for_action(
         } else {
             "none"
         };
+        let curve_technique = shot_curve_technique_for_player(
+            &player.skills,
+            observation.perceived_pressure,
+            observation.yards_to_goal,
+            observation.opponent_goal_angle_degrees,
+            observation.shot_curl_probability,
+        );
+        estimate.recommended_curve_technique = curve_technique.as_str();
         estimate.recommended_curve_bend_yards = if estimate.recommended_curve == "none" {
             0.0
         } else {
-            (0.45 + observation.yards_to_goal / 28.0).clamp(0.45, 2.2)
+            shot_curve_bend_yards_for_player(
+                &player.skills,
+                observation.yards_to_goal,
+                curve_technique,
+            )
         };
         estimate.recommended_spin_rps = (estimate.recommended_curve_bend_yards
             / observation.yards_to_goal.max(1.0)
@@ -1954,7 +3128,8 @@ fn mpc_execution_estimate_for_action(
                 / (player_top_speed_yps(player.role, &player.skills)
                     * MovementGait::Sprint.speed_multiplier())
                 .max(1.0);
-            estimate.horizon_seconds = sprint_horizon.clamp(estimate.horizon_seconds, 0.82);
+            let max_horizon = estimate.horizon_seconds.min(0.82);
+            estimate.horizon_seconds = sprint_horizon.clamp(0.0, max_horizon);
         }
         let forward_dir = Vec2::new(0.0, player.team.attack_dir());
         let left_dir = Vec2::new(-player.team.attack_dir(), 0.0);
@@ -2236,7 +3411,7 @@ fn direct_mpc_execution_estimate_for_candidate(
         .unwrap_or(0.0);
     let dt = sane_dt_seconds(snapshot.dt_seconds, DEFAULT_DT_SECONDS).max(1e-6);
     let execution_skill = mpc_execution_skill_for_label(player, label);
-    let mpc_horizon_seconds = (dt * 2.0).clamp(2.0 / 15.0, 0.24);
+    let mpc_horizon_seconds = decision_mpc_execution_horizon_seconds(dt);
     let reachable_delta_yards = (player.velocity.len() * mpc_horizon_seconds
         + 0.5
             * acceleration_yps2_from_score(player.skills.acceleration)
@@ -2329,7 +3504,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         );
     let mpc_reselect_candidate = mpc_reselect_candidate_label(label);
     let execution_skill = mpc_execution_skill_for_label(player, label);
-    let mpc_horizon_seconds = (dt * 2.0).clamp(2.0 / 15.0, 0.24);
+    let mpc_horizon_seconds = decision_mpc_execution_horizon_seconds(dt);
     let reachable_delta_yards = (player.velocity.len() * mpc_horizon_seconds
         + 0.5
             * acceleration_yps2_from_score(player.skills.acceleration)
@@ -2418,6 +3593,7 @@ pub(crate) fn player_mdp_mpc_comparison_trace(
         ),
         mpc_recommended_spin_rps: finite_metric(execution_estimate.recommended_spin_rps),
         mpc_recommended_curve: execution_estimate.recommended_curve.to_string(),
+        mpc_recommended_curve_technique: execution_estimate.recommended_curve_technique.to_string(),
         mpc_execution_horizon_seconds: finite_metric(execution_estimate.horizon_seconds),
         mpc_reselect_reason: execution_estimate.reselect_reason.to_string(),
         mpc_guidance_present: true,
@@ -2433,26 +3609,83 @@ fn mpc_reselects_candidate(
     action: &SoccerAction,
     action_label: &str,
 ) -> bool {
+    mpc_reselect_rejection_probability(snapshot, player, action, action_label).is_some()
+}
+
+fn option_score_safety_possession_candidate_is_executable(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    action: &SoccerAction,
+    action_label: &str,
+) -> bool {
+    let normalized = normalize_soccer_action_label(action_label);
+    if matches!(
+        action,
+        SoccerAction::Pass {
+            target_player: None,
+            ..
+        }
+    ) && pass_like_action_flight(normalized).is_some()
+    {
+        return false;
+    }
+    if mpc_reselect_rejection_probability(snapshot, player, action, action_label).is_some() {
+        return false;
+    }
+    if pass_like_action_flight(normalized).is_some() {
+        return true;
+    }
     let action_target = player.action_target_trace(action, snapshot);
+    let Some(estimate) =
+        direct_mpc_execution_estimate_for_candidate(snapshot, player, &action_target, action_label)
+    else {
+        return true;
+    };
+    estimate.reselect_reason.is_empty()
+        && estimate.execution_probability
+            >= tunables()
+                .decision_mpc
+                .reselect_min_ball_execution_probability
+}
+
+fn mpc_reselect_rejection_probability(
+    snapshot: &WorldSnapshot,
+    player: &PlayerAgent,
+    action: &SoccerAction,
+    action_label: &str,
+) -> Option<f64> {
     if !snapshot
         .formation_lp_guidance_for(player.id)
         .is_some_and(|guidance| guidance.local_mpc_guidance)
     {
-        return false;
+        return None;
     }
-    if player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
-        .is_some_and(|trace| trace.decision == "reselect-mdp-after-mpc-low-confidence")
+    if matches!(
+        action,
+        SoccerAction::Pass {
+            target_player: None,
+            ..
+        }
+    ) && pass_like_action_flight(normalize_soccer_action_label(action_label)).is_some()
     {
-        return true;
+        return Some(0.0);
+    }
+    let action_target = player.action_target_trace(action, snapshot);
+    if let Some(trace) =
+        player_mdp_mpc_comparison_trace(snapshot, player, &action_target, action_label)
+            .filter(|trace| trace.decision == "reselect-mdp-after-mpc-low-confidence")
+    {
+        return Some(trace.mpc_execution_probability.clamp(0.0, 1.0));
     }
     direct_mpc_execution_estimate_for_candidate(snapshot, player, &action_target, action_label)
-        .is_some_and(|estimate| {
+        .filter(|estimate| {
             !estimate.reselect_reason.is_empty()
                 && estimate.execution_probability
                     < tunables()
                         .decision_mpc
                         .reselect_min_ball_execution_probability
         })
+        .map(|estimate| estimate.execution_probability.clamp(0.0, 1.0))
 }
 
 /// Minimum ticks between two consecutive deliberative decisions (≈0.20 s at 15 Hz): at most one
@@ -2473,7 +3706,7 @@ pub(crate) fn decision_refractory_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("DD_SOCCER_ENABLE_DECISION_REFRACTORY").is_ok())
+        *V.get_or_init(|| soccer_env_flag_enabled("DD_SOCCER_ENABLE_DECISION_REFRACTORY"))
     }
     #[cfg(not(test))]
     {
@@ -2489,7 +3722,7 @@ pub(crate) fn decision_refractory_enabled() -> bool {
 pub(crate) fn forward_pass_first_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_FORWARD_PASS_FIRST").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_FORWARD_PASS_FIRST")
     }
     #[cfg(not(test))]
     {
@@ -2509,7 +3742,7 @@ pub(crate) fn forward_pass_first_enabled() -> bool {
 pub(crate) fn isolated_carrier_drive_enabled() -> bool {
     #[cfg(test)]
     {
-        std::env::var("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE").is_ok()
+        soccer_env_flag_enabled("DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE")
     }
     #[cfg(not(test))]
     {
@@ -2623,8 +3856,7 @@ pub(crate) fn isolated_attacking_carrier_drive_mode(
 /// `outside_midfielder` test used inside [`possession_action_options`], factored out so the gait
 /// resolver can reuse it for [`isolated_attacking_carrier_drive_mode`].
 pub(crate) fn is_outside_midfielder_role(role: PlayerRole, home_x: f64, field_width: f64) -> bool {
-    role == PlayerRole::Midfielder
-        && (home_x < field_width * 0.30 || home_x > field_width * 0.70)
+    role == PlayerRole::Midfielder && (home_x < field_width * 0.30 || home_x > field_width * 0.70)
 }
 
 /// Re-weight the carrier's possession options for the isolated-carrier `mode` so a forward DRIVE
@@ -2766,7 +3998,7 @@ fn decision_cadence_labels_match(committed_label: &str, candidate_label: &str) -
 fn decision_cadence_immediate_label(label: &str) -> bool {
     matches!(
         normalize_soccer_action_label(label),
-        "tackle" | "slide-tackle" | ACTION_LABEL_RECOVER
+        "tackle" | "slide-tackle" | "blindside-steal" | ACTION_LABEL_RECOVER
     )
 }
 
@@ -3743,7 +4975,8 @@ impl PlayerAgent {
             || contested_final_third_shot;
         let no_teammate_in_front =
             observation.teammates_ahead == 0 && observation.visible_forward_pass_options == 0;
-        let attacking_ball_carrier = observation.yards_to_goal <= observation.yards_to_own_goal + 6.0
+        let attacking_ball_carrier = observation.yards_to_goal
+            <= observation.yards_to_own_goal + 6.0
             && matches!(self.role, PlayerRole::Forward | PlayerRole::Midfielder);
         let goal_side_defenders = observation.field_opponents_ahead;
         let thin_goal_side_cover_fit = if goal_side_defenders < 4 {
@@ -3755,7 +4988,9 @@ impl PlayerAgent {
             ((observation.forward_dribble_space_yards - 6.0) / 18.0).clamp(0.0, 1.0);
         let solo_speed_fit = (((observation.perceived_fatigue_advantage + 0.08) / 0.46)
             .clamp(0.0, 1.0)
-            * observation.nearest_defender_fatigue_confidence.clamp(0.35, 1.0))
+            * observation
+                .nearest_defender_fatigue_confidence
+                .clamp(0.35, 1.0))
         .clamp(0.0, 1.0);
         let space_speed_break_fit = if solo_space_fit >= 0.45 && solo_speed_fit >= 0.24 {
             (solo_space_fit * 0.66 + solo_speed_fit * 0.34).clamp(0.0, 1.0)
@@ -3767,14 +5002,12 @@ impl PlayerAgent {
         } else {
             0.0
         };
-        let solo_hold_up_need = if no_teammate_in_front
-            && attacking_ball_carrier
-            && solo_goal_drive_fit < 0.55
-        {
-            (1.0 - solo_goal_drive_fit).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let solo_hold_up_need =
+            if no_teammate_in_front && attacking_ball_carrier && solo_goal_drive_fit < 0.55 {
+                (1.0 - solo_goal_drive_fit).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
         let emergency_backward_release_relief = (pressure_urgency
             .max(pressure)
             .max(observation.immediate_dispossession_risk)
@@ -3801,6 +5034,8 @@ impl PlayerAgent {
         let striker_shot_bonus = striker_legal_shot_attempt_bonus(observation, self.role);
         let goal_proximity_shot_pressure =
             goal_proximity_shot_pressure_score(observation, self.role, shooting);
+        let pressured_shot_release =
+            pressured_shot_release_urgency(observation, self.role, shooting);
         let decisive_goal_pressure = observation
             .decisive_goal_action_pressure
             .max(near_goal_decisive_action_pressure_score(
@@ -3830,6 +5065,7 @@ impl PlayerAgent {
             * (1.0 + striker_shot_bonus * 1.35)
             * (1.0 + decisive_goal_pressure * 1.18)
             * (1.0 + final_ball_goal_decision_fit * 0.42)
+            * (1.0 + pressured_shot_release * 0.54)
             * shot_choice_learning
             * 0.042)
             .clamp(
@@ -3840,10 +5076,12 @@ impl PlayerAgent {
                     + goal_attack * 0.22
                     + goal_proximity_shot_pressure * 0.36
                     + goal_entry_pressure * 0.20
-                    + decisive_goal_pressure * 0.30)
+                    + decisive_goal_pressure * 0.30
+                    + pressured_shot_release * 0.22)
                     * shot_choice_learning.clamp(0.82, 1.24),
             )
             .max(close_shot_attempt * shot_choice_learning.clamp(0.88, 1.16))
+            .max(pressured_shot_release * shot_choice_learning.clamp(0.88, 1.16))
             .max(
                 goal_proximity_shot_pressure_floor(observation, self.role, shooting)
                     * shot_choice_learning.clamp(0.88, 1.16),
@@ -3921,8 +5159,16 @@ impl PlayerAgent {
             && shot_legal
             && !shot_trigger_long_range_veto
         {
+            shot_score = shot_score
+                .max((0.80 + solo_goal_drive_fit * 0.18) * shot_choice_learning.clamp(0.90, 1.12));
+        }
+        if pressured_shot_release > 0.0
+            && shot_legal
+            && !shot_trigger_long_range_veto
+            && !threaded_goal_pass_overrides_shot
+        {
             shot_score = shot_score.max(
-                (0.80 + solo_goal_drive_fit * 0.18)
+                (0.50 + pressured_shot_release * 0.38 + decision_urgency * 0.08).clamp(0.50, 0.94)
                     * shot_choice_learning.clamp(0.90, 1.12),
             );
         }
@@ -3958,8 +5204,8 @@ impl PlayerAgent {
                     .max(observation.immediate_dispossession_risk)
                     .clamp(0.0, 1.0))
             .clamp(0.0, 1.0);
-            let space_fit = ((observation.forward_dribble_space_yards - 4.0) / 10.0)
-                .clamp(0.0, 1.0);
+            let space_fit =
+                ((observation.forward_dribble_space_yards - 4.0) / 10.0).clamp(0.0, 1.0);
             let movement_fit = (observation.actor_speed_yps / 2.6)
                 .clamp(0.0, 1.0)
                 .max((observation.perceived_time_on_ball_seconds / 1.2).clamp(0.0, 0.45));
@@ -3968,8 +5214,7 @@ impl PlayerAgent {
             0.0
         };
         let rolling_space_carry_lift = (1.0 + rolling_open_space_fit * 0.34).clamp(1.0, 1.34);
-        let static_hold_open_space_damp =
-            (1.0 - rolling_open_space_fit * 0.72).clamp(0.22, 1.0);
+        let static_hold_open_space_damp = (1.0 - rolling_open_space_fit * 0.72).clamp(0.22, 1.0);
         let patient_dribble_lift = (1.0
             + patience_factor * poor_floor_pass * (0.42 + forward_space_fit * 0.50))
             .clamp(1.0, 1.38);
@@ -3987,10 +5232,8 @@ impl PlayerAgent {
         let goalmouth_carry_forced = goal_approach_forces_goalmouth_carry(observation, self.role);
         let patient_carry_multiplier = low_pressure_patient_carry_multiplier(observation);
         let attacking_carry_boost = if no_teammate_in_front && attacking_ball_carrier {
-            (1.30
-                + solo_goal_drive_fit * 0.42
-                + if pass_target_count == 0 { 0.18 } else { 0.0 })
-            .clamp(1.30, 1.90)
+            (1.30 + solo_goal_drive_fit * 0.42 + if pass_target_count == 0 { 0.18 } else { 0.0 })
+                .clamp(1.30, 1.90)
         } else if self.role == PlayerRole::Forward {
             1.24
         } else if outside_midfielder && pass_target_count == 0 {
@@ -4020,6 +5263,7 @@ impl PlayerAgent {
             0.0
         };
         let short_upfield_ground_pass_fit = short_upfield_ground_pass_fit(observation);
+        let short_forward_release_urgency = short_forward_pass_release_urgency(observation);
         let attacking_numbers_up_fit = (observation.attacking_numbers_advantage as f64 / 4.0)
             .clamp(0.0, 1.0)
             .max(observation.pass_and_move_numbers_advantage.clamp(0.0, 1.0))
@@ -4030,10 +5274,12 @@ impl PlayerAgent {
                     + decision_urgency * 0.14
                     + pressured_release_signal * 0.18
                     + open_forward_outlet * 0.18
-                    + attacking_numbers_up_fit * 0.12))
+                    + attacking_numbers_up_fit * 0.12
+                    + short_forward_release_urgency * 0.16))
             .clamp(1.0, 1.62);
         let direct_forward_release_fit = short_upfield_ground_pass_fit
             .max(observation.quick_forward_pass_value.clamp(0.0, 1.0))
+            .max(short_forward_release_urgency * 0.92)
             .max(
                 (open_forward_outlet
                     * observation.expected_pass_completion.clamp(0.0, 1.0)
@@ -4070,6 +5316,11 @@ impl PlayerAgent {
             self.role,
             own_half,
             observation.nearest_opponent_distance,
+            observation
+                .neural_extended
+                .nearest_opponent_closing_rate_yps,
+        );
+        let moving_away_spacing_relief = dribble_moving_away_relief_from_closing_rate(
             observation
                 .neural_extended
                 .nearest_opponent_closing_rate_yps,
@@ -4133,6 +5384,17 @@ impl PlayerAgent {
         // risk for the most-advanced players — the three furthest forward. See
         // `advanced_dribbler_fit_from_rank` for the rank→appetite curve.
         let advanced_dribbler_fit = advanced_dribbler_fit_from_rank(observation.teammates_ahead);
+        let pressure_action_profile = pressure_urgency_action_profile(
+            observation,
+            self.role,
+            dribbling,
+            shooting,
+            floor_pass_quality,
+            aerial_pass_quality,
+            advanced_dribbler_fit,
+            good_escape_outlet_fit,
+        );
+        shot_score = (shot_score * pressure_action_profile.shot_multiplier).clamp(0.0, 1.25);
         // How risky a dribble is right now: real pressure, a defender on top of the ball, or
         // a live chance of being dispossessed.
         let dribble_risk = steal_pressure
@@ -4169,8 +5431,10 @@ impl PlayerAgent {
             * (1.0 - pressured_good_outlet * 0.30).clamp(0.62, 1.0)
             * (1.0 - (open_forward_outlet * 0.34 + short_upfield_ground_pass_fit * 0.18))
                 .clamp(0.44, 1.0)
+            * (1.0 - short_forward_release_urgency * 0.28).clamp(0.36, 1.0)
             * dribble_into_opponent_penalty
             * deep_pressure_dribble_damp
+            * pressure_action_profile.dribble_multiplier
             * crowded_dribble_damp)
             .clamp(0.02, 1.36);
         let dribble_score = (pre_fatigue_dribble_score
@@ -4179,8 +5443,12 @@ impl PlayerAgent {
             * rolling_space_carry_lift
             * hold_penalty_multiplier
             * keeper_carry_under_pressure_damp
-            * (1.0 - observation.side_glance_control_cost * 0.74).clamp(0.90, 1.0))
-        .clamp(0.02, 1.75);
+            * (1.0 - observation.side_glance_control_cost * 0.74).clamp(0.90, 1.0)
+            // Preserve the shared spacing contract at the final option seam:
+            // an opponent retreating quickly is materially less dangerous than
+            // a static marker at the same instantaneous distance.
+            * (1.0 + moving_away_spacing_relief * 0.08))
+            .clamp(0.02, 1.75);
         let patient_carry_score_base = (dribble_score * patient_carry_multiplier).clamp(0.02, 1.58);
         // Central defenders must stay back: they do NOT dribble the ball forward when
         // an opponent is within ~5 yds in front of them (little open space ahead).
@@ -4217,6 +5485,7 @@ impl PlayerAgent {
             // Carrying forward INTO pressure is the worst option for a deep player — damp it
             // hard for anyone outside the three most-forward when there's real risk ahead.
             * (1.0 - dribble_risk * (1.0 - advanced_dribbler_fit) * 0.40).clamp(0.45, 1.0)
+            * pressure_action_profile.carry_forward_multiplier
             // Own-half retention: risky forward dribbling is de-emphasised in our own
             // half (more so when pressured) in favour of keeping the ball.
             * if own_half { (1.0 - 0.24 - pressure * 0.18).clamp(0.55, 1.0) } else { 1.0 }
@@ -4242,6 +5511,7 @@ impl PlayerAgent {
                 + solo_goal_drive_fit * 0.42
                 + self.preferences.offensive_mindedness.clamp(0.0, 1.0) * 0.18)
             * advance_upfield_carry_multiplier
+            * pressure_action_profile.carry_forward_multiplier
             * (1.0 - pressure * 0.16).clamp(0.76, 1.0))
         .clamp(0.01, 1.54)
         .max(if solo_goal_drive_fit > 0.0 {
@@ -4290,7 +5560,9 @@ impl PlayerAgent {
         } else {
             1.0
         };
-        let carry_forward_score = (carry_forward_score * byline_drive_boost).clamp(0.01, 1.85);
+        let carry_forward_score =
+            (carry_forward_score * byline_drive_boost * (1.0 + moving_away_spacing_relief * 0.08))
+                .clamp(0.01, 1.85);
         let carry_out_score = (carry_out_score * byline_drive_boost).clamp(0.01, 1.30);
         let field_width = if field_width_yards.is_finite() && field_width_yards > 0.0 {
             field_width_yards
@@ -4740,17 +6012,51 @@ impl PlayerAgent {
             PlayerRole::Midfielder => 0.72,
             PlayerRole::Forward => 0.24,
         };
-        let route_one_legal = own_half;
+        let route_one_pressure_signal = pressure_urgency
+            .max(pressure)
+            .max(observation.immediate_dispossession_risk)
+            .max(excessive_hold_pressure(observation, dribbling))
+            .clamp(0.0, 1.0);
+        let route_one_attack_signal = observation.attacking_overload_score.clamp(0.0, 1.0);
+        let route_one_runner_signal =
+            ((observation.aerial_forward_runner_pass_multiplier - 1.0) / 0.50).clamp(0.0, 1.0);
+        let route_one_safe_short_outlet = observation.visible_forward_pass_options > 0
+            && observation.expected_pass_completion >= OPEN_OUTLET_RELEASE_COMPLETION
+            && observation.best_pass_receiver_openness >= OPEN_OUTLET_RELEASE_OPENNESS;
+        let route_one_vertical_window = route_one_runner_signal >= 0.52
+            && observation.expected_aerial_pass_completion >= 0.45
+            && observation.aerial_pass_interception_risk <= LEARNED_PASS_MAX_INTERCEPTION_RISK;
+        let route_one_release_need = defensive_urgency >= 0.62 && route_one_pressure_signal >= 0.50;
+        let route_one_forced_escape = route_one_pressure_signal >= 0.55
+            || observation.immediate_dispossession_risk >= 0.50
+            || defensive_urgency >= 0.62
+            || observation.yards_to_own_goal <= 18.0;
+        let route_one_last_ditch =
+            observation.yards_to_own_goal <= 18.0 && route_one_pressure_signal >= 0.50;
+        let route_one_proximity_gate = observation.nearest_opponent_distance <= 24.0
+            || observation.immediate_dispossession_risk >= 0.45
+            || defensive_urgency >= 0.52
+            || observation.yards_to_own_goal <= 18.0
+            || route_one_vertical_window;
+        let route_one_outlet_gate =
+            !route_one_safe_short_outlet || route_one_forced_escape || route_one_vertical_window;
+        let route_one_legal = own_half
+            && route_one_proximity_gate
+            && route_one_outlet_gate
+            && route_one_release_need
+            && route_one_last_ditch;
         let route_one_score = ((0.05
             + directive.risk_tolerance * 0.12
             + passing * 0.12
-            + defensive_urgency * 0.22
-            + excessive_hold_pressure(observation, dribbling) * 0.18
-            + observation.attacking_overload_score.clamp(0.0, 1.0) * 0.22
+            + defensive_urgency * 0.18
+            + route_one_pressure_signal * 0.20
+            + route_one_attack_signal * 0.24
+            + route_one_runner_signal * 0.18
             + (1.0 - observation.expected_pass_completion.clamp(0.0, 1.0)) * 0.10
             + (1.0 - (pass_target_count as f64 / 3.0).clamp(0.0, 1.0)) * 0.08)
             * route_one_role_bias
-            * hold_release_multiplier)
+            * hold_release_multiplier
+            * (0.58 + route_one_pressure_signal * 0.24 + route_one_attack_signal * 0.18))
             .clamp(0.02, 1.12);
         options.push(AgentActionOptionTrace::new(
             "clearance",
@@ -5130,7 +6436,9 @@ impl PlayerAgent {
                 * pass_and_move_forward_lift
                 * crowded_pass_lift
                 * pressured_release_multiplier
+                * pressure_action_profile.pass_multiplier
                 * panic_pass_damp
+                * pressure_action_profile.panic_pass_multiplier
                 * isolated_backward_release_multiplier
                 * slip_break_pass_multiplier
                 * rank_weight)
@@ -5192,6 +6500,8 @@ impl PlayerAgent {
                 * hold_release_multiplier
                 * high_cross_multiplier
                 * pressured_release_multiplier
+                * pressure_action_profile.pass_multiplier
+                * pressure_action_profile.panic_pass_multiplier
                 * aerial_flick_strategy_multiplier
                 * isolated_backward_release_multiplier
                 * rank_weight)
@@ -5321,6 +6631,23 @@ impl PlayerAgent {
                 .clamp(0.34, 0.74);
             ensure_min_legal_option_probability(&mut options, "pass1", pass_and_move_floor);
         }
+        if pass_target_count > 0
+            && pressure_action_profile.good_release >= 0.24
+            && good_escape_outlet_fit >= 0.30
+            && !goal_attack_shot_blocks_alternatives
+            && !(no_teammate_in_front
+                && attacking_ball_carrier
+                && hold_up_flank_available
+                && pressure_action_profile.pressure < 0.62)
+        {
+            let pressure_release_floor = (0.22
+                + pressure_action_profile.good_release * 0.42
+                + pressure_action_profile.pressure * 0.08
+                + observation.best_pass_receiver_openness.clamp(0.0, 1.0) * 0.08
+                + observation.expected_pass_completion.clamp(0.0, 1.0) * 0.08)
+                .clamp(0.34, 0.80);
+            ensure_min_legal_option_probability(&mut options, "pass1", pressure_release_floor);
+        }
         if clearance_legal && hold_pressure >= 0.16 && release_pressure >= 0.42 {
             let danger_clearance_floor =
                 (0.30 + hold_pressure * 0.22 + release_pressure * 0.10).clamp(0.34, 0.72);
@@ -5359,6 +6686,54 @@ impl PlayerAgent {
                 "shoot",
                 (0.80 + solo_goal_drive_fit * 0.18).clamp(0.80, 0.98),
             );
+        }
+        if pressure_action_profile.shot_release >= 0.18
+            && shot_legal
+            && !shot_trigger_long_range_veto
+            && !threaded_goal_pass_overrides_shot
+        {
+            let pressured_shot_floor =
+                (0.14 + pressure_action_profile.shot_release * 0.44).clamp(0.20, 0.70);
+            ensure_min_legal_option_probability(&mut options, "shoot", pressured_shot_floor);
+        }
+        if pressure_action_profile.escape_floor >= 0.20
+            && !goal_attack_shot_blocks_alternatives
+            && !goalmouth_carry_forced
+            && !must_shoot_near_goal(observation, self.role)
+        {
+            let panic_choice_damp =
+                (1.0 - pressure_action_profile.bad_outlet_pressure * 0.38).clamp(0.42, 1.0);
+            for label in [
+                "pass1",
+                "aerial-pass1",
+                "shoot",
+                "dribble",
+                "carry-forward",
+                "vertical-attack",
+                "turnover-burst",
+            ] {
+                scale_legal_option_score(&mut options, label, panic_choice_damp);
+            }
+            ensure_min_legal_option_family_probability(
+                &mut options,
+                &[
+                    "protect-ball",
+                    "side-step",
+                    "carry-out-left",
+                    "carry-out-right",
+                    "left-cut",
+                    "right-cut",
+                ],
+                pressure_action_profile.escape_floor,
+            );
+            if bad_outlet_escape_panic_cap_enabled()
+                && pressure_action_profile.bad_outlet_pressure >= 0.24
+            {
+                cap_bad_outlet_escape_panic_options(
+                    &mut options,
+                    pressure_action_profile.bad_outlet_pressure,
+                );
+            }
         }
         if killer_pass_legal && killer_pass_goal_pressure >= 0.24 {
             let threaded_lane_fit = threaded_goal_pass_quality.max(
@@ -5413,12 +6788,10 @@ impl PlayerAgent {
                 * pressure_escape_progression_lift.clamp(0.0, 0.54);
             ensure_min_legal_option_probability(&mut options, "carry-forward", progression_floor);
         }
-        if solo_goal_drive_fit > 0.0
-            && carry_forward_legal
-            && !goal_attack_shot_blocks_alternatives
+        if solo_goal_drive_fit > 0.0 && carry_forward_legal && !goal_attack_shot_blocks_alternatives
         {
-            let solo_drive_floor = (0.58 + solo_goal_drive_fit * 0.28 + forward_space_fit * 0.10)
-                .clamp(0.58, 0.92);
+            let solo_drive_floor =
+                (0.58 + solo_goal_drive_fit * 0.28 + forward_space_fit * 0.10).clamp(0.58, 0.92);
             ensure_min_legal_option_family_probability(
                 &mut options,
                 &["carry-forward", "vertical-attack", "turnover-burst"],
@@ -5630,6 +7003,71 @@ impl PlayerAgent {
                 scale_legal_option_score(&mut options, label, dwell_damp);
             }
         }
+        // Short-forward release urgency: when the field is telling the carrier "there are
+        // bodies ahead and a clean 5-15yd forward outlet is on", he should pass forward now
+        // instead of walking the ball into another dribble touch. This is default-on coaching
+        // behavior; the POMDP/MPC still price the pass quality and execution, but the option
+        // sampler no longer lets dribble/carry/hold dominate that obvious release.
+        if pass_target_count > 0
+            && short_forward_release_urgency > 0.0
+            && !goal_attack_shot_blocks_alternatives
+            && !observation.threaded_goal_pass_available
+            && !must_shoot_near_goal(observation, self.role)
+        {
+            let forward_floor =
+                (0.48 + short_forward_release_urgency * 0.42 + decision_urgency * 0.08)
+                    .clamp(0.54, 0.94);
+            ensure_min_legal_option_probability(&mut options, "pass1", forward_floor);
+            let dwell_damp = (1.0 - short_forward_release_urgency * 0.58).clamp(0.34, 1.0);
+            for label in [
+                "dribble",
+                "carry-forward",
+                "vertical-attack",
+                "protect-ball",
+                "hold-up-flank",
+                "side-step",
+                "fake-left-cut-right",
+                "fake-right-cut-left",
+                "nutmeg",
+            ] {
+                scale_legal_option_score(&mut options, label, dwell_damp);
+            }
+            let sideways_damp = (1.0 - short_forward_release_urgency * 0.28).clamp(0.62, 1.0);
+            for label in ["recycle-reset", "switch-play"] {
+                scale_legal_option_score(&mut options, label, sideways_damp);
+            }
+        }
+        // Pressure-to-shot release: if the carrier has a clean close shooting lane while pressure
+        // is arriving, the urgent release is the shot itself. This deliberately stays below the
+        // threaded-goal-pass override and below hard blocked-lane legality, so pressure cannot
+        // manufacture a panic shot through a defender.
+        if pressured_shot_release > 0.0
+            && shot_legal
+            && !shot_trigger_long_range_veto
+            && !threaded_goal_pass_overrides_shot
+        {
+            let shot_floor =
+                (0.46 + pressured_shot_release * 0.42 + decision_urgency * 0.08).clamp(0.52, 0.93);
+            ensure_min_legal_option_probability(&mut options, "shoot", shot_floor);
+            let dwell_damp = (1.0 - pressured_shot_release * 0.48).clamp(0.42, 1.0);
+            for label in [
+                "dribble",
+                "carry-forward",
+                "vertical-attack",
+                "protect-ball",
+                "hold-up-flank",
+                "side-step",
+                "fake-left-cut-right",
+                "fake-right-cut-left",
+                "nutmeg",
+            ] {
+                scale_legal_option_score(&mut options, label, dwell_damp);
+            }
+            let recycle_damp = (1.0 - pressured_shot_release * 0.34).clamp(0.56, 1.0);
+            for label in ["pass1", "pass2", "recycle-reset", "switch-play"] {
+                scale_legal_option_score(&mut options, label, recycle_damp);
+            }
+        }
         // Forward-pass-first release: when a forward teammate is sufficiently open, prioritise
         // releasing the ball forward and do it SOONER the longer the carrier has dwelt on it — so
         // he plays the open forward man instead of deliberating into a late, pressured square/back
@@ -5685,6 +7123,34 @@ impl PlayerAgent {
                 // driving into space remains a valid alternative.
                 let dribble_damp = (1.0 - 0.30 * strength).clamp(0.55, 1.0);
                 scale_legal_option_score(&mut options, "dribble", dribble_damp);
+            }
+        }
+        if forward_pass_climb_curriculum_enabled()
+            && pass_target_count > 0
+            && observation.visible_forward_pass_options > 0
+        {
+            let forward_quality = observation
+                .best_forward_pass_option_quality
+                .max(observation.best_forward_pass_receiver_openness)
+                .max(observation.quick_forward_pass_value)
+                .max(observation.expected_pass_completion * 0.72)
+                .clamp(0.0, 1.0);
+            let pass_floor = (0.76 + forward_quality * 0.20).clamp(0.76, 0.98);
+            ensure_min_legal_option_probability(&mut options, "pass1", pass_floor);
+            for label in ["shoot", "route-one", "recycle-reset", "switch-play"] {
+                scale_legal_option_score(&mut options, label, 0.32);
+            }
+            for label in [
+                "dribble",
+                "carry-forward",
+                "vertical-attack",
+                "carry-out-left",
+                "carry-out-right",
+                "protect-ball",
+                "hold-up-flank",
+                "side-step",
+            ] {
+                scale_legal_option_score(&mut options, label, 0.58);
             }
         }
         // Isolated attacking carrier (gated `DD_SOCCER_ENABLE_ISOLATED_CARRIER_DRIVE`; OFF ⇒
@@ -5751,6 +7217,35 @@ impl PlayerAgent {
                 runway_floor,
             );
         }
+        apply_pass_completion_primary_scores(&mut options, observation);
+        apply_forward_pass_turnover_risk_gate(&mut options, observation);
+        if bad_outlet_escape_panic_cap_enabled()
+            && !goal_attack_shot_blocks_alternatives
+            && !goalmouth_carry_forced
+        {
+            let direct_release_quality = observation
+                .expected_pass_completion
+                .max(observation.best_pass_receiver_openness)
+                .max(observation.floor_pass_lane_score)
+                .max(observation.expected_aerial_pass_completion * 0.86)
+                .max(observation.best_aerial_pass_receiver_openness * 0.80)
+                .max(open_support_fit * 0.72)
+                .clamp(0.0, 1.0);
+            let direct_bad_outlet_pressure = pressure_action_profile
+                .pressure
+                .max(pressure_urgency)
+                .max(pressure)
+                .max(observation.immediate_dispossession_risk)
+                .clamp(0.0, 1.0)
+                * (1.0 - direct_release_quality).powi(2);
+            cap_bad_outlet_escape_panic_options(
+                &mut options,
+                pressure_action_profile
+                    .bad_outlet_pressure
+                    .max(direct_bad_outlet_pressure),
+            );
+        }
+        cap_low_completion_floor_passes_against_carry(&mut options, observation);
         let mut options = normalize_action_options(options);
         annotate_tick_probabilities_from_scores(&mut options, dt_seconds);
         options
@@ -5815,6 +7310,17 @@ impl PlayerAgent {
         let control_field_multiplier =
             (1.0 + (1.0 - pass_field_fit.max(shot_field_fit)) * 0.18).clamp(1.0, 1.18);
         let short_upfield_ground_pass_fit = short_upfield_ground_pass_fit(observation);
+        let completion_guard_enabled = first_touch_completion_guard_enabled();
+        let (
+            guarded_floor_pass_quality,
+            completion_safe_first_touch_floor,
+            floor_completion_score_multiplier,
+        ) = first_touch_completion_guard_values(
+            completion_guard_enabled,
+            pass_has_target,
+            observation.expected_pass_completion,
+            observation.best_pass_receiver_openness,
+        );
         let first_time_forward_pass_multiplier =
             (1.0 + short_upfield_ground_pass_fit * (0.26 + pass_field_fit * 0.20)).clamp(1.0, 1.46);
         let killer_pressure = observation
@@ -5875,6 +7381,7 @@ impl PlayerAgent {
                     * quick_pressure_bonus
                     * pass_field_multiplier
                     * first_time_forward_pass_multiplier
+                    * floor_completion_score_multiplier
                     * 0.86
                     * pass_feasibility_gate)
                     .clamp(0.0, 0.88),
@@ -5923,10 +7430,7 @@ impl PlayerAgent {
             // weighted coin-flip to it (the live bug: control-touch chosen over an
             // available first-time-pass to a wide-open teammate at openness 1.0 /
             // completion 0.97 under a 3yd press with zero forward space).
-            let pass_quality = observation
-                .best_pass_receiver_openness
-                .max(observation.expected_pass_completion)
-                .clamp(0.0, 1.0);
+            let pass_quality = guarded_floor_pass_quality.clamp(0.0, 1.0);
             let pressure = observation
                 .perceived_pressure
                 .max(observation.immediate_dispossession_risk)
@@ -5942,7 +7446,10 @@ impl PlayerAgent {
                 let control_multiplier = (1.0 - dominance * 0.85).clamp(0.10, 1.0);
                 scale_legal_option_score(&mut options, control_label, control_multiplier);
             }
-            if short_upfield_ground_pass_fit >= 0.42 && !one_touch_pass_blocked {
+            if short_upfield_ground_pass_fit >= 0.42
+                && !one_touch_pass_blocked
+                && completion_safe_first_touch_floor
+            {
                 let forward_release_floor =
                     (0.34 + short_upfield_ground_pass_fit * 0.42 + pass_field_fit * 0.10)
                         .clamp(0.42, 0.86);
@@ -5961,13 +7468,18 @@ impl PlayerAgent {
         // play it FIRST-TIME rather than settling — floor the first-time-pass and trim the
         // controlling touch in proportion to the value. The chosen pass is delivered through the
         // MPC pass path. Gate OFF ⇒ value is 0 ⇒ byte-identical no-op.
-        if pass_legal && !one_touch_pass_blocked && observation.quick_forward_pass_value > 0.0 {
+        if pass_legal
+            && !one_touch_pass_blocked
+            && observation.quick_forward_pass_value > 0.0
+            && completion_safe_first_touch_floor
+        {
             let quick_value = observation.quick_forward_pass_value.clamp(0.0, 1.0);
             let quick_floor = (0.44 + quick_value * 0.44).clamp(0.44, 0.88);
             ensure_min_legal_option_probability(&mut options, "first-time-pass", quick_floor);
             let control_multiplier = (1.0 - quick_value * 0.45).clamp(0.45, 1.0);
             scale_legal_option_score(&mut options, control_label, control_multiplier);
         }
+        apply_forward_pass_turnover_risk_gate(&mut options, observation);
         normalize_action_options(options)
     }
 
@@ -5983,7 +7495,10 @@ impl PlayerAgent {
         let exploit_space_strategy_active =
             matches!(directive.attack_strategy, TeamAttackStrategy::ExploitSpace);
         let advance_upfield_strategy_active = dd_soccer_advance_upfield_strategy_enabled()
-            && matches!(directive.attack_strategy, TeamAttackStrategy::AdvanceUpfield);
+            && matches!(
+                directive.attack_strategy,
+                TeamAttackStrategy::AdvanceUpfield
+            );
         let crash_box_strategy_active =
             matches!(directive.attack_strategy, TeamAttackStrategy::CrashTheBox);
         let possession_team = snapshot.controlled_possession_team();
@@ -6055,6 +7570,8 @@ impl PlayerAgent {
             check_to_ball: snapshot.check_to_ball_target_for(self.id, self.home_position),
             in_behind: snapshot.in_behind_run_target_for(self.id),
             exploit_space: snapshot.exploit_space_run_target_for(self.id, self.home_position),
+            forward_receive: snapshot
+                .open_forward_receive_run_target_for(self.id, self.home_position),
             wide_outlet: snapshot.wide_possession_outlet_target_for(self.id, self.home_position),
             flank_cross_arrival: snapshot
                 .flank_cross_arrival_target_for(self.id, self.home_position),
@@ -6101,6 +7618,14 @@ impl PlayerAgent {
         let guarded_exploit_space_target = |target: Vec2| {
             snapshot.shape_guarded_support_point(self.id, target, &[], self.home_position, false)
         };
+        let lp_support_fit = |target: Vec2| {
+            snapshot
+                .formation_lp_guidance_for(self.id)
+                .filter(|guidance| guidance.team == self.team)
+                .map(|guidance| formation_lp_support_target_fit(guidance, target))
+                .unwrap_or(0.0)
+        };
+        let lp_shape_fit = lp_support_fit(open);
         let special_score = |target: Vec2, base: f64| {
             let forward = ((target.y - current.y) * self.team.attack_dir()).clamp(-8.0, 24.0);
             let openness = pass_receiver_openness_for_snapshots_with_teammates(
@@ -6120,7 +7645,8 @@ impl PlayerAgent {
                 + forward.max(0.0) * 0.034
                 + openness * 0.26
                 + pass_lane * 0.22
-                + space_fit * 0.24)
+                + space_fit * 0.24
+                + lp_support_fit(target) * 0.34)
                 * self.preferences.open_space_bias.clamp(0.25, 1.0)
         };
         let mut options = vec![
@@ -6130,14 +7656,18 @@ impl PlayerAgent {
                     * self.preferences.open_space_bias
                     * (1.0
                         + support_urgency * 0.14
-                        + run_prediction.weight_for_label("support-shape") * 0.18),
+                        + run_prediction.weight_for_label("support-shape") * 0.18
+                        + lp_shape_fit * 0.20),
                 true,
             ),
             AgentActionOptionTrace::new(
                 "support-roam",
                 roam_weight
                     * self.preferences.open_space_bias
-                    * (1.0 + support_urgency * 0.18 + run_prediction.entropy * 0.16),
+                    * (1.0
+                        + support_urgency * 0.18
+                        + run_prediction.entropy * 0.16
+                        + lp_shape_fit * 0.12),
                 true,
             ),
         ];
@@ -6174,22 +7704,43 @@ impl PlayerAgent {
                     0.68 + shape_support_urgency * 0.10
                         + holder_pressure_urgency * 0.18
                         + backfield_long_pass_run * 0.46
-                        + if advance_upfield_strategy_active { 0.24 } else { 0.0 }
+                        + if advance_upfield_strategy_active {
+                            0.24
+                        } else {
+                            0.0
+                        }
                         + run_prediction.weight_for_label("run-in-behind") * 0.58
                         + run_prediction.off_ball_pitch_value_score_lift(),
                 ),
                 true,
             ));
         }
-        if let Some(target) = special_targets.exploit_space {
-            let target = guarded_exploit_space_target(target);
+        if let Some(target) = special_targets
+            .forward_receive
+            .or(special_targets.exploit_space)
+        {
+            let target = if special_targets.forward_receive.is_some() {
+                target
+            } else {
+                guarded_exploit_space_target(target)
+            };
+            let forward_receive_lift = if special_targets.forward_receive.is_some() {
+                0.48 + holder_pressure_urgency * 0.10
+            } else {
+                0.0
+            };
             options.push(AgentActionOptionTrace::new(
                 "exploit-space-run",
                 special_score(
                     target,
-                    0.66 + shape_support_urgency * 0.16
+                    0.66 + forward_receive_lift
+                        + shape_support_urgency * 0.16
                         + holder_pressure_urgency * 0.14
-                        + if advance_upfield_strategy_active { 0.26 } else { 0.0 }
+                        + if advance_upfield_strategy_active {
+                            0.26
+                        } else {
+                            0.0
+                        }
                         + run_prediction.weight_for_label("exploit-space-run") * 0.54
                         + run_prediction.off_ball_pitch_value_score_lift(),
                 ),
@@ -6401,6 +7952,8 @@ impl PlayerAgent {
         {
             let strategy_floor = if exploit_space_strategy_active {
                 0.42
+            } else if special_targets.forward_receive.is_some() {
+                0.36
             } else {
                 0.0
             };
@@ -6417,6 +7970,9 @@ impl PlayerAgent {
                     },
                 );
             ensure_min_legal_option_probability(&mut options, "exploit-space-run", exploit_floor);
+            if special_targets.forward_receive.is_some() {
+                ensure_min_legal_option_probability(&mut options, "exploit-space-run", 0.58);
+            }
         }
         if options
             .iter()
@@ -6644,7 +8200,7 @@ impl PlayerAgent {
         let defensive_mindedness = self.preferences.defensive_mindedness.clamp(0.0, 1.0);
         let offensive_mindedness = self.preferences.offensive_mindedness.clamp(0.0, 1.0);
         let press = directive.press_intensity.clamp(0.0, 1.0);
-        let (mut shape_score, roam_score) = if self.role == PlayerRole::Goalkeeper {
+        let (mut shape_score, mut roam_score) = if self.role == PlayerRole::Goalkeeper {
             let ball_distance = self.position.distance(snapshot.ball.position);
             let close_ball = (1.0 - ball_distance / 12.0).clamp(0.0, 1.0);
             let line_recovery = snapshot.goalkeeper_line_recovery_sprint_active(self.id);
@@ -6666,6 +8222,19 @@ impl PlayerAgent {
         };
         let press_profile = (self.role != PlayerRole::Goalkeeper)
             .then(|| snapshot.defensive_press_contain_profile_for(self.id));
+        if !matches!(self.role, PlayerRole::Goalkeeper | PlayerRole::Forward) {
+            let goal_side_line = defensive_goal_side_line_profile_for_role(
+                self.team,
+                self.role,
+                self.position,
+                snapshot,
+            );
+            let recovery = goal_side_line.recovery_pressure.clamp(0.0, 1.0);
+            if recovery > 0.0 {
+                shape_score = (shape_score * (1.0 + recovery * 0.38)).clamp(0.10, 1.48);
+                roam_score *= (1.0 - recovery * 0.30).clamp(0.58, 1.0);
+            }
+        }
         let press_model_score = press_profile
             .map(|profile| profile.press_score)
             .unwrap_or(0.0)
@@ -6976,6 +8545,13 @@ impl PlayerAgent {
             mdp_mpc_comparison,
             learned_mpc_replan: None,
             behavior_policy_probability: self.pending_policy_behavior_probability,
+            actor_policy_probability: None,
+            neural_mcts_selected: false,
+            neural_mcts_candidate_count: 0,
+            neural_mcts_discretized_kick_candidate_count: 0,
+            neural_mcts_root_discretized_kick_candidate_count: 0,
+            neural_mcts_dribble_candidate_count: 0,
+            neural_mcts_root_dribble_candidate_count: 0,
             action: action_label,
         }
     }
@@ -6993,6 +8569,7 @@ impl PlayerAgent {
             SoccerAction::DribbleMove { target, touch, .. } => (*target, None, Some(*touch)),
             SoccerAction::Pass {
                 target_player,
+                target_point,
                 power,
                 flight,
                 ..
@@ -7007,21 +8584,23 @@ impl PlayerAgent {
                     })
                     .or_else(|| snapshot.best_pass_target(self.id));
                 let passer_position = snapshot.player_position(self.id).unwrap_or(self.position);
-                let point = resolved_target
-                    .and_then(|id| {
-                        let target_position = snapshot.player_position(id)?;
-                        let is_cross = pass_would_be_cross(
-                            passer_position,
-                            target_position,
-                            self.team,
-                            snapshot.field_width,
-                            snapshot.field_length,
-                        );
-                        let speed =
-                            pass_speed_yps_from_power(*power, *flight, is_cross, &self.skills);
-                        snapshot
-                            .anticipated_pass_reception_point(self.id, id, *flight, speed)
-                            .or(Some(target_position))
+                let point = (*target_point)
+                    .or_else(|| {
+                        resolved_target.and_then(|id| {
+                            let target_position = snapshot.player_position(id)?;
+                            let is_cross = pass_would_be_cross(
+                                passer_position,
+                                target_position,
+                                self.team,
+                                snapshot.field_width,
+                                snapshot.field_length,
+                            );
+                            let speed =
+                                pass_speed_yps_from_power(*power, *flight, is_cross, &self.skills);
+                            snapshot
+                                .anticipated_pass_reception_point(self.id, id, *flight, speed)
+                                .or(Some(target_position))
+                        })
                     })
                     .unwrap_or_else(|| {
                         Vec2::new(
@@ -7063,6 +8642,7 @@ impl PlayerAgent {
             )),
             facing,
             dribble_touch,
+            receiver_descriptor: None,
         })
     }
 
@@ -7127,6 +8707,7 @@ impl PlayerAgent {
             return Some((
                 SoccerAction::Shoot {
                     power: shot_power_for_skill(ability01(self.skills.shooting)),
+                    target_point: None,
                 },
                 restart_label.to_string(),
             ));
@@ -7167,6 +8748,7 @@ impl PlayerAgent {
             Some(id) => Some((
                 SoccerAction::Pass {
                     target_player: Some(id),
+                    target_point: None,
                     power,
                     flight,
                 },
@@ -7402,7 +8984,13 @@ impl PlayerAgent {
         observation: &SoccerPomdpObservation,
     ) -> (SoccerAction, String) {
         if shot_decision_is_qualified_for_role(observation, self.role) {
-            return (SoccerAction::Shoot { power: 1.0 }, "shoot".to_string());
+            return (
+                SoccerAction::Shoot {
+                    power: 1.0,
+                    target_point: None,
+                },
+                "shoot".to_string(),
+            );
         }
 
         self.human_carry_or_protect_action(snapshot, observation)
@@ -7469,6 +9057,7 @@ impl PlayerAgent {
             return (
                 SoccerAction::Pass {
                     target_player: Some(target),
+                    target_point: None,
                     power,
                     flight,
                 },
@@ -7755,7 +9344,8 @@ impl PlayerAgent {
         let intent = snapshot.midfield_line_band_adjusted_intent(intent);
         let intent = snapshot.forward_line_band_adjusted_intent(intent);
         let intent = snapshot.wingback_width_adjusted_intent(intent);
-        snapshot.possession_wide_lane_floor_adjusted_intent(intent)
+        let intent = snapshot.possession_wide_lane_floor_adjusted_intent(intent);
+        snapshot.teammate_spacing_path_adjusted_intent(intent)
     }
 
     /// Per-tick decision entry. Thin wrapper over [`Self::run_time_step_with_context_inner`]
@@ -7940,6 +9530,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: input.target_player,
+                                target_point: None,
                                 power: if restart_label == "throw-in" {
                                     0.58
                                 } else {
@@ -8112,10 +9703,7 @@ impl PlayerAgent {
                             "keeper-foot-control-outside-box",
                         )
                     } else {
-                        (
-                            vec!["ball-at-feet-reflex".to_string()],
-                            "control-ball-at-feet",
-                        )
+                        (vec!["ball-at-feet-reflex".to_string()], "control-touch")
                     };
                     self.last_decision = Some(self.decision_trace(
                         snapshot,
@@ -8286,10 +9874,24 @@ impl PlayerAgent {
                 let under_urgent_pressure = observation.nearest_opponent_distance.is_finite()
                     && observation.nearest_opponent_distance
                         <= GOALKEEPER_OUTSIDE_BOX_URGENT_PRESSURE_YARDS;
-                if let Some(plan) = snapshot.goalkeeper_mpc_play_out_plan(self.id, None) {
+                let learned_keeper_target = learned_plan.and_then(|plan| {
+                    let label = normalize_soccer_action_label(&plan.action);
+                    if pass_like_action_flight(label).is_some()
+                        || matches!(label, "keeper-mpc-floor-pass" | "keeper-mpc-aerial-pass")
+                    {
+                        plan.target_player
+                    } else {
+                        None
+                    }
+                });
+                let learned_keeper_target_requested = learned_keeper_target.is_some();
+                if let Some(plan) =
+                    snapshot.goalkeeper_mpc_play_out_plan(self.id, learned_keeper_target)
+                {
                     let action = if let Some(target_player) = plan.target_player {
                         SoccerAction::Pass {
                             target_player: Some(target_player),
+                            target_point: None,
                             power: plan.power,
                             flight: plan.flight,
                         }
@@ -8343,6 +9945,9 @@ impl PlayerAgent {
                         ];
                         if learned_keeper_release_requested {
                             operation_order.push("learned-keeper-release".to_string());
+                        }
+                        if learned_keeper_target_requested {
+                            operation_order.push("pomdp-target-player".to_string());
                         }
                         if outside_box_release {
                             operation_order.push("outside-box-no-hands".to_string());
@@ -8421,6 +10026,7 @@ impl PlayerAgent {
                 // logic was turning most chosen wall passes into unrelated possessions.
                 let action = SoccerAction::Pass {
                     target_player: Some(runner),
+                    target_point: None,
                     power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
                     flight: PassFlight::Floor,
                 };
@@ -8448,6 +10054,7 @@ impl PlayerAgent {
                 if give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY {
                     let action = SoccerAction::Pass {
                         target_player: Some(plan.wall_partner),
+                        target_point: None,
                         power: WALL_PASS_GIVE_POWER + 0.20 * passing_skill,
                         flight: PassFlight::Floor,
                     };
@@ -8478,7 +10085,7 @@ impl PlayerAgent {
         if has_ball && observation.first_touch_available {
             let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
             let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
-            let action_options = self.first_touch_action_options(
+            let mut action_options = self.first_touch_action_options(
                 &observation,
                 pass_targets.len(),
                 aerial_pass_targets.len(),
@@ -8500,6 +10107,7 @@ impl PlayerAgent {
                 };
                 let action = SoccerAction::Shoot {
                     power: shot_power_for_finish_skill(finish_skill),
+                    target_point: None,
                 };
                 let action_label = if is_aerial {
                     "first-time-header"
@@ -8507,6 +10115,7 @@ impl PlayerAgent {
                     "first-time-shot"
                 };
                 if mpc_reselects_candidate(snapshot, self, &action, action_label) {
+                    suppress_mpc_reselected_action_option(&mut action_options, action_label);
                     forced_first_touch_order.extend([
                         "first-touch-goalmouth-window".to_string(),
                         "must-shoot".to_string(),
@@ -8583,6 +10192,7 @@ impl PlayerAgent {
                         let candidate_label = normalize_soccer_action_label(&op).to_string();
                         let candidate_action = SoccerAction::Shoot {
                             power: shot_power_for_finish_skill(finish_skill),
+                            target_point: None,
                         };
                         if mpc_reselects_candidate(
                             snapshot,
@@ -8590,6 +10200,10 @@ impl PlayerAgent {
                             &candidate_action,
                             &candidate_label,
                         ) {
+                            suppress_mpc_reselected_action_option(
+                                &mut action_options,
+                                &candidate_label,
+                            );
                             order_names.push(format!("first-touch-mpc-reselect:{candidate_label}"));
                             continue;
                         }
@@ -8603,6 +10217,7 @@ impl PlayerAgent {
                             let candidate_label = "killer-pass".to_string();
                             let candidate_action = SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: None,
                                 power: 0.66
                                     + 0.24 * passing_skill.max(ability01(self.skills.vision)),
                                 flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
@@ -8613,6 +10228,10 @@ impl PlayerAgent {
                                 &candidate_action,
                                 &candidate_label,
                             ) {
+                                suppress_mpc_reselected_action_option(
+                                    &mut action_options,
+                                    &candidate_label,
+                                );
                                 order_names
                                     .push(format!("first-touch-mpc-reselect:{candidate_label}"));
                                 continue;
@@ -8629,6 +10248,7 @@ impl PlayerAgent {
                         let candidate_label = "first-time-pass".to_string();
                         let candidate_action = SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.54 + 0.30 * passing_skill,
                             flight: PassFlight::Floor,
                         };
@@ -8638,6 +10258,10 @@ impl PlayerAgent {
                             &candidate_action,
                             &candidate_label,
                         ) {
+                            suppress_mpc_reselected_action_option(
+                                &mut action_options,
+                                &candidate_label,
+                            );
                             order_names.push(format!("first-touch-mpc-reselect:{candidate_label}"));
                             continue;
                         }
@@ -8649,6 +10273,7 @@ impl PlayerAgent {
                         let candidate_label = "flick-on".to_string();
                         let candidate_action = SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.46
                                 + 0.26
                                     * aerial_duel_skill_from_agent(self)
@@ -8661,6 +10286,10 @@ impl PlayerAgent {
                             &candidate_action,
                             &candidate_label,
                         ) {
+                            suppress_mpc_reselected_action_option(
+                                &mut action_options,
+                                &candidate_label,
+                            );
                             order_names.push(format!("first-touch-mpc-reselect:{candidate_label}"));
                             continue;
                         }
@@ -8693,6 +10322,7 @@ impl PlayerAgent {
             });
             let first_touch_escape_sprint = matches!(action, SoccerAction::ControlTouch { .. })
                 && observation.first_touch_escape_pressure >= FIRST_TOUCH_ESCAPE_SPRINT_PRESSURE;
+            let action_options = normalize_action_options(action_options);
             self.last_decision = Some(self.decision_trace(
                 snapshot,
                 mdp_state,
@@ -8750,6 +10380,7 @@ impl PlayerAgent {
         {
             let action = SoccerAction::Shoot {
                 power: shot_power_for_skill(shooting_skill),
+                target_point: None,
             };
             let action_label = action.label();
             self.last_decision = Some(self.decision_trace(
@@ -8783,6 +10414,7 @@ impl PlayerAgent {
             ) {
                 let action = SoccerAction::Shoot {
                     power: shot_power_for_skill(shooting_skill),
+                    target_point: None,
                 };
                 let action_label = action.label();
                 self.last_decision = Some(self.decision_trace(
@@ -8842,6 +10474,7 @@ impl PlayerAgent {
             ) {
                 let action = SoccerAction::Shoot {
                     power: shot_power_for_skill(shooting_skill),
+                    target_point: None,
                 };
                 let action_label = action.label();
                 self.last_decision = Some(self.decision_trace(
@@ -8967,6 +10600,7 @@ impl PlayerAgent {
                     ) {
                         let action = SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.80 + 0.14 * crossing.max(passing_skill),
                             flight: PassFlight::Aerial,
                         };
@@ -9004,9 +10638,9 @@ impl PlayerAgent {
                         observation,
                         belief,
                         vec!["runaround-collect".to_string()],
-                        single_action_option("runaround-collect"),
+                        single_action_option("runaround-dribble"),
                         &action,
-                        "runaround-collect",
+                        "runaround-dribble",
                     ));
                     return PlayerIntent {
                         player_id: self.id,
@@ -9193,8 +10827,9 @@ impl PlayerAgent {
         }
 
         let mut learned_mpc_reselect_label: Option<String> = None;
+        let mut learned_mpc_reselect_probability: Option<f64> = None;
         if let Some(plan) = learned_plan {
-            if let Some((action, action_label)) =
+            if let Some((mut action, mut action_label)) =
                 self.action_from_learned_plan(plan, snapshot, &observation)
             {
                 if matches!(action, SoccerAction::Shoot { .. }) {
@@ -9248,6 +10883,13 @@ impl PlayerAgent {
                             kind,
                             touch,
                         };
+                        let action_options = self.learned_policy_counterfactual_action_options(
+                            snapshot,
+                            &observation,
+                            &directive,
+                            has_ball,
+                            kind.label(),
+                        );
                         let mut decision = self.decision_trace(
                             snapshot,
                             mdp_state,
@@ -9258,7 +10900,7 @@ impl PlayerAgent {
                                 plan.action.clone(),
                                 "defer-shot".to_string(),
                             ],
-                            single_action_option(kind.label()),
+                            action_options,
                             &defer_action,
                             kind.label(),
                         );
@@ -9271,8 +10913,11 @@ impl PlayerAgent {
                         };
                     }
                 }
-                if mpc_reselects_candidate(snapshot, self, &action, &action_label) {
+                if let Some(rejected_probability) =
+                    mpc_reselect_rejection_probability(snapshot, self, &action, &action_label)
+                {
                     learned_mpc_reselect_label = Some(action_label.clone());
+                    learned_mpc_reselect_probability = Some(rejected_probability);
                 } else {
                     if action_label == "wall-pass" {
                         if let Some(plan) = snapshot.wall_pass_option_for(self.id) {
@@ -9311,17 +10956,65 @@ impl PlayerAgent {
                             &action,
                         )
                     };
+                    let concrete_action_options = self.learned_policy_concrete_action_options(
+                        snapshot,
+                        &observation,
+                        &directive,
+                        has_ball,
+                    );
+                    let mut operation_order =
+                        vec!["learned-policy".to_string(), plan.action.clone()];
+                    let mut option_score_safety_original: Option<(String, f64)> = None;
+                    if let Some((safety_action, safety_label, rejected_execution_probability)) =
+                        self.learned_policy_option_score_safety_override(
+                            plan,
+                            snapshot,
+                            &observation,
+                            &action,
+                            &concrete_action_options,
+                            &action_label,
+                        )
+                    {
+                        let original_label = action_label.clone();
+                        action = safety_action;
+                        action_label = safety_label;
+                        operation_order.push(format!(
+                            "option-score-safety:{original_label}->{action_label}"
+                        ));
+                        option_score_safety_original =
+                            Some((original_label, rejected_execution_probability));
+                    }
+                    let action_options = self.learned_policy_counterfactual_action_options(
+                        snapshot,
+                        &observation,
+                        &directive,
+                        has_ball,
+                        &action_label,
+                    );
                     let mut decision = self.decision_trace(
                         snapshot,
                         mdp_state,
                         observation,
                         belief,
-                        vec!["learned-policy".to_string(), plan.action.clone()],
-                        single_action_option(&action_label),
+                        operation_order,
+                        action_options,
                         &action,
                         action_label,
                     );
-                    decision.learned_mpc_replan = plan.mpc_replan.clone();
+                    if let Some((original_label, rejected_execution_probability)) =
+                        option_score_safety_original
+                    {
+                        decision.learned_mpc_replan =
+                            learned_policy_option_score_safety_replan_trace(
+                                &original_label,
+                                &decision.action,
+                                rejected_execution_probability,
+                                &decision.action_options,
+                            )
+                            .or_else(|| plan.mpc_replan.clone());
+                    } else {
+                        decision.learned_mpc_replan = plan.mpc_replan.clone();
+                    }
                     self.last_decision = Some(decision);
                     return PlayerIntent {
                         player_id: self.id,
@@ -9335,6 +11028,15 @@ impl PlayerAgent {
         if has_ball {
             let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
             let strategic_pass_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+            let curriculum_forward_pass_target = if forward_pass_climb_curriculum_enabled() {
+                possession_curriculum_forward_pass_target_for(
+                    snapshot,
+                    self.id,
+                    &strategic_pass_targets,
+                )
+            } else {
+                None
+            };
             let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
             let hold_up_flank_target = snapshot.attacking_hold_up_flank_target_for(self.id);
             let mut action_options = self.possession_action_options(
@@ -9435,23 +11137,49 @@ impl PlayerAgent {
                 let technique = ability01(self.skills.flair_passing) * 0.5
                     + ability01(self.skills.passing) * 0.3
                     + ability01(self.skills.vision) * 0.2;
-                let scoop_chance = (0.22 + technique * 0.56)
+                let scoop_chance = (1.24 + technique * 0.32)
                     .max(if scoop_strategy_requested {
-                        0.78 + technique * 0.10
+                        1.42 + technique * 0.24
                     } else {
                         0.0
                     })
-                    .clamp(0.0, if scoop_strategy_requested { 0.94 } else { 0.80 });
+                    .clamp(0.0, if scoop_strategy_requested { 1.72 } else { 1.60 });
                 (target, scoop_chance)
             });
             if let Some((_, scoop_chance)) = scoop_pass_option {
+                // Completion gate: a scoop scored from TECHNIQUE alone (and floored below) wins a
+                // majority share even into a covered lane — the live "pass straight to the
+                // opponent". Scale BOTH the propensity and the floor by how likely the lofted ball
+                // actually reaches the target (aerial completion × open flight lane). A good chip
+                // keeps ~full weight; a giveaway collapses so a carry / square ball wins instead.
+                // Off (`DD_SOCCER_ENABLE_SCOOP_COMPLETION_GATE=0`) ⇒ technique-only (byte-identical).
+                let scoop_completion_gate = dd_soccer_enable_scoop_completion_gate();
+                let scoop_viability = if scoop_completion_gate {
+                    scoop_completion_viability(&observation)
+                } else {
+                    1.0
+                };
                 action_options.push(AgentActionOptionTrace::new(
                     "scoop-pass",
-                    scoop_chance,
+                    scoop_chance * scoop_viability,
                     true,
                 ));
                 if scoop_strategy_requested {
-                    ensure_min_legal_option_probability(&mut action_options, "scoop-pass", 0.64);
+                    ensure_min_legal_option_probability(
+                        &mut action_options,
+                        "scoop-pass",
+                        0.64 * scoop_viability,
+                    );
+                } else if dd_soccer_enable_scoop_lane_blocked() {
+                    // Live-frequency bias: a scoop is only ever offered into a genuinely blocked
+                    // lane to an open man (every geometry check in `scoop_pass_target_for` passed),
+                    // so floor its propensity enough to compete with a carry / square ball instead
+                    // of being buried by the policy. Off ⇒ unchanged (technique-scored only).
+                    ensure_min_legal_option_probability(
+                        &mut action_options,
+                        "scoop-pass",
+                        0.52 * scoop_viability,
+                    );
                 }
             }
             let wall_pass_option = snapshot.wall_pass_option_for(self.id).map(|plan| {
@@ -9461,11 +11189,40 @@ impl PlayerAgent {
                         .clamp(0.0, 1.0))
                 .clamp(0.0, 1.0);
                 let ambition_appetite = if attack_ambition_enabled() { 1.45 } else { 1.0 };
+                // Moderate default-ON live-frequency bump: lift the propensity to combine so an
+                // available good one-two competes with carries/through-balls (kill switch
+                // `DD_SOCCER_ENABLE_GIVE_AND_GO_AMBITION=0`). Off ⇒ 1.0 (byte-identical).
+                let gg_ambition = give_and_go_ambition_enabled();
+                let gg_ambition_appetite = if gg_ambition {
+                    GIVE_AND_GO_AMBITION_APPETITE_MULTIPLIER
+                } else {
+                    1.0
+                };
+                // Learned MARL/MAPPO lift: when the trained give-and-go head ranks THIS one-two
+                // above its analytic seed, raise the appetite (never suppress it). 1.0 when the
+                // head is off/untrained, so the gate-off path is byte-identical.
+                let learned_lift = snapshot.give_and_go_learned_appetite_lift(self.id);
+                // Pass-and-move context lift (independent of the give-and-go ambition/learned lifts
+                // above): raise the one-two appetite when the move opens forward opportunity / a
+                // numbers advantage / a run lane. 1.0 at neutral context, so it only ADDS. Stacks
+                // with `gg_ambition_appetite` and `learned_lift` in `raw_wall_appetite` below.
+                let pass_and_move_context = (observation
+                    .pass_and_move_forward_opportunity
+                    .clamp(0.0, 1.0)
+                    * 0.46
+                    + observation.pass_and_move_numbers_advantage.clamp(0.0, 1.0) * 0.26
+                    + observation.pass_and_move_run_lane_score.clamp(0.0, 1.0) * 0.28)
+                    .clamp(0.0, 1.0);
+                let one_two_context_lift =
+                    1.0 + pass_and_move_context * WALL_PASS_PASS_AND_MOVE_CONTEXT_APPETITE_BOOST;
                 let raw_wall_appetite = WALL_PASS_BASE_APPETITE
                     * ambition_appetite
+                    * gg_ambition_appetite
+                    * learned_lift
                     * self.preferences.pass_bias.clamp(0.4, 1.0)
                     * (0.55 + passing_skill * 0.45 + ability01(self.skills.vision) * 0.25)
                     * (0.5 + plan.quality)
+                    * one_two_context_lift
                     * (1.0 + observation.perceived_pressure.clamp(0.0, 1.0) * 0.9)
                     * (1.0 + goal_proximity * 0.8)
                     * if give_and_go_strategy {
@@ -9478,9 +11235,18 @@ impl PlayerAgent {
                 } else {
                     0.0
                 };
+                // Lift the non-strategy ceiling modestly under the ambition bump so a strong
+                // available one-two is not capped below decisive options.
+                let appetite_ceiling = if give_and_go_strategy {
+                    0.97
+                } else if gg_ambition {
+                    GIVE_AND_GO_AMBITION_APPETITE_CEILING
+                } else {
+                    0.92
+                };
                 let wall_appetite = raw_wall_appetite
                     .max(strategy_commitment_floor)
-                    .clamp(0.0, if give_and_go_strategy { 0.97 } else { 0.92 });
+                    .clamp(0.0, appetite_ceiling);
                 let strategy_commits =
                     give_and_go_strategy && plan.quality >= WALL_PASS_STRATEGY_COMMIT_MIN_QUALITY;
                 (plan, wall_appetite, strategy_commits)
@@ -9522,6 +11288,24 @@ impl PlayerAgent {
                         * (0.60 + patience * 0.60)
                         * (0.50 + calm * 0.70))
                         .clamp(0.0, HOLD_FOR_SUPPORT_MAX_APPETITE);
+                    let pressured_recovery = pressured_hold_for_support_enabled()
+                        && observation.expected_pass_completion <= 0.34
+                        && observation
+                            .perceived_pressure
+                            .max(observation.pressure_urgency)
+                            .max(observation.immediate_dispossession_risk)
+                            >= 0.70
+                        && observation.forward_dribble_space_yards
+                            <= HOLD_FOR_SUPPORT_PRESSURED_MAX_DRIBBLE_SPACE_YARDS
+                        && observation.visible_forward_pass_options <= 1;
+                    let appetite = if pressured_recovery {
+                        appetite.max(
+                            (HOLD_FOR_SUPPORT_BASE_APPETITE * (0.74 + plan.quality * 0.96))
+                                .clamp(0.30, HOLD_FOR_SUPPORT_MAX_APPETITE),
+                        )
+                    } else {
+                        appetite
+                    };
                     action_options.push(AgentActionOptionTrace::new(
                         "wait-for-support",
                         appetite,
@@ -9638,6 +11422,9 @@ impl PlayerAgent {
                 }
             }
             action_options = normalize_action_options(action_options);
+            if let Some(label) = learned_mpc_reselect_label.as_deref() {
+                suppress_mpc_reselected_action_option(&mut action_options, label);
+            }
             annotate_tick_probabilities_from_scores(&mut action_options, snapshot.dt_seconds);
             let mut weighted_ops = vec![
                 (
@@ -9851,6 +11638,7 @@ impl PlayerAgent {
                             chosen = Some((
                                 SoccerAction::Shoot {
                                     power: shot_power_for_skill(shooting_skill),
+                                    target_point: None,
                                 },
                                 "shoot".to_string(),
                             ));
@@ -10181,7 +11969,13 @@ impl PlayerAgent {
                     "route-one" => {
                         order_names.push("route-one".to_string());
                         let route_one_chance = action_option_score(&action_options, "route-one");
-                        if agentic_action_commitment(
+                        let visible_runner_target = snapshot.route_one_target_for(self.id);
+                        if Self::learned_route_one_viable(
+                            &observation,
+                            self.role,
+                            ability01(self.skills.dribbling),
+                            visible_runner_target.is_some(),
+                        ) && agentic_action_commitment(
                             route_one_chance,
                             snapshot.dt_seconds,
                             &observation,
@@ -10189,17 +11983,15 @@ impl PlayerAgent {
                         ) {
                             chosen = Some((
                                 SoccerAction::RouteOne {
-                                    target: snapshot.route_one_target_for(self.id).unwrap_or_else(
-                                        || {
-                                            route_one_target_for_actor(
-                                                self.team,
-                                                self.position,
-                                                snapshot.field_width,
-                                                snapshot.field_length,
-                                                self.role,
-                                            )
-                                        },
-                                    ),
+                                    target: visible_runner_target.unwrap_or_else(|| {
+                                        route_one_target_for_actor(
+                                            self.team,
+                                            self.position,
+                                            snapshot.field_width,
+                                            snapshot.field_length,
+                                            self.role,
+                                        )
+                                    }),
                                     power: 0.76
                                         + 0.18 * passing_skill.max(ability01(self.skills.strength)),
                                 },
@@ -10224,6 +12016,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.60 + 0.26 * crossing.max(passing_skill),
                                         flight: PassFlight::Floor,
                                     },
@@ -10249,6 +12042,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.64 + 0.28 * crossing.max(passing_skill),
                                         flight: PassFlight::Aerial,
                                     },
@@ -10275,6 +12069,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.62 + 0.28 * crossing.max(passing_skill),
                                         flight: PassFlight::Floor,
                                     },
@@ -10285,6 +12080,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.66 + 0.28 * crossing.max(passing_skill),
                                         flight: PassFlight::Aerial,
                                     },
@@ -10309,6 +12105,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.66
                                             + 0.24
                                                 * passing_skill.max(ability01(self.skills.vision)),
@@ -10336,6 +12133,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.46 + 0.22 * passing_skill,
                                         flight: PassFlight::Floor,
                                     },
@@ -10360,6 +12158,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.62
                                             + 0.24
                                                 * passing_skill
@@ -10385,6 +12184,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(scoop_target),
+                                        target_point: None,
                                         power: 0.5,
                                         flight: PassFlight::Scoop,
                                     },
@@ -10407,6 +12207,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.50
                                             + 0.22
                                                 * passing_skill
@@ -10432,6 +12233,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.46
                                             + 0.26
                                                 * aerial_duel_skill_from_agent(self)
@@ -10458,6 +12260,7 @@ impl PlayerAgent {
                                 chosen = Some((
                                     SoccerAction::Pass {
                                         target_player: Some(plan.wall_partner),
+                                        target_point: None,
                                         power: WALL_PASS_GIVE_POWER + 0.20 * passing_skill,
                                         flight: PassFlight::Floor,
                                     },
@@ -10576,9 +12379,17 @@ impl PlayerAgent {
                             .ok()
                             .and_then(|n| n.checked_sub(1))
                             .unwrap_or(0);
-                        if rank >= pass_targets.len() {
+                        let Some(target) = possession_ranked_pass_target_for(
+                            rank,
+                            &pass_targets,
+                            &strategic_pass_targets,
+                            observation
+                                .quick_forward_pass_target
+                                .filter(|id| strategic_pass_targets.contains(id))
+                                .or(curriculum_forward_pass_target),
+                        ) else {
                             continue;
-                        }
+                        };
                         order_names.push(format!("pass{}", rank + 1));
                         let pass_chance = action_option_score(&action_options, pass_label);
                         if agentic_action_commitment(
@@ -10587,21 +12398,20 @@ impl PlayerAgent {
                             &observation,
                             self.role,
                         ) {
-                            // The primary pass adopts the quick forward (5-15 yd, open, advanced)
-                            // teammate when one qualifies, so the floored "pass sooner" release
-                            // actually goes forward to feet. None when the gate is off ⇒ the
-                            // ranked target is used unchanged.
-                            let target = if rank == 0 {
-                                observation
-                                    .quick_forward_pass_target
-                                    .filter(|id| pass_targets.contains(id))
-                                    .unwrap_or(pass_targets[rank])
-                            } else {
-                                pass_targets[rank]
-                            };
+                            if let Some(promoted) = self.promoted_floor_pass_to_aerial_action(
+                                snapshot,
+                                &observation,
+                                target,
+                                rank,
+                                passing_skill,
+                            ) {
+                                chosen = Some(promoted);
+                                break;
+                            }
                             chosen = Some((
                                 SoccerAction::Pass {
                                     target_player: Some(target),
+                                    target_point: None,
                                     power: 0.58 + 0.32 * passing_skill,
                                     flight: PassFlight::Floor,
                                 },
@@ -10634,6 +12444,7 @@ impl PlayerAgent {
                             chosen = Some((
                                 SoccerAction::Pass {
                                     target_player: Some(target),
+                                    target_point: None,
                                     power: 0.56 + 0.28 * crossing.max(passing_skill),
                                     flight: PassFlight::Aerial,
                                 },
@@ -10696,6 +12507,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.66 + 0.24 * passing_skill.max(ability01(self.skills.vision)),
                             flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
                         },
@@ -10707,6 +12519,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Shoot {
                             power: shot_power_for_skill(shooting_skill),
+                            target_point: None,
                         },
                         "shoot".to_string(),
                     )
@@ -10714,6 +12527,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.66 + 0.24 * passing_skill.max(ability01(self.skills.vision)),
                             flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
                         },
@@ -10762,7 +12576,14 @@ impl PlayerAgent {
                         },
                         kind.label().to_string(),
                     )
-                } else if let Some(plan) = open_pass_lane_plan {
+                } else if let Some(plan) = open_pass_lane_plan.filter(|_| {
+                    let open_lane_score =
+                        action_option_score(&action_options, OPEN_PASS_LANE_ACTION_LABEL);
+                    let pass_score = action_option_score(&action_options, "pass1");
+                    let carry_score = action_option_score(&action_options, "carry-forward")
+                        .max(action_option_score(&action_options, "vertical-attack"));
+                    open_lane_score >= pass_score.max(carry_score)
+                }) {
                     (
                         SoccerAction::DribbleMove {
                             target: plan.target,
@@ -10772,9 +12593,19 @@ impl PlayerAgent {
                         OPEN_PASS_LANE_ACTION_LABEL.to_string(),
                     )
                 } else if let Some(target) = pass_targets.first() {
+                    if let Some(promoted) = self.promoted_floor_pass_to_aerial_action(
+                        snapshot,
+                        &observation,
+                        *target,
+                        0,
+                        passing_skill,
+                    ) {
+                        return promoted;
+                    }
                     (
                         SoccerAction::Pass {
                             target_player: Some(*target),
+                            target_point: None,
                             power: 0.58 + 0.32 * passing_skill,
                             flight: PassFlight::Floor,
                         },
@@ -10800,6 +12631,7 @@ impl PlayerAgent {
                 }
             });
             if mpc_reselects_candidate(snapshot, self, &action, &action_label) {
+                let rejected_action_label = action_label.clone();
                 let rejected_label = normalize_soccer_action_label(&action_label).to_string();
                 order_names.push(format!("mpc-reselect:{}", action_label));
                 if rejected_label == "wall-pass" {
@@ -10810,7 +12642,8 @@ impl PlayerAgent {
                     .filter(|option| option.legal && option.score > 0.0)
                     .filter(|option| {
                         let label = normalize_soccer_action_label(&option.label);
-                        label != rejected_label && label != "wall-pass"
+                        !mpc_reselect_rejects_option_label(&option.label, &rejected_action_label)
+                            && label != "wall-pass"
                     })
                     .filter_map(|option| {
                         let label = if option.label == "scoop-pass" {
@@ -10830,6 +12663,7 @@ impl PlayerAgent {
                                 Some((
                                     SoccerAction::Shoot {
                                         power: shot_power_for_skill(shooting_skill),
+                                        target_point: None,
                                     },
                                     "shoot".to_string(),
                                 ))
@@ -10843,9 +12677,21 @@ impl PlayerAgent {
                                     .and_then(|n| n.checked_sub(1))
                                     .unwrap_or(0);
                                 pass_targets.get(rank).copied().map(|target| {
+                                    if let Some(promoted) = self
+                                        .promoted_floor_pass_to_aerial_action(
+                                            snapshot,
+                                            &observation,
+                                            target,
+                                            rank,
+                                            passing_skill,
+                                        )
+                                    {
+                                        return promoted;
+                                    }
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.58 + 0.32 * passing_skill,
                                             flight: PassFlight::Floor,
                                         },
@@ -10868,6 +12714,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.56 + 0.28 * crossing.max(passing_skill),
                                             flight: PassFlight::Aerial,
                                         },
@@ -10881,6 +12728,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.66
                                                 + 0.24
                                                     * passing_skill
@@ -10897,6 +12745,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.46 + 0.22 * passing_skill,
                                             flight: PassFlight::Floor,
                                         },
@@ -10909,6 +12758,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.62
                                                 + 0.24
                                                     * passing_skill
@@ -10925,6 +12775,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.60 + 0.26 * crossing.max(passing_skill),
                                         flight: PassFlight::Floor,
                                     },
@@ -10939,6 +12790,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.64 + 0.28 * crossing.max(passing_skill),
                                             flight: PassFlight::Aerial,
                                         },
@@ -10956,6 +12808,7 @@ impl PlayerAgent {
                                     (
                                         SoccerAction::Pass {
                                             target_player: Some(target),
+                                            target_point: None,
                                             power: 0.62 + 0.28 * crossing.max(passing_skill),
                                             flight: PassFlight::Floor,
                                         },
@@ -10972,6 +12825,7 @@ impl PlayerAgent {
                                         (
                                             SoccerAction::Pass {
                                                 target_player: Some(target),
+                                                target_point: None,
                                                 power: 0.66 + 0.28 * crossing.max(passing_skill),
                                                 flight: PassFlight::Aerial,
                                             },
@@ -10983,6 +12837,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.5,
                                         flight: PassFlight::Scoop,
                                     },
@@ -10993,6 +12848,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.50
                                             + 0.22
                                                 * passing_skill
@@ -11006,6 +12862,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: None,
                                         power: 0.46
                                             + 0.26
                                                 * aerial_duel_skill_from_agent(self)
@@ -11120,23 +12977,33 @@ impl PlayerAgent {
                                 },
                                 "clearance".to_string(),
                             )),
-                            "route-one" => Some((
-                                SoccerAction::RouteOne {
-                                    target: snapshot.route_one_target_for(self.id).unwrap_or_else(
-                                        || {
-                                            route_one_target_for_actor(
-                                                self.team,
-                                                self.position,
-                                                snapshot.field_width,
-                                                snapshot.field_length,
-                                                self.role,
-                                            )
+                            "route-one" => {
+                                let visible_runner_target = snapshot.route_one_target_for(self.id);
+                                if Self::learned_route_one_viable(
+                                    &observation,
+                                    self.role,
+                                    ability01(self.skills.dribbling),
+                                    visible_runner_target.is_some(),
+                                ) {
+                                    Some((
+                                        SoccerAction::RouteOne {
+                                            target: visible_runner_target.unwrap_or_else(|| {
+                                                route_one_target_for_actor(
+                                                    self.team,
+                                                    self.position,
+                                                    snapshot.field_width,
+                                                    snapshot.field_length,
+                                                    self.role,
+                                                )
+                                            }),
+                                            power: 0.80,
                                         },
-                                    ),
-                                    power: 0.80,
-                                },
-                                "route-one".to_string(),
-                            )),
+                                        "route-one".to_string(),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            }
                             _ => None,
                         };
                         candidate
@@ -11187,7 +13054,11 @@ impl PlayerAgent {
                 isolated_attacking_carrier_drive_mode(
                     &observation,
                     self.role,
-                    is_outside_midfielder_role(self.role, self.home_position.x, snapshot.field_width),
+                    is_outside_midfielder_role(
+                        self.role,
+                        self.home_position.x,
+                        snapshot.field_width,
+                    ),
                 )
             } else {
                 None
@@ -11217,7 +13088,7 @@ impl PlayerAgent {
                     || observation.decision_urgency > 0.46
                     || observation.offensive_urgency > 0.34
             };
-            self.last_decision = Some(self.decision_trace(
+            let mut decision = self.decision_trace(
                 snapshot,
                 mdp_state,
                 observation,
@@ -11226,7 +13097,28 @@ impl PlayerAgent {
                 action_options,
                 &action,
                 action_label,
-            ));
+            );
+            if let (Some(original), Some(rejected_execution_probability)) = (
+                learned_mpc_reselect_label.as_deref(),
+                learned_mpc_reselect_probability,
+            ) {
+                let original_action = learned_mpc_action_label_key(original);
+                let replacement_action = learned_mpc_action_label_key(&decision.action);
+                if original_action != replacement_action {
+                    decision.learned_mpc_replan = Some(SoccerLearnedMpcReplanTrace {
+                        original_action,
+                        replacement_action,
+                        source: SoccerLearnedMpcReplanSource::Mpc,
+                        rejected_execution_probability,
+                        candidate_count: decision
+                            .action_options
+                            .iter()
+                            .filter(|option| option.legal)
+                            .count(),
+                    });
+                }
+            }
+            self.last_decision = Some(decision);
             return PlayerIntent {
                 player_id: self.id,
                 action,
@@ -11324,12 +13216,19 @@ impl PlayerAgent {
                         }
                     }),
                     "exploit-space-run" => {
-                        support_context.special_targets.exploit_space.map(|point| {
-                            SupportMovementTarget {
-                                point: guarded_support_special(point),
+                        if let Some(point) = support_context.special_targets.forward_receive {
+                            Some(SupportMovementTarget {
+                                point,
                                 action_label: "exploit-space-run",
-                            }
-                        })
+                            })
+                        } else {
+                            support_context.special_targets.exploit_space.map(|point| {
+                                SupportMovementTarget {
+                                    point: guarded_support_special(point),
+                                    action_label: "exploit-space-run",
+                                }
+                            })
+                        }
                     }
                     "wide-outlet" => support_context.special_targets.wide_outlet.map(|point| {
                         SupportMovementTarget {
@@ -11395,9 +13294,15 @@ impl PlayerAgent {
                 snapshot
                     .formation_lp_guidance_for(self.id)
                     .map(|guidance| SupportMovementTarget {
+                        // Formation shape is a NUDGE the player's own support pick can override
+                        // (gated). Off ⇒ returns guidance.target ⇒ authoritative as before.
                         point: snapshot.clamp_to_role_position(
                             self.id,
-                            guidance.target,
+                            formation_nudged_target(
+                                self.decision_confidence,
+                                support_target.point,
+                                guidance.target,
+                            ),
                             self.home_position,
                             false,
                         ),
@@ -11430,6 +13335,10 @@ impl PlayerAgent {
                 (
                     "press-cover".to_string(),
                     action_option_score(&action_options, "press-cover"),
+                ),
+                (
+                    "blindside-steal".to_string(),
+                    action_option_score(&action_options, "blindside-steal"),
                 ),
             ];
             let cadence_hold_label = decision_cadence_hold_label_from_weights(
@@ -11491,6 +13400,18 @@ impl PlayerAgent {
                             }
                         }
                     }
+                    "blindside-steal" => {
+                        order_names.push("blindside-steal".to_string());
+                        if let Some(assessment) = snapshot.blindside_steal_assessment(self.id) {
+                            chosen = Some((
+                                SoccerAction::Tackle {
+                                    target_player: assessment.target,
+                                },
+                                "blindside-steal".to_string(),
+                            ));
+                            break;
+                        }
+                    }
                     "defend-shape" | "defend-roam" | "press-cover" => {
                         let press_cover = op.as_str() == "press-cover";
                         let roam = op.as_str() == "defend-roam" || press_cover;
@@ -11500,20 +13421,41 @@ impl PlayerAgent {
                         let target = if self.role == PlayerRole::Goalkeeper {
                             snapshot.defensive_assignment_for(self.id, self.home_position, roam)
                         } else if press_cover {
-                            snapshot.defensive_assignment_for(self.id, self.home_position, true)
+                            snapshot
+                                .players
+                                .iter()
+                                .find(|player| player.id == self.id)
+                                .and_then(|player| snapshot.press_cover_target_for(player))
+                                .unwrap_or_else(|| {
+                                    snapshot.goal_side_defensive_target_for(
+                                        self.id,
+                                        snapshot.defensive_assignment_for(
+                                            self.id,
+                                            self.home_position,
+                                            true,
+                                        ),
+                                    )
+                                })
                         } else if roam && dist < defend_radius {
                             snapshot.goal_side_defensive_target_for(self.id, snapshot.ball.position)
                         } else {
+                            // Own defensive coordinate; the LP shape only NUDGES it (gated). Off ⇒
+                            // formation_nudged_target returns guidance.target ⇒ authoritative as before.
+                            let own_defensive = snapshot.defensive_assignment_for(
+                                self.id,
+                                self.home_position,
+                                roam,
+                            );
                             let target = snapshot
                                 .formation_lp_guidance_for(self.id)
-                                .map(|guidance| guidance.target)
-                                .unwrap_or_else(|| {
-                                    snapshot.defensive_assignment_for(
-                                        self.id,
-                                        self.home_position,
-                                        roam,
+                                .map(|guidance| {
+                                    formation_nudged_target(
+                                        self.decision_confidence,
+                                        own_defensive,
+                                        guidance.target,
                                     )
-                                });
+                                })
+                                .unwrap_or(own_defensive);
                             if self.role == PlayerRole::Defender {
                                 if let Some((holder_position, line_gap)) =
                                     snapshot.opponent_breakthrough_ball_carrier(self.team)
@@ -11531,12 +13473,20 @@ impl PlayerAgent {
                                 target
                             }
                         };
-                        let target = snapshot.goal_side_defensive_target_for(self.id, target);
+                        let target = if press_cover {
+                            target.clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+                        } else {
+                            snapshot.goal_side_defensive_target_for(self.id, target)
+                        };
                         // Push up to fill the space ahead when the ball is far upfield.
                         let (target, push_up) =
                             snapshot.defensive_push_up_adjustment(self.id, target);
                         push_up_sprint = push_up;
-                        let label = if press_cover { "press-cover" } else { "defend" };
+                        let label = if press_cover {
+                            "press-cover"
+                        } else {
+                            op.as_str()
+                        };
                         chosen = Some((SoccerAction::MoveTo(target), label.to_string()));
                         break;
                     }
@@ -11639,12 +13589,17 @@ impl PlayerAgent {
                     })
                     .map(|player| player.position.distance(movement_target))
                     .fold(f64::INFINITY, f64::min);
-                loose_ball_pressured_sprint = self.role != PlayerRole::Goalkeeper
+                loose_ball_pressured_sprint = (self.role != PlayerRole::Goalkeeper
                     && self.position.distance(movement_target)
                         > LOOSE_BALL_PRESSURED_SPRINT_MIN_DISTANCE_YARDS
                     && (fifty_fifty_duel
                         || nearest_opponent_to_ball
-                            <= LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS);
+                            <= LOOSE_BALL_PRESSURED_SPRINT_OPPONENT_RADIUS_YARDS))
+                    // Match the opponent's committed pace: if a nearby opponent is
+                    // running/sprinting this ball down, our elected chaser sprints to
+                    // keep up even when the proximity gate above would not have fired.
+                    || snapshot
+                        .loose_ball_opponent_pace_match_sprint(self.id, movement_target);
                 (
                     SoccerAction::MoveTo(movement_target),
                     ACTION_LABEL_RECOVER.to_string(),
@@ -11860,9 +13815,50 @@ impl PlayerAgent {
         observation: &SoccerPomdpObservation,
     ) -> Option<(SoccerAction, String)> {
         let label = normalize_soccer_action_label(&plan.action);
+        let learned_pass_target_point = |target: usize| {
+            if !dd_soccer_enable_neural_pass_space() {
+                return None;
+            }
+            let point = plan
+                .target_point?
+                .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+            if plan.target_player == Some(target) {
+                return Some(point);
+            }
+            let target_position = snapshot.player_position(target)?;
+            (plan.target_player.is_none()
+                && target_position.distance(point) <= SOCCER_SPACE_RUN_ONTO_YARDS)
+                .then_some(point)
+        };
+        let learned_space_runner_target = |targets: &[usize]| {
+            if !dd_soccer_enable_neural_pass_space() || plan.target_player.is_some() {
+                return None;
+            }
+            let point = plan
+                .target_point?
+                .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+            targets
+                .iter()
+                .copied()
+                .filter_map(|target| {
+                    let position = snapshot.player_position(target)?;
+                    let distance = position.distance(point);
+                    (distance <= SOCCER_SPACE_RUN_ONTO_YARDS).then_some((target, distance))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(target, _)| target)
+        };
         if !observation.has_ball
             && snapshot.controlled_possession_team() == Some(self.team.other())
-            && !matches!(label, "tackle" | "slide-tackle" | "press-cover")
+            && !matches!(
+                label,
+                "tackle"
+                    | "slide-tackle"
+                    | "blindside-steal"
+                    | "defend-shape"
+                    | "defend-roam"
+                    | "press-cover"
+            )
         {
             let assignment = snapshot.defensive_assignment_for(self.id, self.home_position, false);
             let target = plan
@@ -11872,6 +13868,60 @@ impl PlayerAgent {
             return Some((SoccerAction::MoveTo(target), "defend".to_string()));
         }
         match label {
+            "wait-for-support" if observation.has_ball => {
+                let kind = DribbleMoveKind::ProtectBall;
+                let touch = snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                let target = plan.target_point.unwrap_or_else(|| {
+                    snapshot.dribble_move_target_for_touch(self.id, self.home_position, kind, touch)
+                });
+                Some((
+                    SoccerAction::DribbleMove {
+                        target,
+                        kind,
+                        touch,
+                    },
+                    "wait-for-support".to_string(),
+                ))
+            }
+            "open-passing-lane" if observation.has_ball => {
+                let current = snapshot
+                    .player_position(self.id)
+                    .unwrap_or(self.position)
+                    .clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+                let learned_target = plan.target_point.and_then(|target| {
+                    let target = target.clamp_to_pitch(snapshot.field_width, snapshot.field_length);
+                    let touch = open_pass_lane_touch_for_target(self.team, current, target)?;
+                    let kind = open_pass_lane_kind_for_target(self.team, current, target);
+                    Some((target, kind, touch))
+                });
+                learned_target
+                    .or_else(|| {
+                        snapshot
+                            .dribble_to_open_passing_lane_for(self.id)
+                            .map(|(target, _, _)| {
+                                let kind =
+                                    open_pass_lane_kind_for_target(self.team, current, target);
+                                let touch =
+                                    open_pass_lane_touch_for_target(self.team, current, target)
+                                        .unwrap_or_else(|| {
+                                            snapshot.deterministic_dribble_touch_decision_for(
+                                                self.id, kind,
+                                            )
+                                        });
+                                (target, kind, touch)
+                            })
+                    })
+                    .map(|(target, kind, touch)| {
+                        (
+                            SoccerAction::DribbleMove {
+                                target,
+                                kind,
+                                touch,
+                            },
+                            "open-passing-lane".to_string(),
+                        )
+                    })
+            }
             "shoot"
                 if observation.has_ball
                     && (shot_decision_is_qualified_for_role(observation, self.role)
@@ -11881,11 +13931,22 @@ impl PlayerAgent {
                             ability01(self.skills.shooting),
                         )) =>
             {
+                let learned_label = learned_mpc_action_label_key(&plan.action);
+                let power = learned_discretized_kick_power_for_action_label(&plan.action)
+                    .unwrap_or_else(|| shot_power_for_skill(ability01(self.skills.shooting)));
                 Some((
                     SoccerAction::Shoot {
-                        power: shot_power_for_skill(ability01(self.skills.shooting)),
+                        power,
+                        // ACTOR-OWNED SHOT PLACEMENT (default-OFF): carry the plan's chosen
+                        // goal-mouth aim into the action so execution honors it instead of
+                        // discarding it and re-defaulting to goal-centre. Off ⇒ None ⇒ identical.
+                        target_point: if dd_soccer_enable_actor_shot_placement() {
+                            plan.target_point
+                        } else {
+                            None
+                        },
                     },
-                    "shoot".to_string(),
+                    learned_label,
                 ))
             }
             "wall-pass" if observation.has_ball => {
@@ -11893,11 +13954,25 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(plan.wall_partner),
+                            target_point: None,
                             power: WALL_PASS_GIVE_POWER
                                 + 0.20 * ability01(self.skills.passing_completion_rate),
                             flight: PassFlight::Floor,
                         },
                         "wall-pass".to_string(),
+                    )
+                })
+            }
+            "wall-return" if observation.has_ball => {
+                snapshot.wall_return_pass_target_for(self.id).map(|runner| {
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(runner),
+                            target_point: None,
+                            power: WALL_PASS_GIVE_POWER + 0.22 * ability01(self.skills.passing),
+                            flight: PassFlight::Floor,
+                        },
+                        "wall-return".to_string(),
                     )
                 })
             }
@@ -11912,6 +13987,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: learned_pass_target_point(target),
                                 power: 0.62
                                     + 0.28
                                         * crossing
@@ -11929,6 +14005,7 @@ impl PlayerAgent {
                                 (
                                     SoccerAction::Pass {
                                         target_player: Some(target),
+                                        target_point: learned_pass_target_point(target),
                                         power: 0.66
                                             + 0.28
                                                 * crossing.max(ability01(
@@ -11946,6 +14023,7 @@ impl PlayerAgent {
                 let target = plan
                     .target_player
                     .filter(|target| visible_targets.contains(target))
+                    .or_else(|| learned_space_runner_target(&visible_targets))
                     .or_else(|| {
                         plan.target_point.and_then(|point| {
                             visible_targets.iter().copied().min_by(|a, b| {
@@ -11970,6 +14048,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power: 0.60
                                 + 0.26
                                     * crossing.max(ability01(self.skills.passing_completion_rate)),
@@ -11984,6 +14063,7 @@ impl PlayerAgent {
                 let target = plan
                     .target_player
                     .filter(|target| visible_targets.contains(target))
+                    .or_else(|| learned_space_runner_target(&visible_targets))
                     .or_else(|| visible_targets.first().copied());
                 target.map(|target| {
                     let crossing =
@@ -11991,6 +14071,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power: 0.64
                                 + 0.28
                                     * crossing.max(ability01(self.skills.passing_completion_rate)),
@@ -12011,6 +14092,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power: 0.62
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
@@ -12034,6 +14116,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power: 0.46 + 0.22 * ability01(self.skills.passing_completion_rate),
                             flight: PassFlight::Floor,
                         },
@@ -12046,6 +14129,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: None,
                             power: 0.5,
                             flight: PassFlight::Scoop,
                         },
@@ -12062,6 +14146,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: learned_pass_target_point(target),
                                 power: 0.50
                                     + 0.22
                                         * ability01(self.skills.passing_completion_rate)
@@ -12077,24 +14162,43 @@ impl PlayerAgent {
                 if !Self::learned_pass_viable(observation, PassFlight::Floor) {
                     return None;
                 }
+                let learned_kick_power =
+                    learned_discretized_kick_power_for_action_label(&plan.action);
                 let visible_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
-                if let Some(target) = learned_generic_pass_killer_upgrade_target_for(
-                    self,
-                    snapshot,
-                    observation,
-                    &visible_targets,
-                ) {
+                if let Some(power) = learned_kick_power {
+                    let target = plan
+                        .target_player
+                        .filter(|target| visible_targets.contains(target))?;
                     return Some((
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            power: 0.66
-                                + 0.24
-                                    * ability01(self.skills.passing_completion_rate)
-                                        .max(ability01(self.skills.vision)),
-                            flight: snapshot.killer_pass_flight_for(self.id, &visible_targets),
+                            target_point: learned_pass_target_point(target),
+                            power,
+                            flight: PassFlight::Floor,
                         },
-                        "killer-pass".to_string(),
+                        learned_mpc_action_label_key(&plan.action),
                     ));
+                }
+                if learned_kick_power.is_none() {
+                    if let Some(target) = learned_generic_pass_killer_upgrade_target_for(
+                        self,
+                        snapshot,
+                        observation,
+                        &visible_targets,
+                    ) {
+                        return Some((
+                            SoccerAction::Pass {
+                                target_player: Some(target),
+                                target_point: None,
+                                power: 0.66
+                                    + 0.24
+                                        * ability01(self.skills.passing_completion_rate)
+                                            .max(ability01(self.skills.vision)),
+                                flight: snapshot.killer_pass_flight_for(self.id, &visible_targets),
+                            },
+                            "killer-pass".to_string(),
+                        ));
+                    }
                 }
                 let target = plan
                     .target_player
@@ -12118,13 +14222,35 @@ impl PlayerAgent {
                     })
                     .or_else(|| visible_targets.first().copied());
                 target.map(|target| {
+                    let action_label = if ranked_pass_action_label(&plan.action)
+                        && (learned_kick_power.is_some() || plan.target_player == Some(target))
+                    {
+                        learned_mpc_action_label_key(&plan.action)
+                    } else {
+                        "pass".to_string()
+                    };
+                    if learned_kick_power.is_none() && plan.target_point.is_none() {
+                        let rank = floor_pass_label_rank(&plan.action).unwrap_or(0);
+                        if let Some(promoted) = self.promoted_floor_pass_to_aerial_action(
+                            snapshot,
+                            observation,
+                            target,
+                            rank,
+                            ability01(self.skills.passing_completion_rate),
+                        ) {
+                            return promoted;
+                        }
+                    }
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            power: 0.58 + 0.32 * ability01(self.skills.passing_completion_rate),
+                            target_point: learned_pass_target_point(target),
+                            power: learned_kick_power.unwrap_or_else(|| {
+                                0.58 + 0.32 * ability01(self.skills.passing_completion_rate)
+                            }),
                             flight: PassFlight::Floor,
                         },
-                        "pass".to_string(),
+                        action_label,
                     )
                 })
             }
@@ -12155,6 +14281,7 @@ impl PlayerAgent {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power: 0.66
                                 + 0.24
                                     * ability01(self.skills.passing_completion_rate)
@@ -12173,6 +14300,22 @@ impl PlayerAgent {
                     return None;
                 }
                 let visible_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 11);
+                let learned_kick_power =
+                    learned_discretized_kick_power_for_action_label(&plan.action);
+                if let Some(power) = learned_kick_power {
+                    let target = plan
+                        .target_player
+                        .filter(|target| visible_targets.contains(target))?;
+                    return Some((
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
+                            power,
+                            flight: PassFlight::Aerial,
+                        },
+                        learned_mpc_action_label_key(&plan.action),
+                    ));
+                }
                 let target = plan
                     .target_player
                     .filter(|target| visible_targets.contains(target))
@@ -12180,15 +14323,24 @@ impl PlayerAgent {
                 target.map(|target| {
                     let crossing =
                         ability01(self.skills.crossing_left.max(self.skills.crossing_right));
+                    let action_label = if ranked_pass_action_label(&plan.action)
+                        && (learned_kick_power.is_some() || plan.target_player == Some(target))
+                    {
+                        learned_mpc_action_label_key(&plan.action)
+                    } else {
+                        "aerial-pass".to_string()
+                    };
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
-                            power: 0.56
-                                + 0.28
-                                    * crossing.max(ability01(self.skills.passing_completion_rate)),
+                            target_point: learned_pass_target_point(target),
+                            power: learned_kick_power.unwrap_or_else(|| {
+                                0.56 + 0.28
+                                    * crossing.max(ability01(self.skills.passing_completion_rate))
+                            }),
                             flight: PassFlight::Aerial,
                         },
-                        "aerial-pass".to_string(),
+                        action_label,
                     )
                 })
             }
@@ -12201,6 +14353,7 @@ impl PlayerAgent {
                         (
                             SoccerAction::Pass {
                                 target_player: Some(target),
+                                target_point: learned_pass_target_point(target),
                                 power: 0.46
                                     + 0.26
                                         * aerial_duel_skill_from_agent(self)
@@ -12225,26 +14378,102 @@ impl PlayerAgent {
                             .max(self.skills.left_foot_shot_power),
                     )
                 };
+                let power = learned_discretized_kick_power_for_action_label(&plan.action)
+                    .unwrap_or_else(|| shot_power_for_finish_skill(finish_skill));
+                let learned_label = if label == "first-time-shot" {
+                    learned_mpc_action_label_key(&plan.action)
+                } else {
+                    label.to_string()
+                };
                 Some((
                     SoccerAction::Shoot {
-                        power: shot_power_for_finish_skill(finish_skill),
+                        power,
+                        // ACTOR-OWNED SHOT PLACEMENT (default-OFF): carry the plan's chosen
+                        // goal-mouth aim into the action so execution honors it instead of
+                        // discarding it and re-defaulting to goal-centre. Off ⇒ None ⇒ identical.
+                        target_point: if dd_soccer_enable_actor_shot_placement() {
+                            plan.target_point
+                        } else {
+                            None
+                        },
                     },
-                    label.to_string(),
+                    learned_label,
                 ))
+            }
+            "forward-release-pass" if forward_release_action_enabled() && observation.has_ball => {
+                let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
+                // Codex r24/r25: COMMIT forward, to the highest-QUALITY forward receiver. Prefer the
+                // quick-forward teammate; else the FIRST (best-ranked) visible receiver that is
+                // forward. `ranked_visible_pass_targets` is already ordered best-first, so this picks
+                // a high-quality forward option rather than the most-DISTANT one (v1's distance-max
+                // fallback chose far/covered receivers → worse pass-gain, the observed v1 failure).
+                // Never fall back to a lateral/backward target or a generic analytic lead.
+                let attack_dir = self.team.attack_dir();
+                let my_pos = snapshot.player_position(self.id).unwrap_or(self.position);
+                let is_forward = |id: &usize| {
+                    snapshot
+                        .player_position(*id)
+                        .map(|p| (p.y - my_pos.y) * attack_dir > 0.0)
+                        .unwrap_or(false)
+                };
+                // Codex r26: quick-forward teammate, else best-ranked forward receiver, but only if
+                // the best forward option clears the 0.50 quality floor; otherwise DECLINE so the
+                // actor picks another action rather than forcing a poor forward pass (the v1 failure).
+                let quick = observation
+                    .quick_forward_pass_target
+                    .filter(|id| visible.contains(id));
+                let (target, fwdrel_src) = if let Some(q) = quick {
+                    (Some(q), "quick")
+                } else if observation.best_forward_pass_option_quality >= 0.50 {
+                    (visible.iter().copied().find(is_forward), "fallback")
+                } else {
+                    (None, "decline")
+                };
+                // Target-health telemetry (Codex r25/r26 bet #1), env-gated so default behavior is
+                // byte-identical. Reveals quick-hit vs fallback vs decline rate + forward yards.
+                if std::env::var("DD_SOCCER_FWDREL_DIAG").is_ok() {
+                    let fy = target
+                        .and_then(|t| snapshot.player_position(t))
+                        .map(|p| (p.y - my_pos.y) * attack_dir)
+                        .unwrap_or(-1.0);
+                    eprintln!(
+                        "FWDREL src={fwdrel_src} fy={fy:.1} q={:.2} exp={:.2}",
+                        observation.best_forward_pass_option_quality,
+                        observation.expected_pass_completion
+                    );
+                }
+                target.map(|target| {
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            target_point: None,
+                            power: 0.54 + 0.30 * ability01(self.skills.passing_completion_rate),
+                            flight: PassFlight::Floor,
+                        },
+                        "forward-release-pass".to_string(),
+                    )
+                })
             }
             "first-time-pass" if observation.has_ball && observation.first_touch_available => {
                 let visible = snapshot.ranked_visible_pass_targets(self.id, 11);
                 // Prefer the quick forward (5-15 yd, open, advanced) teammate when one is on —
                 // played first-time and delivered through the MPC pass path. None when the gate
                 // is off ⇒ falls back to the top-ranked visible target (unchanged).
-                let target = observation
-                    .quick_forward_pass_target
-                    .filter(|id| visible.contains(id))
+                let target = plan
+                    .target_player
+                    .filter(|target| visible.contains(target))
+                    .or_else(|| learned_space_runner_target(&visible))
+                    .or_else(|| {
+                        observation
+                            .quick_forward_pass_target
+                            .filter(|id| visible.contains(id))
+                    })
                     .or_else(|| visible.first().copied());
                 target.map(|target| {
                     (
                         SoccerAction::Pass {
                             target_player: Some(target),
+                            target_point: learned_pass_target_point(target),
                             power: 0.54 + 0.30 * ability01(self.skills.passing_completion_rate),
                             flight: PassFlight::Floor,
                         },
@@ -12259,55 +14488,68 @@ impl PlayerAgent {
                     "control-touch".to_string(),
                 ))
             }
-            "clearance" if observation.has_ball => Some((
-                SoccerAction::Clearance {
-                    target: snapshot
-                        .pressure_clearance_target_for(self.id)
-                        .unwrap_or_else(|| {
-                            clearance_target_for_player(
-                                self.team,
-                                self.position,
-                                snapshot.field_width,
-                                snapshot.field_length,
-                            )
-                        }),
-                    power: 0.92,
-                },
-                "clearance".to_string(),
-            )),
-            "route-one" if observation.has_ball => Some((
-                SoccerAction::RouteOne {
-                    target: snapshot.route_one_target_for(self.id).unwrap_or_else(|| {
-                        route_one_target_for_actor(
-                            self.team,
-                            self.position,
-                            snapshot.field_width,
-                            snapshot.field_length,
-                            self.role,
-                        )
-                    }),
-                    power: 0.88,
-                },
-                "route-one".to_string(),
-            )),
-            "hold-up-flank" if observation.has_ball => {
-                if goal_approach_forces_goalmouth_carry(observation, self.role) {
-                    let kind = DribbleMoveKind::CarryForward;
-                    let touch = snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
-                    return Some((
-                        SoccerAction::DribbleMove {
-                            target: snapshot.dribble_move_target_for_touch(
-                                self.id,
-                                self.home_position,
-                                kind,
-                                touch,
-                            ),
-                            kind,
-                            touch,
-                        },
-                        kind.label().to_string(),
-                    ));
+            "clearance" if observation.has_ball => {
+                if !Self::learned_clearance_viable(observation, self.role) {
+                    return None;
                 }
+                Some((
+                    SoccerAction::Clearance {
+                        target: plan
+                            .target_point
+                            .map(|target| {
+                                target.clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+                            })
+                            .unwrap_or_else(|| {
+                                snapshot
+                                    .pressure_clearance_target_for(self.id)
+                                    .unwrap_or_else(|| {
+                                        clearance_target_for_player(
+                                            self.team,
+                                            self.position,
+                                            snapshot.field_width,
+                                            snapshot.field_length,
+                                        )
+                                    })
+                            }),
+                        power: 0.92,
+                    },
+                    "clearance".to_string(),
+                ))
+            }
+            "route-one" if observation.has_ball => {
+                let visible_runner_target = snapshot.route_one_target_for(self.id);
+                if !Self::learned_route_one_viable(
+                    observation,
+                    self.role,
+                    ability01(self.skills.dribbling),
+                    visible_runner_target.is_some(),
+                ) {
+                    return None;
+                }
+                Some((
+                    SoccerAction::RouteOne {
+                        target: plan
+                            .target_point
+                            .map(|target| {
+                                target.clamp_to_pitch(snapshot.field_width, snapshot.field_length)
+                            })
+                            .unwrap_or_else(|| {
+                                visible_runner_target.unwrap_or_else(|| {
+                                    route_one_target_for_actor(
+                                        self.team,
+                                        self.position,
+                                        snapshot.field_width,
+                                        snapshot.field_length,
+                                        self.role,
+                                    )
+                                })
+                            }),
+                        power: 0.88,
+                    },
+                    "route-one".to_string(),
+                ))
+            }
+            "hold-up-flank" if observation.has_ball => {
                 let target = plan
                     .target_point
                     .or_else(|| snapshot.attacking_hold_up_flank_target_for(self.id))?;
@@ -12396,18 +14638,21 @@ impl PlayerAgent {
                         score: 0.0,
                     })
                 });
-                self.open_pass_lane_dribble_plan_for(snapshot, observation, &lane_targets)
-                    .or(learned_target)
-                    .map(|lane_plan| {
-                        (
-                            SoccerAction::DribbleMove {
-                                target: lane_plan.target,
-                                kind: lane_plan.kind,
-                                touch: lane_plan.touch,
-                            },
-                            OPEN_PASS_LANE_ACTION_LABEL.to_string(),
-                        )
-                    })
+                let lane_plan = if plan.target_point.is_some() {
+                    learned_target
+                } else {
+                    self.open_pass_lane_dribble_plan_for(snapshot, observation, &lane_targets)
+                };
+                lane_plan.map(|lane_plan| {
+                    (
+                        SoccerAction::DribbleMove {
+                            target: lane_plan.target,
+                            kind: lane_plan.kind,
+                            touch: lane_plan.touch,
+                        },
+                        OPEN_PASS_LANE_ACTION_LABEL.to_string(),
+                    )
+                })
             }
             "dribble"
             | "vertical-attack"
@@ -12429,7 +14674,7 @@ impl PlayerAgent {
                 {
                     return Some(release);
                 }
-                let kind = match label {
+                let planned_kind = match label {
                     "vertical-attack" | "turnover-burst" => DribbleMoveKind::CarryForward,
                     "carry-forward" => DribbleMoveKind::CarryForward,
                     "carry-out-left" => DribbleMoveKind::CarryOutLeft,
@@ -12443,8 +14688,14 @@ impl PlayerAgent {
                     "fake-right-cut-left" => DribbleMoveKind::FakeRightCutLeft,
                     _ => self.agentic_fallback_dribble_kind(snapshot, observation, false, true),
                 };
-                let force_goal_drive = goal_approach_forces_goalmouth_carry(observation, self.role);
-                let kind = goal_approach_dribble_kind(kind, observation, self.role);
+                let pomdp_named_dribble = label != "dribble";
+                let force_goal_drive = !pomdp_named_dribble
+                    && goal_approach_forces_goalmouth_carry(observation, self.role);
+                let kind = if pomdp_named_dribble {
+                    planned_kind
+                } else {
+                    goal_approach_dribble_kind(planned_kind, observation, self.role)
+                };
                 let touch = snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
                 Some((
                     SoccerAction::DribbleMove {
@@ -12470,6 +14721,8 @@ impl PlayerAgent {
                     },
                     if matches!(label, "vertical-attack" | "turnover-burst") {
                         label.to_string()
+                    } else if pomdp_named_dribble {
+                        label.to_string()
                     } else {
                         kind.label().to_string()
                     },
@@ -12482,32 +14735,21 @@ impl PlayerAgent {
                     return Some(release);
                 }
                 let kind = snapshot.side_step_dribble_kind_for(self.id);
-                let force_goal_drive = goal_approach_forces_goalmouth_carry(observation, self.role);
-                let kind = goal_approach_dribble_kind(kind, observation, self.role);
                 let touch = snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
                 Some((
                     SoccerAction::DribbleMove {
-                        target: if force_goal_drive {
+                        target: plan.target_point.unwrap_or_else(|| {
                             snapshot.dribble_move_target_for_touch(
                                 self.id,
                                 self.home_position,
                                 kind,
                                 touch,
                             )
-                        } else {
-                            plan.target_point.unwrap_or_else(|| {
-                                snapshot.dribble_move_target_for_touch(
-                                    self.id,
-                                    self.home_position,
-                                    kind,
-                                    touch,
-                                )
-                            })
-                        },
+                        }),
                         kind,
                         touch,
                     },
-                    kind.label().to_string(),
+                    "side-step".to_string(),
                 ))
             }
             "defend" if snapshot.controlled_possession_team() == Some(self.team.other()) => Some((
@@ -12518,6 +14760,28 @@ impl PlayerAgent {
                 )),
                 "defend".to_string(),
             )),
+            "defend-shape" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                let own_defensive =
+                    snapshot.defensive_assignment_for(self.id, self.home_position, false);
+                let target = snapshot
+                    .formation_lp_guidance_for(self.id)
+                    .map(|guidance| {
+                        formation_nudged_target(
+                            self.decision_confidence,
+                            own_defensive,
+                            guidance.target,
+                        )
+                    })
+                    .unwrap_or(own_defensive);
+                Some((SoccerAction::MoveTo(target), "defend-shape".to_string()))
+            }
+            "defend-roam" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                let target = snapshot.goal_side_defensive_target_for(
+                    self.id,
+                    snapshot.defensive_assignment_for(self.id, self.home_position, true),
+                );
+                Some((SoccerAction::MoveTo(target), "defend-roam".to_string()))
+            }
             ACTION_LABEL_RECOVER if snapshot.controlled_possession_team().is_none() => Some((
                 SoccerAction::MoveTo(snapshot.loose_ball_recovery_target_for(self.id)),
                 ACTION_LABEL_RECOVER.to_string(),
@@ -12553,15 +14817,29 @@ impl PlayerAgent {
                     "slide-tackle".to_string(),
                 )
             }),
+            "blindside-steal" => snapshot
+                .blindside_steal_assessment(self.id)
+                .map(|assessment| {
+                    (
+                        SoccerAction::Tackle {
+                            target_player: assessment.target,
+                        },
+                        "blindside-steal".to_string(),
+                    )
+                }),
             "press-cover" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
-                let assignment =
-                    snapshot.defensive_assignment_for(self.id, self.home_position, true);
-                Some((
-                    SoccerAction::MoveTo(
-                        snapshot.goal_side_defensive_target_for(self.id, assignment),
-                    ),
-                    "press-cover".to_string(),
-                ))
+                let target = snapshot
+                    .players
+                    .iter()
+                    .find(|player| player.id == self.id)
+                    .and_then(|player| snapshot.press_cover_target_for(player))
+                    .unwrap_or_else(|| {
+                        snapshot.goal_side_defensive_target_for(
+                            self.id,
+                            snapshot.defensive_assignment_for(self.id, self.home_position, true),
+                        )
+                    });
+                Some((SoccerAction::MoveTo(target), "press-cover".to_string()))
             }
             DUMMY_LET_RUN_ACTION_LABEL if !observation.has_ball => snapshot
                 .teammate_dummy_let_run_target_for(self.id)
@@ -12579,6 +14857,26 @@ impl PlayerAgent {
                         DUMMY_CLEAR_LANE_ACTION_LABEL.to_string(),
                     )
                 }),
+            "lane-yield" if !observation.has_ball => snapshot
+                .pass_lane_yield_target_for(self.id, self.home_position)
+                .map(|(target, _)| {
+                    (
+                        SoccerAction::MoveTo(snapshot.shape_guarded_support_point(
+                            self.id,
+                            target,
+                            &[self.home_position],
+                            self.home_position,
+                            false,
+                        )),
+                        "lane-yield".to_string(),
+                    )
+                }),
+            "buildup-receive" if !observation.has_ball => Some((
+                SoccerAction::MoveTo(
+                    snapshot.goalkeeper_buildup_lane_target_for(self.id, self.home_position),
+                ),
+                "buildup-receive".to_string(),
+            )),
             "check-to-ball" if !observation.has_ball => snapshot
                 .check_to_ball_target_for(self.id, self.home_position)
                 .map(|target| {
@@ -12623,9 +14921,27 @@ impl PlayerAgent {
                         "wide-outlet".to_string(),
                     )
                 }),
+            "one-two-run" if !observation.has_ball => snapshot
+                .one_two_run_target_for(self.id)
+                .map(|target| (SoccerAction::MoveTo(target), "one-two-run".to_string())),
+            "pinch-cross-arrival" if !observation.has_ball => snapshot
+                .flank_cross_arrival_target_for(self.id, self.home_position)
+                .map(|target| {
+                    let open = snapshot.open_space_for(self.id, self.home_position);
+                    (
+                        SoccerAction::MoveTo(snapshot.shape_guarded_support_point(
+                            self.id,
+                            target,
+                            &[open, self.home_position],
+                            self.home_position,
+                            false,
+                        )),
+                        "pinch-cross-arrival".to_string(),
+                    )
+                }),
             "exploit-space-run" | "shot-creation-run" | "overlap-run" | "support-push-up"
             | "support-screen" | "support-shape" | "support-roam" | "vacate-space"
-            | "vertical-attack"
+            | "set-play-run" | "vertical-attack"
                 if !observation.has_ball =>
             {
                 let roam = matches!(label, "support-roam" | "overlap-run" | "vacate-space");
@@ -12633,17 +14949,32 @@ impl PlayerAgent {
                     snapshot.attacking_support_movement_for(self.id, self.home_position, roam);
                 let target = if self.role == PlayerRole::Goalkeeper {
                     support_target.point
-                } else {
-                    plan.target_point
-                        .map(|target| {
-                            snapshot.shape_guarded_learned_support_target(
+                } else if let Some(target) = plan.target_point {
+                    snapshot.shape_guarded_learned_support_target(
+                        self.id,
+                        target,
+                        support_target.point,
+                        self.home_position,
+                    )
+                } else if matches!(label, "support-shape" | "support-roam") {
+                    snapshot
+                        .formation_lp_guidance_for(self.id)
+                        .filter(|guidance| {
+                            guidance.team == self.team
+                                && guidance.target.x.is_finite()
+                                && guidance.target.y.is_finite()
+                        })
+                        .map(|guidance| {
+                            snapshot.clamp_to_role_position(
                                 self.id,
-                                target,
-                                support_target.point,
+                                guidance.target,
                                 self.home_position,
+                                false,
                             )
                         })
                         .unwrap_or(support_target.point)
+                } else {
+                    support_target.point
                 };
                 Some((SoccerAction::MoveTo(target), label.to_string()))
             }
@@ -12668,6 +14999,602 @@ impl PlayerAgent {
             "hold" => Some((SoccerAction::MoveTo(self.home_position), "hold".to_string())),
             _ => None,
         }
+    }
+
+    fn learned_policy_concrete_action_options(
+        &self,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+        directive: &TeamTacticalDirective,
+        has_ball: bool,
+    ) -> Vec<AgentActionOptionTrace> {
+        let options = if has_ball {
+            let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 3);
+            let strategic_pass_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+            let aerial_pass_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 3);
+            let hold_up_flank_target = snapshot.attacking_hold_up_flank_target_for(self.id);
+            let mut options = self.possession_action_options(
+                observation,
+                directive,
+                pass_targets.len(),
+                aerial_pass_targets.len(),
+                hold_up_flank_target.is_some(),
+                snapshot.dt_seconds,
+                snapshot.field_width,
+            );
+            if let Some(plan) =
+                self.open_pass_lane_dribble_plan_for(snapshot, observation, &strategic_pass_targets)
+            {
+                options.push(AgentActionOptionTrace::new(
+                    OPEN_PASS_LANE_ACTION_LABEL,
+                    plan.score,
+                    true,
+                ));
+            }
+            if let Some(plan) = self.round_goalkeeper_dribble_plan_for(snapshot, observation) {
+                options.push(AgentActionOptionTrace::new(
+                    ROUND_GOALKEEPER_ACTION_LABEL,
+                    plan.score,
+                    true,
+                ));
+            }
+            if let Some(plan) = snapshot.runaround_dribble_option_for(self.id) {
+                options.push(AgentActionOptionTrace::new(
+                    "runaround-dribble",
+                    plan.quality.clamp(0.0, 1.0),
+                    true,
+                ));
+            }
+            if let Some(plan) = snapshot.wall_pass_option_for(self.id) {
+                options.push(AgentActionOptionTrace::new(
+                    "wall-pass",
+                    (0.35 + plan.quality).clamp(0.0, 1.45),
+                    true,
+                ));
+            }
+            if snapshot.scoop_pass_target_for(self.id).is_some() {
+                options.push(AgentActionOptionTrace::new("scoop-pass", 0.85, true));
+            }
+            options
+        } else if snapshot.controlled_possession_team() == Some(self.team.other()) {
+            self.defensive_action_options(snapshot, directive, snapshot.dt_seconds)
+        } else {
+            Vec::new()
+        };
+        normalize_action_options(options)
+    }
+
+    fn learned_policy_counterfactual_action_options(
+        &self,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+        directive: &TeamTacticalDirective,
+        has_ball: bool,
+        action_label: &str,
+    ) -> Vec<AgentActionOptionTrace> {
+        let mut options =
+            self.learned_policy_concrete_action_options(snapshot, observation, directive, has_ball);
+        if options.is_empty() {
+            return single_action_option(action_label);
+        }
+        if !options
+            .iter()
+            .any(|option| learned_mpc_action_labels_match(&option.label, action_label))
+        {
+            let neutral_score = options
+                .iter()
+                .filter(|option| option.legal)
+                .map(soccer_finite_option_score)
+                .fold(1.0, f64::max);
+            options.push(AgentActionOptionTrace::new(
+                action_label,
+                neutral_score,
+                true,
+            ));
+        }
+        normalize_action_options(options)
+    }
+
+    fn learned_policy_option_score_safety_override(
+        &self,
+        plan: &SoccerLearnedPlan,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+        chosen_action: &SoccerAction,
+        options: &[AgentActionOptionTrace],
+        action_label: &str,
+    ) -> Option<(SoccerAction, String, f64)> {
+        if !learned_policy_option_score_safety_enabled() {
+            return None;
+        }
+        let chosen_key = learned_mpc_action_label_key(action_label);
+        let chosen_score = options
+            .iter()
+            .find(|option| {
+                option.legal && learned_mpc_action_labels_match(&option.label, &chosen_key)
+            })
+            .map(soccer_finite_option_score)
+            .unwrap_or(0.0);
+        let mut fallback_options = options
+            .iter()
+            .filter(|option| option.legal)
+            .filter(|option| !learned_mpc_action_labels_match(&option.label, &chosen_key))
+            .collect::<Vec<_>>();
+        fallback_options.sort_by(|a, b| {
+            soccer_finite_option_score(b).total_cmp(&soccer_finite_option_score(a))
+        });
+        let best_score = fallback_options
+            .first()
+            .map(|option| soccer_finite_option_score(option))
+            .unwrap_or(0.0);
+        if !learned_policy_option_score_safety_trips(chosen_score, best_score) {
+            return None;
+        }
+        let chosen_family = normalize_soccer_action_label(&chosen_key);
+        if forward_pass_climb_curriculum_enabled()
+            && observation.has_ball
+            && pass_like_action_flight(chosen_family).is_some()
+            && matches!(
+                chosen_action,
+                SoccerAction::Pass {
+                    target_player: Some(_),
+                    ..
+                } | SoccerAction::Pass {
+                    target_point: Some(_),
+                    ..
+                }
+            )
+        {
+            return None;
+        }
+        let rejected_execution_probability =
+            learned_policy_option_score_safety_rejected_execution_probability(
+                chosen_score,
+                best_score,
+            );
+
+        for fallback_option in fallback_options {
+            let fallback_score = soccer_finite_option_score(fallback_option);
+            if !learned_policy_option_score_safety_trips(chosen_score, fallback_score) {
+                continue;
+            }
+
+            let direct_fallback = self
+                .option_score_safety_aerial_replacement_action(
+                    &fallback_option.label,
+                    snapshot,
+                    observation,
+                )
+                .or_else(|| {
+                    self.learned_policy_option_score_safety_direct_action(
+                        &fallback_option.label,
+                        snapshot,
+                        observation,
+                    )
+                });
+
+            if let Some((fallback_action, fallback_label)) = direct_fallback {
+                if !observation.has_ball
+                    || option_score_safety_possession_candidate_is_executable(
+                        snapshot,
+                        self,
+                        &fallback_action,
+                        &fallback_label,
+                    )
+                {
+                    return Some((
+                        fallback_action,
+                        fallback_label,
+                        rejected_execution_probability,
+                    ));
+                }
+            }
+
+            let fallback_plan = SoccerLearnedPlan {
+                action: fallback_option.label.clone(),
+                target_player: None,
+                target_point: None,
+                mpc_replan: plan.mpc_replan.clone(),
+            };
+            if let Some((fallback_action, fallback_label)) =
+                self.action_from_learned_plan(&fallback_plan, snapshot, observation)
+            {
+                let trace_label =
+                    if learned_mpc_action_labels_match(&fallback_option.label, &fallback_label)
+                        || normalize_soccer_action_label(&fallback_option.label)
+                            == normalize_soccer_action_label(&fallback_label)
+                    {
+                        fallback_option.label.clone()
+                    } else {
+                        fallback_label
+                    };
+                if !observation.has_ball
+                    || option_score_safety_possession_candidate_is_executable(
+                        snapshot,
+                        self,
+                        &fallback_action,
+                        &trace_label,
+                    )
+                {
+                    return Some((fallback_action, trace_label, rejected_execution_probability));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn option_score_safety_aerial_replacement_action(
+        &self,
+        label: &str,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+    ) -> Option<(SoccerAction, String)> {
+        if !observation.has_ball {
+            return None;
+        }
+        let rank = label
+            .strip_prefix("pass")
+            .and_then(|rank| rank.parse::<usize>().ok())
+            .and_then(|rank| rank.checked_sub(1))?;
+        let target = snapshot
+            .ranked_visible_pass_targets(self.id, 11)
+            .get(rank)
+            .copied()?;
+        self.promoted_floor_pass_to_aerial_action_with_gate(
+            snapshot,
+            observation,
+            target,
+            rank,
+            ability01(self.skills.passing_completion_rate),
+            option_score_replacement_should_promote_to_aerial,
+        )
+    }
+
+    fn learned_policy_option_score_safety_direct_action(
+        &self,
+        label: &str,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+    ) -> Option<(SoccerAction, String)> {
+        if !observation.has_ball {
+            let normalized = normalize_soccer_action_label(label);
+            return match normalized {
+                "defend" if snapshot.controlled_possession_team() == Some(self.team.other()) => {
+                    Some((
+                        SoccerAction::MoveTo(snapshot.defensive_assignment_for(
+                            self.id,
+                            self.home_position,
+                            false,
+                        )),
+                        "defend".to_string(),
+                    ))
+                }
+                "defend-shape"
+                    if snapshot.controlled_possession_team() == Some(self.team.other()) =>
+                {
+                    let own_defensive =
+                        snapshot.defensive_assignment_for(self.id, self.home_position, false);
+                    let target = snapshot
+                        .formation_lp_guidance_for(self.id)
+                        .map(|guidance| {
+                            formation_nudged_target(
+                                self.decision_confidence,
+                                own_defensive,
+                                guidance.target,
+                            )
+                        })
+                        .unwrap_or(own_defensive);
+                    Some((SoccerAction::MoveTo(target), "defend-shape".to_string()))
+                }
+                "defend-roam"
+                    if snapshot.controlled_possession_team() == Some(self.team.other()) =>
+                {
+                    Some((
+                        SoccerAction::MoveTo(snapshot.goal_side_defensive_target_for(
+                            self.id,
+                            snapshot.defensive_assignment_for(self.id, self.home_position, true),
+                        )),
+                        "defend-roam".to_string(),
+                    ))
+                }
+                "press-cover"
+                    if snapshot.controlled_possession_team() == Some(self.team.other()) =>
+                {
+                    let target = snapshot
+                        .players
+                        .iter()
+                        .find(|player| player.id == self.id)
+                        .and_then(|player| snapshot.press_cover_target_for(player))
+                        .unwrap_or_else(|| {
+                            snapshot.goal_side_defensive_target_for(
+                                self.id,
+                                snapshot.defensive_assignment_for(
+                                    self.id,
+                                    self.home_position,
+                                    true,
+                                ),
+                            )
+                        });
+                    Some((SoccerAction::MoveTo(target), "press-cover".to_string()))
+                }
+                "hold" if self.role == PlayerRole::Goalkeeper => Some((
+                    SoccerAction::MoveTo(snapshot.goalkeeper_ball_goal_tracking_target(self.team)),
+                    "hold".to_string(),
+                )),
+                _ => None,
+            };
+        }
+        let passing_skill = ability01(self.skills.passing_completion_rate);
+        if let Some(rank) = label
+            .strip_prefix("pass")
+            .and_then(|rank| rank.parse::<usize>().ok())
+            .and_then(|rank| rank.checked_sub(1))
+        {
+            return snapshot
+                .ranked_visible_pass_targets(self.id, 11)
+                .get(rank)
+                .copied()
+                .map(|target| {
+                    if let Some(promoted) = self.promoted_floor_pass_to_aerial_action(
+                        snapshot,
+                        observation,
+                        target,
+                        rank,
+                        passing_skill,
+                    ) {
+                        return promoted;
+                    }
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            target_point: None,
+                            power: 0.58 + 0.32 * passing_skill,
+                            flight: PassFlight::Floor,
+                        },
+                        format!("pass{}", rank + 1),
+                    )
+                });
+        }
+        if let Some(rank) = label
+            .strip_prefix("aerial-pass")
+            .and_then(|rank| rank.parse::<usize>().ok())
+            .and_then(|rank| rank.checked_sub(1))
+        {
+            let crossing = ability01(self.skills.crossing_left.max(self.skills.crossing_right));
+            return snapshot
+                .ranked_visible_aerial_pass_targets(self.id, 11)
+                .get(rank)
+                .copied()
+                .map(|target| {
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            target_point: None,
+                            power: 0.56 + 0.28 * crossing.max(passing_skill),
+                            flight: PassFlight::Aerial,
+                        },
+                        format!("aerial-pass{}", rank + 1),
+                    )
+                });
+        }
+
+        let normalized = normalize_soccer_action_label(label);
+        match normalized {
+            "pass" => snapshot
+                .ranked_visible_pass_targets(self.id, 11)
+                .first()
+                .copied()
+                .map(|target| {
+                    if let Some(promoted) = self.promoted_floor_pass_to_aerial_action(
+                        snapshot,
+                        observation,
+                        target,
+                        0,
+                        passing_skill,
+                    ) {
+                        return promoted;
+                    }
+                    (
+                        SoccerAction::Pass {
+                            target_player: Some(target),
+                            target_point: None,
+                            power: 0.58 + 0.32 * passing_skill,
+                            flight: PassFlight::Floor,
+                        },
+                        "pass1".to_string(),
+                    )
+                }),
+            "aerial-pass" => {
+                let crossing = ability01(self.skills.crossing_left.max(self.skills.crossing_right));
+                snapshot
+                    .ranked_visible_aerial_pass_targets(self.id, 11)
+                    .first()
+                    .copied()
+                    .map(|target| {
+                        (
+                            SoccerAction::Pass {
+                                target_player: Some(target),
+                                target_point: None,
+                                power: 0.56 + 0.28 * crossing.max(passing_skill),
+                                flight: PassFlight::Aerial,
+                            },
+                            "aerial-pass1".to_string(),
+                        )
+                    })
+            }
+            "killer-pass" => {
+                let pass_targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+                snapshot
+                    .killer_pass_target_for(self.id, &pass_targets)
+                    .map(|target| {
+                        (
+                            SoccerAction::Pass {
+                                target_player: Some(target),
+                                target_point: None,
+                                power: 0.66
+                                    + 0.24 * passing_skill.max(ability01(self.skills.vision)),
+                                flight: snapshot.killer_pass_flight_for(self.id, &pass_targets),
+                            },
+                            "killer-pass".to_string(),
+                        )
+                    })
+            }
+            "shoot"
+                if shot_decision_is_qualified_for_role(observation, self.role)
+                    || speculative_long_shot_is_qualified(
+                        observation,
+                        self.role,
+                        ability01(self.skills.shooting),
+                    ) =>
+            {
+                Some((
+                    SoccerAction::Shoot {
+                        power: shot_power_for_skill(ability01(self.skills.shooting)),
+                        target_point: None,
+                    },
+                    "shoot".to_string(),
+                ))
+            }
+            OPEN_PASS_LANE_ACTION_LABEL => {
+                let targets = snapshot.ranked_visible_pass_targets(self.id, 11);
+                self.open_pass_lane_dribble_plan_for(snapshot, observation, &targets)
+                    .map(|plan| {
+                        (
+                            SoccerAction::DribbleMove {
+                                target: plan.target,
+                                kind: plan.kind,
+                                touch: plan.touch,
+                            },
+                            OPEN_PASS_LANE_ACTION_LABEL.to_string(),
+                        )
+                    })
+            }
+            ROUND_GOALKEEPER_ACTION_LABEL => self
+                .round_goalkeeper_dribble_plan_for(snapshot, observation)
+                .map(|plan| {
+                    (
+                        SoccerAction::DribbleMove {
+                            target: plan.target,
+                            kind: plan.kind,
+                            touch: plan.touch,
+                        },
+                        ROUND_GOALKEEPER_ACTION_LABEL.to_string(),
+                    )
+                }),
+            "dribble"
+            | "vertical-attack"
+            | "turnover-burst"
+            | "carry-forward"
+            | "carry-out-left"
+            | "carry-out-right"
+            | "protect-ball"
+            | "xavi-turn"
+            | "left-cut"
+            | "right-cut"
+            | "nutmeg"
+            | "fake-left-cut-right"
+            | "fake-right-cut-left" => {
+                let planned_kind = match normalized {
+                    "vertical-attack" | "turnover-burst" | "carry-forward" => {
+                        DribbleMoveKind::CarryForward
+                    }
+                    "carry-out-left" => DribbleMoveKind::CarryOutLeft,
+                    "carry-out-right" => DribbleMoveKind::CarryOutRight,
+                    "protect-ball" => DribbleMoveKind::ProtectBall,
+                    "xavi-turn" => DribbleMoveKind::XaviTurn,
+                    "left-cut" => DribbleMoveKind::LeftCut,
+                    "right-cut" => DribbleMoveKind::RightCut,
+                    "nutmeg" => DribbleMoveKind::Nutmeg,
+                    "fake-left-cut-right" => DribbleMoveKind::FakeLeftCutRight,
+                    "fake-right-cut-left" => DribbleMoveKind::FakeRightCutLeft,
+                    _ => self.agentic_fallback_dribble_kind(snapshot, observation, false, true),
+                };
+                let pomdp_named_dribble = normalized != "dribble";
+                let kind = if pomdp_named_dribble {
+                    planned_kind
+                } else {
+                    goal_approach_dribble_kind(planned_kind, observation, self.role)
+                };
+                let touch = snapshot.deterministic_dribble_touch_decision_for(self.id, kind);
+                Some((
+                    SoccerAction::DribbleMove {
+                        target: snapshot.dribble_move_target_for_touch(
+                            self.id,
+                            self.home_position,
+                            kind,
+                            touch,
+                        ),
+                        kind,
+                        touch,
+                    },
+                    if matches!(normalized, "vertical-attack" | "turnover-burst") {
+                        normalized.to_string()
+                    } else if pomdp_named_dribble {
+                        normalized.to_string()
+                    } else {
+                        kind.label().to_string()
+                    },
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn promoted_floor_pass_to_aerial_action(
+        &self,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+        floor_target: usize,
+        floor_rank: usize,
+        passing_skill: f64,
+    ) -> Option<(SoccerAction, String)> {
+        self.promoted_floor_pass_to_aerial_action_with_gate(
+            snapshot,
+            observation,
+            floor_target,
+            floor_rank,
+            passing_skill,
+            floor_pass_should_promote_to_aerial,
+        )
+    }
+
+    fn promoted_floor_pass_to_aerial_action_with_gate(
+        &self,
+        snapshot: &WorldSnapshot,
+        observation: &SoccerPomdpObservation,
+        floor_target: usize,
+        floor_rank: usize,
+        passing_skill: f64,
+        should_promote: fn(&SoccerPomdpObservation, f64) -> bool,
+    ) -> Option<(SoccerAction, String)> {
+        let aerial_targets = snapshot.ranked_visible_aerial_pass_targets(self.id, 11);
+        let (target, aerial_rank) = aerial_targets
+            .iter()
+            .position(|target| *target == floor_target)
+            .map(|rank| (floor_target, rank))
+            .or_else(|| {
+                aerial_targets
+                    .get(floor_rank)
+                    .copied()
+                    .map(|target| (target, floor_rank))
+            })?;
+        let passer_position = snapshot.player_position(self.id).unwrap_or(self.position);
+        let target_position = snapshot.player_position(target)?;
+        let forward_yards = (target_position.y - passer_position.y) * self.team.attack_dir();
+        if !should_promote(observation, forward_yards) {
+            return None;
+        }
+        let crossing = ability01(self.skills.crossing_left.max(self.skills.crossing_right));
+        Some((
+            SoccerAction::Pass {
+                target_player: Some(target),
+                target_point: None,
+                power: 0.56 + 0.28 * crossing.max(passing_skill),
+                flight: PassFlight::Aerial,
+            },
+            format!("aerial-pass{}", aerial_rank + 1),
+        ))
     }
 
     fn switch_play_target_for(
@@ -12769,6 +15696,85 @@ impl PlayerAgent {
         completion >= LEARNED_PASS_MIN_COMPLETION || openness >= LEARNED_PASS_MIN_OPENNESS
     }
 
+    fn learned_clearance_viable(observation: &SoccerPomdpObservation, role: PlayerRole) -> bool {
+        if observation.yards_to_own_goal >= observation.yards_to_goal {
+            return false;
+        }
+        if observation.yards_to_own_goal <= 20.0 {
+            return true;
+        }
+        let close_danger = observation.nearest_opponent_distance
+            <= CLEARANCE_MAX_OPPONENT_DISTANCE_YARDS
+            || observation.immediate_dispossession_risk >= 0.50
+            || observation.pressure_urgency >= 0.62
+            || observation.defensive_urgency >= 0.70;
+        if matches!(role, PlayerRole::Goalkeeper | PlayerRole::Defender) && close_danger {
+            return true;
+        }
+        let no_safe_short_option = observation.expected_pass_completion
+            < LEARNED_PASS_MIN_COMPLETION
+            && observation.best_pass_receiver_openness < LEARNED_PASS_MIN_OPENNESS
+            && observation.forward_dribble_space_yards < DRIBBLE_OPEN_PLAY_MIN_FORWARD_SPACE_YARDS;
+        close_danger && no_safe_short_option
+    }
+
+    pub(crate) fn learned_route_one_viable(
+        observation: &SoccerPomdpObservation,
+        role: PlayerRole,
+        dribbling01: f64,
+        has_visible_runner_target: bool,
+    ) -> bool {
+        if !observation.has_ball || observation.yards_to_own_goal >= observation.yards_to_goal {
+            return false;
+        }
+
+        let pressure_signal = observation
+            .pressure_urgency
+            .max(observation.perceived_pressure)
+            .max(observation.immediate_dispossession_risk)
+            .max(observation.excessive_hold_pressure)
+            .max(excessive_hold_pressure(observation, dribbling01))
+            .clamp(0.0, 1.0);
+        let runner_signal =
+            ((observation.aerial_forward_runner_pass_multiplier - 1.0) / 0.50).clamp(0.0, 1.0);
+        let true_vertical_runner = runner_signal >= 0.52
+            && observation.expected_aerial_pass_completion >= 0.45
+            && observation.aerial_pass_interception_risk <= LEARNED_PASS_MAX_INTERCEPTION_RISK;
+        let safe_short_outlet = observation.visible_forward_pass_options > 0
+            && observation.expected_pass_completion >= OPEN_OUTLET_RELEASE_COMPLETION
+            && observation.best_pass_receiver_openness >= OPEN_OUTLET_RELEASE_OPENNESS;
+        let snapshot_vertical_window = has_visible_runner_target
+            && !safe_short_outlet
+            && observation.expected_aerial_pass_completion >= 0.38
+            && observation.aerial_pass_interception_risk <= LEARNED_PASS_MAX_INTERCEPTION_RISK;
+        let release_need = observation.defensive_urgency >= 0.62 && pressure_signal >= 0.50;
+        let forced_escape = pressure_signal >= 0.55
+            || observation.immediate_dispossession_risk >= 0.50
+            || observation.defensive_urgency >= 0.62
+            || observation.yards_to_own_goal <= 18.0;
+        let pressure_or_emergency = pressure_signal >= 0.30
+            || (observation.defensive_urgency >= 0.40 && pressure_signal >= 0.18)
+            || observation.yards_to_own_goal <= 18.0;
+        let last_ditch_escape = observation.yards_to_own_goal <= 18.0 && pressure_signal >= 0.50;
+        let proximity_gate = observation.nearest_opponent_distance <= 24.0
+            || observation.immediate_dispossession_risk >= 0.45
+            || observation.defensive_urgency >= 0.52
+            || observation.yards_to_own_goal <= 18.0
+            || true_vertical_runner
+            || (snapshot_vertical_window && pressure_or_emergency);
+        let outlet_gate = !safe_short_outlet
+            || forced_escape
+            || true_vertical_runner
+            || (snapshot_vertical_window && pressure_or_emergency);
+        let role_can_release = !matches!(role, PlayerRole::Forward)
+            || pressure_signal >= 0.45
+            || true_vertical_runner
+            || (snapshot_vertical_window && pressure_or_emergency)
+            || last_ditch_escape;
+
+        role_can_release && proximity_gate && outlet_gate && release_need && last_ditch_escape
+    }
+
     fn learned_stale_dribble_release_override(
         &self,
         snapshot: &WorldSnapshot,
@@ -12796,6 +15802,7 @@ impl PlayerAgent {
                 return Some((
                     SoccerAction::Pass {
                         target_player: Some(target),
+                        target_point: None,
                         power: 0.58 + 0.30 * ability01(self.skills.passing_completion_rate),
                         flight: PassFlight::Floor,
                     },
@@ -12884,6 +15891,7 @@ impl PlayerAgent {
             return Some((
                 SoccerAction::Shoot {
                     power: shot_power_for_skill(ability01(self.skills.shooting)),
+                    target_point: None,
                 },
                 "shoot".to_string(),
             ));
@@ -12901,6 +15909,7 @@ impl PlayerAgent {
             return Some((
                 SoccerAction::Pass {
                     target_player: Some(target),
+                    target_point: None,
                     power: 0.60 + 0.30 * ability01(self.skills.passing_completion_rate),
                     flight: PassFlight::Floor,
                 },
@@ -12920,6 +15929,7 @@ impl PlayerAgent {
             return Some((
                 SoccerAction::Pass {
                     target_player: Some(target),
+                    target_point: None,
                     power: 0.62
                         + 0.28
                             * ability01(
@@ -12977,6 +15987,8 @@ pub enum SoccerAction {
     },
     Pass {
         target_player: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_point: Option<Vec2>,
         power: f64,
         #[serde(default)]
         flight: PassFlight,
@@ -12991,6 +16003,10 @@ pub enum SoccerAction {
     },
     Shoot {
         power: f64,
+        /// Actor-chosen goal-mouth aim point. `None` (default) ⇒ analytic aim runs unchanged
+        /// (byte-identical). Populated only when `dd_soccer_enable_actor_shot_placement()` is on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_point: Option<Vec2>,
     },
     Tackle {
         target_player: usize,
@@ -13137,6 +16153,869 @@ pub struct SoccerLearnedPlan {
 }
 
 #[cfg(test)]
+mod learned_policy_option_score_safety_tests {
+    use super::*;
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn floor_to_aerial_promotion_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn floor_to_aerial_promotion_fixture() -> (SoccerMatch, usize, usize) {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94_506,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let mate = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.role != PlayerRole::Goalkeeper
+                    && player.id != holder
+            })
+            .expect("home teammate")
+            .id;
+        let width = sim.config.field_width_yards;
+        let holder_pos = Vec2::new(width * 0.50, 52.0);
+        let mate_pos = Vec2::new(width * 0.50, 66.0);
+        for player in sim.players.iter_mut() {
+            player.velocity = Vec2::zero();
+            if player.id == holder {
+                player.position = holder_pos;
+            } else if player.id == mate {
+                player.position = mate_pos;
+            } else if player.team == Team::Home {
+                player.position = Vec2::new(width * 0.20, 28.0 + player.id as f64 * 0.1);
+            } else {
+                player.position = Vec2::new(width * 0.88, 82.0 + player.id as f64 * 0.1);
+            }
+        }
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+        (sim, holder, mate)
+    }
+
+    fn pressured_bad_floor_good_aerial_observation(
+        snapshot: &WorldSnapshot,
+        holder: usize,
+    ) -> SoccerPomdpObservation {
+        let mut observation = snapshot.observation_for(holder);
+        observation.has_ball = true;
+        observation.visible_pass_options = 1;
+        observation.visible_aerial_pass_options = 1;
+        observation.visible_forward_pass_options = 1;
+        observation.expected_pass_completion = 0.28;
+        observation.expected_aerial_pass_completion = 0.72;
+        observation.best_pass_receiver_openness = 0.32;
+        observation.best_aerial_pass_receiver_openness = 0.70;
+        observation.aerial_pass_interception_risk = 0.52;
+        observation.perceived_pressure = 0.74;
+        observation.pressure_urgency = 0.82;
+        observation.immediate_dispossession_risk = 0.64;
+        observation
+    }
+
+    #[test]
+    fn learned_policy_option_score_safety_trips_on_catastrophic_gap() {
+        assert!(learned_policy_option_score_safety_trips_with_thresholds(
+            0.2, 18.0, 4.0, 3.0, 0.50,
+        ));
+    }
+
+    #[test]
+    fn learned_policy_option_score_safety_leaves_close_choices_to_policy() {
+        assert!(!learned_policy_option_score_safety_trips_with_thresholds(
+            8.0, 12.0, 4.0, 3.0, 0.50,
+        ));
+        assert!(!learned_policy_option_score_safety_trips_with_thresholds(
+            1.0, 3.5, 4.0, 3.0, 0.50,
+        ));
+    }
+
+    #[test]
+    fn learned_policy_option_score_safety_rejection_probability_is_score_ratio() {
+        let probability =
+            learned_policy_option_score_safety_rejected_execution_probability(0.2, 18.0);
+        assert!((probability - (0.2 / 18.0)).abs() < 1e-12);
+        assert_eq!(
+            learned_policy_option_score_safety_rejected_execution_probability(4.0, 2.0),
+            1.0
+        );
+        assert_eq!(
+            learned_policy_option_score_safety_rejected_execution_probability(1.0, 0.0),
+            0.0
+        );
+    }
+
+    #[test]
+    fn learned_policy_option_score_safety_replan_trace_marks_rejected_original() {
+        let trace = learned_policy_option_score_safety_replan_trace(
+            "xavi-turn",
+            "pass1",
+            0.05,
+            &[
+                AgentActionOptionTrace::new("xavi-turn", 0.2, true),
+                AgentActionOptionTrace::new("pass1", 18.0, true),
+                AgentActionOptionTrace::new("shoot", 0.0, false),
+            ],
+        )
+        .expect("safety replacement should stamp a replan trace");
+
+        assert_eq!(trace.original_action, "xavi-turn");
+        assert_eq!(trace.replacement_action, "pass1");
+        assert_eq!(
+            trace.source,
+            SoccerLearnedMpcReplanSource::OptionScoreSafety
+        );
+        assert_eq!(trace.rejected_execution_probability, 0.05);
+        assert_eq!(trace.candidate_count, 2);
+        assert!(
+            learned_policy_option_score_safety_replan_trace("pass1", "pass1", 0.05, &[]).is_none()
+        );
+    }
+
+    #[test]
+    fn option_score_safety_walks_past_unusable_best_fallback() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94_501,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let mate = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.role != PlayerRole::Goalkeeper
+                    && player.id != holder
+            })
+            .expect("home teammate")
+            .id;
+        let width = sim.config.field_width_yards;
+        let holder_pos = Vec2::new(width * 0.50, 52.0);
+        let mate_pos = Vec2::new(width * 0.50, 66.0);
+        for player in sim.players.iter_mut() {
+            if player.team == Team::Home && player.id != holder && player.id != mate {
+                player.position = Vec2::new(width * 0.20, 28.0 + player.id as f64 * 0.1);
+                player.velocity = Vec2::zero();
+            } else if player.team == Team::Away {
+                player.position = Vec2::new(width * 0.88, 82.0 + player.id as f64 * 0.1);
+                player.velocity = Vec2::zero();
+            }
+        }
+        sim.players[holder].position = holder_pos;
+        sim.players[holder].velocity = Vec2::zero();
+        sim.players[mate].position = mate_pos;
+        sim.players[mate].velocity = Vec2::zero();
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        assert_eq!(
+            snapshot.ranked_visible_pass_targets(holder, 11).first(),
+            Some(&mate),
+            "test setup should expose the intended first ranked pass target"
+        );
+        let observation = snapshot.observation_for(holder);
+        let holder_player = sim.players[holder].clone();
+        let learned_plan = SoccerLearnedPlan {
+            action: "xavi-turn".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+        let options = vec![
+            AgentActionOptionTrace::new("unsupported-fallback", 18.0, true),
+            AgentActionOptionTrace::new("pass1", 17.0, true),
+            AgentActionOptionTrace::new("xavi-turn", 0.2, true),
+        ];
+        let chosen_action = SoccerAction::DribbleMove {
+            target: holder_pos,
+            kind: DribbleMoveKind::ProtectBall,
+            touch: DribbleTouchDecision::new(0, 1.0),
+        };
+
+        let (action, label, _) = holder_player
+            .learned_policy_option_score_safety_override(
+                &learned_plan,
+                &snapshot,
+                &observation,
+                &chosen_action,
+                &options,
+                "xavi-turn",
+            )
+            .expect("safety should walk down to the executable ranked pass");
+
+        assert_eq!(label, "pass1");
+        match action {
+            SoccerAction::Pass { target_player, .. } => assert_eq!(target_player, Some(mate)),
+            other => panic!("expected pass1 fallback, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn low_floor_completion_ranked_pass_promotes_to_safer_aerial_teammate() {
+        let _env = floor_to_aerial_promotion_env_lock();
+        let _gate = ScopedEnvVar::set("DD_SOCCER_ENABLE_FLOOR_TO_AERIAL_PASS_PROMOTION", "1");
+        let (sim, holder, mate) = floor_to_aerial_promotion_fixture();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        assert_eq!(
+            snapshot.ranked_visible_pass_targets(holder, 11).first(),
+            Some(&mate),
+            "test setup should expose the intended same-team floor target"
+        );
+        assert!(
+            snapshot
+                .ranked_visible_aerial_pass_targets(holder, 11)
+                .contains(&mate),
+            "test setup should expose the same teammate as an aerial target"
+        );
+        let observation = pressured_bad_floor_good_aerial_observation(&snapshot, holder);
+
+        let (action, label) = sim.players[holder]
+            .learned_policy_option_score_safety_direct_action("pass1", &snapshot, &observation)
+            .expect("ranked pass should remain executable");
+
+        assert_eq!(label, "aerial-pass1");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                flight,
+                ..
+            } => {
+                assert_eq!(target_player, Some(mate));
+                assert_eq!(flight, PassFlight::Aerial);
+            }
+            other => panic!("expected promoted aerial pass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn clean_floor_completion_ranked_pass_stays_on_floor() {
+        let _env = floor_to_aerial_promotion_env_lock();
+        let _gate = ScopedEnvVar::set("DD_SOCCER_ENABLE_FLOOR_TO_AERIAL_PASS_PROMOTION", "1");
+        let (sim, holder, mate) = floor_to_aerial_promotion_fixture();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = pressured_bad_floor_good_aerial_observation(&snapshot, holder);
+        observation.expected_pass_completion = 0.70;
+
+        let (action, label) = sim.players[holder]
+            .learned_policy_option_score_safety_direct_action("pass1", &snapshot, &observation)
+            .expect("ranked pass should remain executable");
+
+        assert_eq!(label, "pass1");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                flight,
+                ..
+            } => {
+                assert_eq!(target_player, Some(mate));
+                assert_eq!(flight, PassFlight::Floor);
+            }
+            other => panic!("expected floor pass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn high_aerial_interception_risk_blocks_floor_to_aerial_promotion() {
+        let _env = floor_to_aerial_promotion_env_lock();
+        let _gate = ScopedEnvVar::set("DD_SOCCER_ENABLE_FLOOR_TO_AERIAL_PASS_PROMOTION", "1");
+        let (sim, holder, mate) = floor_to_aerial_promotion_fixture();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = pressured_bad_floor_good_aerial_observation(&snapshot, holder);
+        observation.aerial_pass_interception_risk = 0.72;
+
+        let (action, label) = sim.players[holder]
+            .learned_policy_option_score_safety_direct_action("pass1", &snapshot, &observation)
+            .expect("ranked pass should remain executable");
+
+        assert_eq!(label, "pass1");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                flight,
+                ..
+            } => {
+                assert_eq!(target_player, Some(mate));
+                assert_eq!(flight, PassFlight::Floor);
+            }
+            other => panic!("expected floor pass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn option_score_safety_replacement_promotes_severe_floor_pass_to_safe_aerial() {
+        let _env = floor_to_aerial_promotion_env_lock();
+        let _broad_gate = ScopedEnvVar::set("DD_SOCCER_ENABLE_FLOOR_TO_AERIAL_PASS_PROMOTION", "0");
+        let _narrow_gate =
+            ScopedEnvVar::set("DD_SOCCER_ENABLE_OPTION_SCORE_AERIAL_REPLACEMENT", "1");
+        let (sim, holder, mate) = floor_to_aerial_promotion_fixture();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = pressured_bad_floor_good_aerial_observation(&snapshot, holder);
+        observation.expected_pass_completion = 0.12;
+        observation.expected_aerial_pass_completion = 0.74;
+        observation.aerial_pass_interception_risk = 0.36;
+        observation.pressure_urgency = 0.82;
+        observation.immediate_dispossession_risk = 0.64;
+
+        let learned_plan = SoccerLearnedPlan {
+            action: "xavi-turn".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+        let chosen_action = SoccerAction::DribbleMove {
+            target: sim.players[holder].position,
+            kind: DribbleMoveKind::XaviTurn,
+            touch: DribbleTouchDecision::new(0, 1.0),
+        };
+        let options = vec![
+            AgentActionOptionTrace::new("xavi-turn", 0.2, true),
+            AgentActionOptionTrace::new("pass1", 18.0, true),
+        ];
+
+        let (action, label, _) = sim.players[holder]
+            .learned_policy_option_score_safety_override(
+                &learned_plan,
+                &snapshot,
+                &observation,
+                &chosen_action,
+                &options,
+                "xavi-turn",
+            )
+            .expect("option-score safety should replace the poor learned action");
+
+        assert_eq!(label, "aerial-pass1");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                flight,
+                ..
+            } => {
+                assert_eq!(target_player, Some(mate));
+                assert_eq!(flight, PassFlight::Aerial);
+            }
+            other => panic!("expected safe aerial replacement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn option_score_aerial_replacement_does_not_change_direct_ranked_pass() {
+        let _env = floor_to_aerial_promotion_env_lock();
+        let _broad_gate = ScopedEnvVar::set("DD_SOCCER_ENABLE_FLOOR_TO_AERIAL_PASS_PROMOTION", "0");
+        let _narrow_gate =
+            ScopedEnvVar::set("DD_SOCCER_ENABLE_OPTION_SCORE_AERIAL_REPLACEMENT", "1");
+        let (sim, holder, mate) = floor_to_aerial_promotion_fixture();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = pressured_bad_floor_good_aerial_observation(&snapshot, holder);
+        observation.expected_pass_completion = 0.12;
+        observation.expected_aerial_pass_completion = 0.74;
+        observation.aerial_pass_interception_risk = 0.36;
+
+        let (action, label) = sim.players[holder]
+            .learned_policy_option_score_safety_direct_action("pass1", &snapshot, &observation)
+            .expect("direct ranked pass should remain executable");
+
+        assert_eq!(label, "pass1");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                flight,
+                ..
+            } => {
+                assert_eq!(target_player, Some(mate));
+                assert_eq!(flight, PassFlight::Floor);
+            }
+            other => panic!("expected direct floor pass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn option_score_aerial_replacement_requires_low_aerial_risk() {
+        let _env = floor_to_aerial_promotion_env_lock();
+        let _broad_gate = ScopedEnvVar::set("DD_SOCCER_ENABLE_FLOOR_TO_AERIAL_PASS_PROMOTION", "0");
+        let _narrow_gate =
+            ScopedEnvVar::set("DD_SOCCER_ENABLE_OPTION_SCORE_AERIAL_REPLACEMENT", "1");
+        let (sim, holder, mate) = floor_to_aerial_promotion_fixture();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = pressured_bad_floor_good_aerial_observation(&snapshot, holder);
+        observation.expected_pass_completion = 0.12;
+        observation.expected_aerial_pass_completion = 0.74;
+        observation.aerial_pass_interception_risk = 0.48;
+        observation.pressure_urgency = 0.82;
+
+        let learned_plan = SoccerLearnedPlan {
+            action: "xavi-turn".to_string(),
+            target_player: None,
+            target_point: None,
+            mpc_replan: None,
+        };
+        let chosen_action = SoccerAction::DribbleMove {
+            target: sim.players[holder].position,
+            kind: DribbleMoveKind::XaviTurn,
+            touch: DribbleTouchDecision::new(0, 1.0),
+        };
+        let options = vec![
+            AgentActionOptionTrace::new("xavi-turn", 0.2, true),
+            AgentActionOptionTrace::new("pass1", 18.0, true),
+        ];
+
+        let (action, label, _) = sim.players[holder]
+            .learned_policy_option_score_safety_override(
+                &learned_plan,
+                &snapshot,
+                &observation,
+                &chosen_action,
+                &options,
+                "xavi-turn",
+            )
+            .expect("option-score safety should still select an executable fallback");
+
+        assert_eq!(label, "pass1");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                flight,
+                ..
+            } => {
+                assert_eq!(target_player, Some(mate));
+                assert_eq!(flight, PassFlight::Floor);
+            }
+            other => panic!(
+                "expected floor fallback when aerial risk is high, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn low_completion_pass_score_yields_to_viable_carry_fallback() {
+        let _env = floor_to_aerial_promotion_env_lock();
+        let _gate = ScopedEnvVar::set(
+            "DD_SOCCER_ENABLE_LOW_COMPLETION_PASS_CARRY_FALLBACK_CAP",
+            "1",
+        );
+        let (sim, holder, _) = floor_to_aerial_promotion_fixture();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = snapshot.observation_for(holder);
+        observation.has_ball = true;
+        observation.expected_pass_completion = 0.24;
+        observation.forward_dribble_space_yards = 19.0;
+        observation.perceived_pressure = 0.62;
+        observation.pressure_urgency = 0.58;
+        observation.immediate_dispossession_risk = 0.36;
+        let mut options = vec![
+            AgentActionOptionTrace::new("pass1", 204.0, true),
+            AgentActionOptionTrace::new("carry-forward", 46.0, true),
+            AgentActionOptionTrace::new("vertical-attack", 16.0, true),
+        ];
+
+        cap_low_completion_floor_passes_against_carry(&mut options, &observation);
+
+        let pass_score = action_option_score(&options, "pass1");
+        let carry_score = action_option_score(&options, "carry-forward");
+        assert!(
+            pass_score < carry_score,
+            "trace-like low-completion pass should yield to viable carry: pass={pass_score} carry={carry_score}"
+        );
+    }
+
+    #[test]
+    fn low_completion_pass_carry_fallback_preserves_clean_pass() {
+        let _env = floor_to_aerial_promotion_env_lock();
+        let _gate = ScopedEnvVar::set(
+            "DD_SOCCER_ENABLE_LOW_COMPLETION_PASS_CARRY_FALLBACK_CAP",
+            "1",
+        );
+        let (sim, holder, _) = floor_to_aerial_promotion_fixture();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = snapshot.observation_for(holder);
+        observation.has_ball = true;
+        observation.expected_pass_completion = 0.72;
+        observation.forward_dribble_space_yards = 19.0;
+        observation.perceived_pressure = 0.62;
+        let mut options = vec![
+            AgentActionOptionTrace::new("pass1", 9.0, true),
+            AgentActionOptionTrace::new("carry-forward", 12.0, true),
+        ];
+
+        cap_low_completion_floor_passes_against_carry(&mut options, &observation);
+
+        assert_eq!(action_option_score(&options, "pass1"), 9.0);
+    }
+
+    #[test]
+    fn low_completion_pass_carry_fallback_requires_viable_carry() {
+        let _env = floor_to_aerial_promotion_env_lock();
+        let _gate = ScopedEnvVar::set(
+            "DD_SOCCER_ENABLE_LOW_COMPLETION_PASS_CARRY_FALLBACK_CAP",
+            "1",
+        );
+        let (sim, holder, _) = floor_to_aerial_promotion_fixture();
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let mut observation = snapshot.observation_for(holder);
+        observation.has_ball = true;
+        observation.expected_pass_completion = 0.22;
+        observation.forward_dribble_space_yards = 3.0;
+        observation.perceived_pressure = 0.62;
+        let mut options = vec![
+            AgentActionOptionTrace::new("pass1", 120.0, true),
+            AgentActionOptionTrace::new("carry-forward", 3.0, true),
+        ];
+
+        cap_low_completion_floor_passes_against_carry(&mut options, &observation);
+
+        assert_eq!(action_option_score(&options, "pass1"), 120.0);
+    }
+
+    #[test]
+    fn forward_pass_curriculum_preserves_executable_pass_choice() {
+        let _guard = ScopedEnvVar::set("DD_SOCCER_FORWARD_PASS_CLIMB_CURRICULUM", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94_503,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let mate = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.role != PlayerRole::Goalkeeper
+                    && player.id != holder
+            })
+            .expect("home teammate")
+            .id;
+        let holder_pos = Vec2::new(sim.config.field_width_yards * 0.50, 52.0);
+        let mate_pos = Vec2::new(sim.config.field_width_yards * 0.50, 65.0);
+        sim.players[holder].position = holder_pos;
+        sim.players[holder].velocity = Vec2::zero();
+        sim.players[mate].position = mate_pos;
+        sim.players[mate].velocity = Vec2::zero();
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(holder);
+        let holder_player = sim.players[holder].clone();
+        let learned_plan = SoccerLearnedPlan {
+            action: "pass1".to_string(),
+            target_player: Some(mate),
+            target_point: Some(mate_pos),
+            mpc_replan: None,
+        };
+        let pass_action = SoccerAction::Pass {
+            target_player: Some(mate),
+            target_point: Some(mate_pos),
+            power: 0.68,
+            flight: PassFlight::Floor,
+        };
+        let options = vec![
+            AgentActionOptionTrace::new("hold", 18.0, true),
+            AgentActionOptionTrace::new("pass1", 0.2, true),
+        ];
+
+        let override_action = holder_player.learned_policy_option_score_safety_override(
+            &learned_plan,
+            &snapshot,
+            &observation,
+            &pass_action,
+            &options,
+            "pass1",
+        );
+
+        assert!(
+            override_action.is_none(),
+            "forward-pass curriculum should let executable pass choices reach receiver/MPC learning"
+        );
+    }
+
+    #[test]
+    fn learned_space_pass_binds_reachable_runner_to_explicit_target_point() {
+        let _guard = ScopedEnvVar::set("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94_504,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let runner = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.role != PlayerRole::Goalkeeper
+                    && player.id != holder
+            })
+            .expect("home runner")
+            .id;
+        let width = sim.config.field_width_yards;
+        let holder_pos = Vec2::new(width * 0.50, 52.0);
+        let runner_pos = Vec2::new(width * 0.50, 61.0);
+        let learned_space = Vec2::new(width * 0.50, 66.0);
+        for player in sim.players.iter_mut() {
+            player.velocity = Vec2::zero();
+            if player.team == Team::Home && player.id != holder && player.id != runner {
+                player.position = Vec2::new(width * 0.12, 20.0 + player.id as f64 * 0.1);
+            } else if player.team == Team::Away {
+                player.position = Vec2::new(width * 0.88, 92.0 + player.id as f64 * 0.1);
+            }
+        }
+        sim.players[holder].position = holder_pos;
+        sim.players[runner].position = runner_pos;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(holder);
+        let learned_plan = SoccerLearnedPlan {
+            action: "pass".to_string(),
+            target_player: None,
+            target_point: Some(learned_space),
+            mpc_replan: None,
+        };
+
+        let (action, label) = sim.players[holder]
+            .action_from_learned_plan(&learned_plan, &snapshot, &observation)
+            .expect("reachable learned space pass should execute");
+
+        assert_eq!(label, "pass");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                target_point,
+                ..
+            } => {
+                assert_eq!(target_player, Some(runner));
+                let target_point = target_point.expect("learned space point should be preserved");
+                assert!(
+                    target_point.distance(learned_space) < 1e-9,
+                    "executed pass should aim at learned space, got {target_point:?}"
+                );
+            }
+            other => panic!("expected learned space pass, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn learned_space_cross_preserves_explicit_target_point() {
+        let _guard = ScopedEnvVar::set("DD_SOCCER_ENABLE_NEURAL_PASS_SPACE", "1");
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94_505,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let runner = sim
+            .players
+            .iter()
+            .find(|player| {
+                player.team == Team::Home
+                    && player.role != PlayerRole::Goalkeeper
+                    && player.id != holder
+            })
+            .expect("home runner")
+            .id;
+        let width = sim.config.field_width_yards;
+        let holder_pos = Vec2::new(width * 0.18, 78.0);
+        let runner_pos = Vec2::new(width * 0.52, 86.0);
+        let learned_space = Vec2::new(width * 0.54, 91.0);
+        for player in sim.players.iter_mut() {
+            player.velocity = Vec2::zero();
+            if player.team == Team::Home && player.id != holder && player.id != runner {
+                player.position = Vec2::new(width * 0.10, 22.0 + player.id as f64 * 0.1);
+            } else if player.team == Team::Away {
+                player.position = Vec2::new(width * 0.90, 94.0 + player.id as f64 * 0.1);
+            }
+        }
+        sim.players[holder].position = holder_pos;
+        sim.players[runner].position = runner_pos;
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let observation = snapshot.observation_for(holder);
+        let learned_plan = SoccerLearnedPlan {
+            action: "flank-low-cross".to_string(),
+            target_player: None,
+            target_point: Some(learned_space),
+            mpc_replan: None,
+        };
+
+        let (action, label) = sim.players[holder]
+            .action_from_learned_plan(&learned_plan, &snapshot, &observation)
+            .expect("reachable learned space cross should execute");
+
+        assert_eq!(label, "flank-low-cross");
+        match action {
+            SoccerAction::Pass {
+                target_player,
+                target_point,
+                flight,
+                ..
+            } => {
+                assert_eq!(target_player, Some(runner));
+                assert_eq!(flight, PassFlight::Floor);
+                let target_point = target_point.expect("learned cross point should be preserved");
+                assert!(
+                    target_point.distance(learned_space) < 1e-9,
+                    "executed cross should aim at learned space, got {target_point:?}"
+                );
+            }
+            other => panic!("expected learned space cross, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn option_score_safety_uses_direct_mpc_without_local_guidance() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            local_mpc_enabled: false,
+            ..Default::default()
+        });
+        let holder = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home holder")
+            .id;
+        let holder_pos = Vec2::new(sim.config.field_width_yards * 0.5, 52.0);
+        sim.players[holder].position = holder_pos;
+        sim.players[holder].velocity = Vec2::zero();
+        sim.ball.holder = Some(holder);
+        sim.ball.position = holder_pos;
+        let mut snapshot = WorldSnapshot::from_match(&sim);
+        snapshot
+            .formation_lp_guidance
+            .retain(|guidance| guidance.player_id != holder);
+        let holder_player = sim.players[holder].clone();
+        let targetless_pass = SoccerAction::Pass {
+            target_player: None,
+            target_point: None,
+            power: 0.6,
+            flight: PassFlight::Floor,
+        };
+
+        assert_eq!(
+            mpc_reselect_rejection_probability(&snapshot, &holder_player, &targetless_pass, "pass"),
+            None,
+            "legacy neural-visible MPC rejection stays gated on local guidance"
+        );
+        assert!(
+            !option_score_safety_possession_candidate_is_executable(
+                &snapshot,
+                &holder_player,
+                &targetless_pass,
+                "pass"
+            ),
+            "option-score safety must still reject impossible possession fallbacks"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mpc_reselect_tests {
+    use super::{
+        mpc_reselect_rejects_option_label, suppress_mpc_reselected_action_option,
+        AgentActionOptionTrace,
+    };
+
+    #[test]
+    fn mpc_reselect_veto_preserves_other_ranked_pass_targets() {
+        assert!(mpc_reselect_rejects_option_label("pass1", "pass1"));
+        assert!(mpc_reselect_rejects_option_label("pass1-kp2", "pass1-kp7"));
+        assert!(!mpc_reselect_rejects_option_label("pass2", "pass1"));
+        assert!(!mpc_reselect_rejects_option_label("pass3-kp4", "pass1-kp7"));
+        assert!(mpc_reselect_rejects_option_label(
+            "aerial-pass1-kp2",
+            "aerial-pass1-kp7"
+        ));
+        assert!(!mpc_reselect_rejects_option_label(
+            "aerial-pass2",
+            "aerial-pass1"
+        ));
+        assert!(
+            mpc_reselect_rejects_option_label("pass2", "pass"),
+            "unranked pass veto stays conservative and rejects the family"
+        );
+        assert!(mpc_reselect_rejects_option_label("shoot", "shoot"));
+        assert!(!mpc_reselect_rejects_option_label("pass1", "shoot"));
+    }
+
+    #[test]
+    fn suppress_mpc_reselected_option_preserves_alternate_ranked_targets() {
+        let mut options = vec![
+            AgentActionOptionTrace::new("pass1", 1.0, true),
+            AgentActionOptionTrace::new("pass2", 0.9, true),
+            AgentActionOptionTrace::new("xavi-turn", 0.8, true),
+        ];
+
+        suppress_mpc_reselected_action_option(&mut options, "pass1-kp7");
+        assert!(!options[0].legal);
+        assert_eq!(options[0].score, 0.0);
+        assert!(options[1].legal);
+        assert!(options[2].legal);
+
+        suppress_mpc_reselected_action_option(&mut options, "xavi-turn");
+        assert!(!options[2].legal);
+        assert_eq!(options[2].score, 0.0);
+    }
+}
+
+#[cfg(test)]
 mod decision_refractory_tests {
     use super::{
         decision_refractory_blocks, DECISION_REFRACTORY_MIN_GAP_TICKS,
@@ -13217,6 +17096,179 @@ mod decision_refractory_tests {
 }
 
 #[cfg(test)]
+mod learned_mpc_reselect_tests {
+    use super::*;
+
+    #[test]
+    fn keeper_learned_play_out_forwards_pomdp_target_player() {
+        let mut sim = SoccerMatch::default_11v11(MatchConfig {
+            dt_seconds: 0.1,
+            seed: 94_101,
+            ..Default::default()
+        });
+        let keeper = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role == PlayerRole::Goalkeeper)
+            .expect("home keeper")
+            .id;
+        let mate = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home teammate")
+            .id;
+        let width = sim.config.field_width_yards;
+        let keeper_pos = Vec2::new(width * 0.5, 22.0);
+        let mate_pos = Vec2::new(width * 0.22, 39.0);
+        for player in sim.players.iter_mut() {
+            if player.team == Team::Home
+                && player.role != PlayerRole::Goalkeeper
+                && player.id != mate
+            {
+                player.position = Vec2::new(width * 0.5, 8.0 + player.id as f64 * 0.05);
+                player.velocity = Vec2::zero();
+            } else if player.team == Team::Away {
+                player.position = Vec2::new(width * 0.78, 96.0 + player.id as f64 * 0.05);
+                player.velocity = Vec2::zero();
+            }
+        }
+        sim.players[keeper].position = keeper_pos;
+        sim.players[keeper].action_facing = FacingBucket::South;
+        sim.players[keeper].facing_yaw = std::f64::consts::FRAC_PI_2;
+        sim.players[mate].position = mate_pos;
+        sim.players[mate].velocity = Vec2::new(0.0, 1.0);
+        sim.ball.holder = Some(keeper);
+        sim.ball.position = keeper_pos;
+
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let learned_plan = SoccerLearnedPlan {
+            action: "keeper-mpc-floor-pass".to_string(),
+            target_player: Some(mate),
+            target_point: snapshot.player_position(mate),
+            mpc_replan: None,
+        };
+        let mut keeper_player = sim.players[keeper].clone();
+        let intent = keeper_player.run_time_step(
+            &snapshot,
+            None,
+            Some(&learned_plan),
+            &mut SeededRandom::new(94_102),
+        );
+
+        match intent.action {
+            SoccerAction::Pass { target_player, .. } => {
+                assert_eq!(target_player, Some(mate));
+            }
+            other => panic!("expected learned keeper play-out pass, got {:?}", other),
+        }
+        let trace = keeper_player
+            .last_decision
+            .as_ref()
+            .expect("keeper decision trace");
+        assert!(
+            trace
+                .operation_order
+                .iter()
+                .any(|op| op == "pomdp-target-player"),
+            "keeper trace should expose that the POMDP target was forwarded: {:?}",
+            trace.operation_order
+        );
+    }
+
+    fn push_test_mpc_guidance(snapshot: &mut WorldSnapshot, player: &PlayerAgent) {
+        snapshot
+            .formation_lp_guidance
+            .retain(|guidance| guidance.player_id != player.id);
+        snapshot
+            .formation_lp_guidance
+            .push(SoccerFormationLpPlayerGuidance {
+                team: player.team,
+                player_id: player.id,
+                slot: player.id,
+                current: player.position,
+                target: player.position,
+                formation_anchor: player.position,
+                pressure_target: None,
+                recommended_move: Vec2::zero(),
+                target_velocity: Vec2::zero(),
+                target_acceleration: Vec2::zero(),
+                local_mpc_guidance: true,
+                recommended_move_yards: 0.0,
+                recommended_speed_yps: 0.0,
+                recommended_acceleration_yps2: 0.0,
+                formation_error_yards: 0.0,
+                movement_error_yards: 0.0,
+                pair_error_yards: 0.0,
+                role_line_error_yards: 0.0,
+                pressure_error_yards: 0.0,
+                fore_aft_speed_error_yps: 0.0,
+                pressure_weight: 0.0,
+                speed_match_weight: 0.0,
+                alignment_weight: 0.0,
+                reduced_cost_target_x: 0.0,
+                reduced_cost_target_y: 0.0,
+                solver_status: "test".to_string(),
+                solver_objective: 0.0,
+                solver_iterations: None,
+                solver_elapsed_ms: 0.0,
+                variable_count: 0,
+                constraint_count: 0,
+            });
+    }
+
+    #[test]
+    fn mpc_reselect_rejection_probability_exposes_low_confidence_candidate() {
+        let sim = SoccerMatch::default_11v11(MatchConfig {
+            local_mpc_enabled: true,
+            ..MatchConfig::default()
+        });
+        let player = sim
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let mut snapshot = WorldSnapshot::from_match(&sim);
+        push_test_mpc_guidance(&mut snapshot, player);
+        let impossible_pass = SoccerAction::Pass {
+            target_player: None,
+            target_point: None,
+            power: 0.5,
+            flight: PassFlight::Floor,
+        };
+
+        let rejected_probability =
+            mpc_reselect_rejection_probability(&snapshot, player, &impossible_pass, "pass")
+                .expect("a no-target learned pass should become a neural-visible MPC rejection");
+        assert!(
+            (0.0..=1.0).contains(&rejected_probability),
+            "MPC rejection probability should be bounded, got {rejected_probability}"
+        );
+
+        let no_mpc = SoccerMatch::default_11v11(MatchConfig {
+            local_mpc_enabled: false,
+            ..MatchConfig::default()
+        });
+        let no_mpc_player = no_mpc
+            .players
+            .iter()
+            .find(|player| player.team == Team::Home && player.role != PlayerRole::Goalkeeper)
+            .expect("home field player");
+        let no_mpc_snapshot = WorldSnapshot::from_match(&no_mpc);
+        assert_eq!(
+            mpc_reselect_rejection_probability(
+                &no_mpc_snapshot,
+                no_mpc_player,
+                &impossible_pass,
+                "pass"
+            ),
+            None,
+            "without local MPC guidance there is no planner rejection to train from"
+        );
+    }
+}
+
+#[cfg(test)]
 mod forward_pass_first_tests {
     use super::{
         forward_pass_first_release_strength, FORWARD_PASS_FIRST_DWELL_FULL_SECONDS,
@@ -13278,7 +17330,10 @@ mod forward_option_recognition_tests {
         for &open in &[0.0, 0.2, 0.45, 0.7, 1.0] {
             for &completion in &[0.0, 0.3, 0.6, 1.0] {
                 let q = forward_pass_option_quality(open, completion);
-                assert!(q >= open - 1e-9, "open={open} completion={completion} q={q}");
+                assert!(
+                    q >= open - 1e-9,
+                    "open={open} completion={completion} q={q}"
+                );
                 assert!((0.0..=1.0).contains(&q), "q out of range: {q}");
             }
         }
@@ -13291,7 +17346,10 @@ mod forward_option_recognition_tests {
         // whereas raw openness alone (0.30) would have it dismissed.
         let raw_open = 0.30;
         let recognised = forward_pass_option_quality(raw_open, 0.95);
-        assert!(raw_open < 0.45, "precondition: raw openness is below the release threshold");
+        assert!(
+            raw_open < 0.45,
+            "precondition: raw openness is below the release threshold"
+        );
         assert!(
             recognised >= 0.5,
             "a clear lane to an advanced runner is recognised: {recognised}"
@@ -13304,7 +17362,10 @@ mod forward_option_recognition_tests {
         // inflated into a good option beyond what their own openness already implies.
         let open = 0.40;
         let q = forward_pass_option_quality(open, 0.05);
-        assert!((q - open).abs() < 1e-9, "blocked lane keeps the raw openness: {q}");
+        assert!(
+            (q - open).abs() < 1e-9,
+            "blocked lane keeps the raw openness: {q}"
+        );
     }
 
     #[test]
@@ -13313,7 +17374,10 @@ mod forward_option_recognition_tests {
         let low = forward_pass_option_quality(open, 0.2);
         let mid = forward_pass_option_quality(open, 0.6);
         let high = forward_pass_option_quality(open, 0.95);
-        assert!(low <= mid && mid <= high, "more completable ⇒ better: {low} {mid} {high}");
+        assert!(
+            low <= mid && mid <= high,
+            "more completable ⇒ better: {low} {mid} {high}"
+        );
     }
 }
 
@@ -13356,5 +17420,46 @@ mod shot_foot_choice_tests {
     fn weak_foot_damp_is_a_reduction() {
         let damp = tunables().shooting.shot_foot_weak_foot_execution_damp;
         assert!(damp > 0.0 && damp < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod formation_nudge_tests {
+    use super::formation_nudge_blend;
+    use crate::des::general::soccer::Vec2;
+
+    #[test]
+    fn full_conviction_ignores_the_shape_signal() {
+        let own = Vec2::new(10.0, 20.0);
+        let lp = Vec2::new(40.0, 20.0);
+        // decision_confidence 1.0 ⇒ weight 0 ⇒ the player's own read fully overrides the nudge.
+        let out = formation_nudge_blend(1.0, own, lp, 0.6, 6.0);
+        assert!((out.x - own.x).abs() < 1e-9 && (out.y - own.y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_conviction_pulls_toward_shape_but_stays_bounded() {
+        let own = Vec2::new(0.0, 0.0);
+        let lp = Vec2::new(100.0, 0.0); // far away: exercises the yard cap
+        let out = formation_nudge_blend(0.0, own, lp, 0.6, 6.0);
+        // Moves toward the LP target...
+        assert!(out.x > own.x && out.x <= lp.x);
+        // ...but never more than the max-yards cap, however far the LP sits.
+        assert!(
+            (out - own).len() <= 6.0 + 1e-9,
+            "nudge must stay a bounded nudge: {out:?}"
+        );
+    }
+
+    #[test]
+    fn confidence_monotonically_reduces_the_pull() {
+        let own = Vec2::new(0.0, 0.0);
+        let lp = Vec2::new(4.0, 0.0); // within the cap so weight (not the clamp) drives distance
+        let unsure = (formation_nudge_blend(0.2, own, lp, 0.6, 6.0) - own).len();
+        let confident = (formation_nudge_blend(0.8, own, lp, 0.6, 6.0) - own).len();
+        assert!(
+            unsure > confident,
+            "a more convinced player should follow the shape less: unsure={unsure} confident={confident}"
+        );
     }
 }

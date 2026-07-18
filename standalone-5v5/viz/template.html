@@ -1,0 +1,607 @@
+<meta charset="utf-8">
+<title>5-a-side RL — before / after learning</title>
+<style>
+  :root{
+    --bg:#0b140e; --panel:#101c14; --panel-2:#0d1710; --ink:#e8f0e9; --ink-dim:#93a89a;
+    --line:#22362a; --accent:#2fe0b6; --teamA:#2fe0b6; --teamB:#ff6b5e; --ball:#f7f7f2;
+    --grid:rgba(255,255,255,.05); --pitch:#12351f; --pitch-line:rgba(233,240,233,.5);
+    --good:#57d979; --bad:#ff6b5e;
+    --shadow:0 1px 0 rgba(255,255,255,.03), 0 18px 40px -24px rgba(0,0,0,.8);
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --bg:#eef2ec; --panel:#ffffff; --panel-2:#f4f7f2; --ink:#0d1a12; --ink-dim:#59705f;
+      --line:#dbe4dc; --accent:#0f9d78; --teamA:#0f9d78; --teamB:#e0483b; --ball:#1a2a1f;
+      --grid:rgba(0,0,0,.04); --pitch:#1e5233; --pitch-line:rgba(255,255,255,.72);
+      --good:#1c9d4b; --bad:#d33a2c;
+      --shadow:0 1px 0 rgba(255,255,255,.6), 0 20px 44px -28px rgba(20,40,28,.4);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0b140e; --panel:#101c14; --panel-2:#0d1710; --ink:#e8f0e9; --ink-dim:#93a89a;
+    --line:#22362a; --accent:#2fe0b6; --teamA:#2fe0b6; --teamB:#ff6b5e; --ball:#f7f7f2;
+    --grid:rgba(255,255,255,.05); --pitch:#12351f; --pitch-line:rgba(233,240,233,.5);
+    --good:#57d979; --bad:#ff6b5e;
+  }
+  :root[data-theme="light"]{
+    --bg:#eef2ec; --panel:#ffffff; --panel-2:#f4f7f2; --ink:#0d1a12; --ink-dim:#59705f;
+    --line:#dbe4dc; --accent:#0f9d78; --teamA:#0f9d78; --teamB:#e0483b; --ball:#1a2a1f;
+    --grid:rgba(0,0,0,.04); --pitch:#1e5233; --pitch-line:rgba(255,255,255,.72);
+    --good:#1c9d4b; --bad:#d33a2c;
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0}
+  .wrap{
+    font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    background:
+      radial-gradient(1200px 600px at 50% -10%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 60%),
+      var(--bg);
+    color:var(--ink); min-height:100vh; padding:clamp(18px,4vw,46px);
+    line-height:1.5; -webkit-font-smoothing:antialiased;
+  }
+  .shell{max-width:1160px;margin:0 auto;display:flex;flex-direction:column;gap:26px}
+
+  /* ---- header ---- */
+  .eyebrow{
+    font-size:12px; letter-spacing:.22em; text-transform:uppercase; color:var(--ink-dim);
+    display:flex;align-items:center;gap:10px;
+  }
+  .eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);
+    box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 22%, transparent)}
+  h1{
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-weight:800; letter-spacing:-.02em; line-height:1.02;
+    font-size:clamp(30px,5.4vw,58px); margin:.35em 0 .1em; text-wrap:balance;
+  }
+  h1 .em{color:var(--accent)}
+  .lede{max-width:70ch;color:var(--ink-dim);font-size:15px}
+  .lede b{color:var(--ink);font-weight:600}
+
+  /* ---- headline result strip ---- */
+  .result{
+    display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:0;align-items:stretch;
+    background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:var(--shadow);
+  }
+  .result .cell{padding:18px 22px;display:flex;flex-direction:column;gap:4px;justify-content:center}
+  .result .div{width:1px;background:var(--line)}
+  .result .k{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-dim)}
+  .result .v{font-size:clamp(26px,4vw,40px);font-weight:800;font-variant-numeric:tabular-nums;
+    font-family:system-ui,-apple-system,sans-serif;letter-spacing:-.02em;line-height:1}
+  .result .v.bad{color:var(--bad)} .result .v.good{color:var(--good)}
+  .result .sub{font-size:12px;color:var(--ink-dim)}
+  .arrow{display:flex;align-items:center;justify-content:center;padding:0 6px;color:var(--accent);font-size:22px}
+
+  /* ---- section ---- */
+  .section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:2px;flex-wrap:wrap}
+  .section-head h2{
+    font-family:system-ui,-apple-system,sans-serif;font-weight:700;letter-spacing:-.01em;
+    font-size:clamp(18px,2.6vw,24px);margin:0}
+  .section-head .note{font-size:12px;color:var(--ink-dim)}
+
+  .pitches{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media (max-width:760px){ .pitches{grid-template-columns:1fr} .result{grid-template-columns:1fr}
+    .result .div{display:none} }
+  .pitchcard{
+    background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:16px;padding:14px;box-shadow:var(--shadow);
+    display:flex;flex-direction:column;gap:10px}
+  .pc-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .tag{font-size:11px;letter-spacing:.16em;text-transform:uppercase;padding:5px 9px;border-radius:999px;
+    border:1px solid var(--line);color:var(--ink-dim)}
+  .tag.before{color:var(--teamB);border-color:color-mix(in srgb,var(--teamB) 45%,var(--line))}
+  .tag.after{color:var(--teamA);border-color:color-mix(in srgb,var(--teamA) 45%,var(--line))}
+  .score{font-family:system-ui,-apple-system,sans-serif;font-weight:800;font-size:22px;
+    font-variant-numeric:tabular-nums;letter-spacing:.02em;display:flex;align-items:center;gap:8px}
+  .score .a{color:var(--teamA)} .score .b{color:var(--teamB)} .score .x{color:var(--ink-dim);font-weight:500}
+  canvas{display:block;width:100%;height:auto;border-radius:10px}
+  .cap{font-size:12px;color:var(--ink-dim);min-height:1.2em}
+
+  /* ---- controls ---- */
+  .controls{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+    background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:14px;padding:12px 16px;box-shadow:var(--shadow)}
+  button.ctl{
+    font-family:inherit;font-size:13px;font-weight:600;cursor:pointer;color:var(--bg);
+    background:var(--accent);border:none;border-radius:9px;padding:9px 16px;letter-spacing:.02em}
+  button.ctl.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  button.ctl:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .clock{font-variant-numeric:tabular-nums;color:var(--ink-dim);font-size:13px;min-width:96px}
+  input[type=range]{flex:1;min-width:140px;accent-color:var(--accent);height:4px}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--ink-dim)}
+  .legend .sw{display:inline-flex;align-items:center;gap:7px}
+  .legend .sw i{width:11px;height:11px;border-radius:50%;display:inline-block}
+
+  /* ---- curve ---- */
+  .curvecard{background:linear-gradient(180deg,var(--panel),var(--panel-2));
+    border:1px solid var(--line);border-radius:16px;padding:18px;box-shadow:var(--shadow);
+    display:flex;flex-direction:column;gap:12px}
+
+  /* ---- setup strip ---- */
+  .facts{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+  @media (max-width:760px){ .facts{grid-template-columns:1fr 1fr} }
+
+  /* match analytics */
+  .statgrid{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:16px}
+  @media (max-width:760px){ .statgrid{grid-template-columns:repeat(3,1fr)} }
+  .stat{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);
+    border-radius:12px;padding:14px;box-shadow:var(--shadow)}
+  .stat .v{font-family:system-ui,-apple-system,sans-serif;font-weight:800;font-size:clamp(20px,3vw,28px);
+    letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1}
+  .stat .k{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-dim);margin-top:6px}
+  .stat .sub{font-size:11px;color:var(--ink-dim);margin-top:2px}
+  .analytics2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media (max-width:760px){ .analytics2{grid-template-columns:1fr} }
+  .trendgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  @media (max-width:900px){ .trendgrid{grid-template-columns:1fr 1fr} }
+  @media (max-width:600px){ .trendgrid{grid-template-columns:1fr} }
+  .trendgrid .curvecard{padding:14px;gap:8px}
+  .mini-h{font-family:system-ui,sans-serif;font-weight:700;font-size:14px;margin-bottom:12px}
+  .passbar{display:flex;height:26px;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
+  .passbar .seg{display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;
+    color:#0b140e;font-variant-numeric:tabular-nums;min-width:0}
+  .passbar .seg.small{color:var(--ink)}
+  .fact{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .fact .k{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-dim)}
+  .fact .v{font-size:14px;margin-top:4px}
+  .fact .v b{font-family:system-ui,sans-serif}
+  .foot{color:var(--ink-dim);font-size:12px;text-align:center;padding-top:6px}
+  code{background:var(--panel-2);border:1px solid var(--line);border-radius:6px;padding:1px 6px;font-size:12px}
+</style>
+
+<div class="wrap"><div class="shell">
+
+  <header>
+    <div class="eyebrow"><span class="dot"></span> standalone 5-a-side · reinforcement learning · zero deps</div>
+    <h1>Watch a policy learn to <span class="em">pass, carry, and finish.</span></h1>
+    <p class="lede">A hermetic 5-a-side sim — <b>goalkeepers</b>, a <b>~7m net</b>, no formation LP/IPM.
+      It's still a <b>POMDP</b> — each outfielder acts on a lean <b>71-dim partial, egocentric
+      observation</b> (not the 11v11 engine's 620-dim feature stack) with a reactive, memoryless policy.
+      The four outfielders learn only the macro families
+      <b>pass · dribble · shoot · clear · hold</b> and <b>chase · support · spread · mark</b>;
+      off-ball players run into <b>open space</b> and the ball-carrier <b>passes to the teammate in space</b>,
+      then shooting uses a short-horizon <b>aim optimizer</b> that places the ball at the corner away
+      from the keeper. A shared-weight policy (PPO + GAE, hand-rolled MLP) trains against a scripted
+      baseline. It goes from flailing to a coherent <em>press, move-it-through-space, and finish</em> game.
+      Same kickoff on both pitches below.</p>
+  </header>
+
+  <div class="result" id="result"></div>
+
+  <section>
+    <div class="section-head">
+      <h2>Before vs after — same kickoff, same opponent</h2>
+      <span class="note">Team A = learner (teal) · Team B = scripted baseline (coral) · synced clock</span>
+    </div>
+    <div class="pitches">
+      <div class="pitchcard">
+        <div class="pc-head"><span class="tag before">Before · untrained</span>
+          <span class="score"><span class="a" id="sa0">0</span><span class="x">–</span><span class="b" id="sb0">0</span></span></div>
+        <canvas id="cv0"></canvas>
+        <div class="cap" id="cap0">Random policy: aimless, gives the ball away, no shape to the play.</div>
+      </div>
+      <div class="pitchcard">
+        <div class="pc-head"><span class="tag after">After · trained</span>
+          <span class="score"><span class="a" id="sa1">0</span><span class="x">–</span><span class="b" id="sb1">0</span></span></div>
+        <canvas id="cv1"></canvas>
+        <div class="cap" id="cap1">Trained policy: presses to win it, passes to teammates in space, carries, and places shots past the keeper.</div>
+      </div>
+    </div>
+    <div class="controls" style="margin-top:14px">
+      <button class="ctl" id="play">Pause</button>
+      <button class="ctl ghost" id="restart">Restart</button>
+      <button class="ctl ghost" id="newgame" title="Play a fresh game with the trained model (needs the live server)">New Game ▸</button>
+      <span class="clock" id="clock">00.0s</span>
+      <select class="ctl ghost" id="speed" aria-label="playback speed" style="padding:8px 10px">
+        <option value="0.25">0.25×</option>
+        <option value="0.5" selected>0.5×</option>
+        <option value="1">1× real-time</option>
+        <option value="2">2×</option>
+      </select>
+      <input type="range" id="scrub" min="0" max="100" value="0" aria-label="scrub match">
+      <div class="legend">
+        <span class="sw"><i style="background:var(--teamA)"></i>learner</span>
+        <span class="sw"><i style="background:var(--teamB)"></i>scripted</span>
+        <span class="sw"><i style="border:2px solid var(--ink-dim);background:transparent"></i>keeper</span>
+        <span class="sw"><i style="background:transparent;box-shadow:0 0 0 2px var(--ball) inset;border:1px solid var(--ball)"></i>on the ball</span>
+        <span class="sw"><i style="background:var(--ball);outline:1px solid var(--ink-dim)"></i>ball</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>The learning curve</h2>
+      <span class="note">goal difference vs scripted baseline, per training iteration (8 games each)</span>
+    </div>
+    <div class="curvecard">
+      <canvas id="curve"></canvas>
+      <div class="legend">
+        <span class="sw"><i style="background:var(--accent)"></i>goal difference (A − B)</span>
+        <span class="sw"><i style="background:var(--teamA);opacity:.6"></i>goals for</span>
+        <span class="sw"><i style="background:var(--teamB);opacity:.7"></i>goals against</span>
+        <span class="sw" style="color:var(--ink-dim)">dashed = break-even</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Tracked over training</h2>
+      <span class="note">every metric, per training iteration (to the best checkpoint)</span>
+    </div>
+    <div class="trendgrid">
+      <div class="curvecard"><div class="mini-h">Passes / game</div><canvas id="t_pass"></canvas><div class="legend" id="t_pass_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Pass completion %</div><canvas id="t_comp"></canvas></div>
+      <div class="curvecard"><div class="mini-h">Pass direction / game</div><canvas id="t_dir"></canvas><div class="legend" id="t_dir_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Shots / game</div><canvas id="t_shots"></canvas><div class="legend" id="t_shots_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Shot conversion %</div><canvas id="t_conv"></canvas></div>
+      <div class="curvecard"><div class="mini-h">Possession % & bunch %</div><canvas id="t_poss"></canvas><div class="legend" id="t_poss_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Winrate %</div><canvas id="t_wr"></canvas></div>
+      <div class="curvecard"><div class="mini-h">Turnovers & balls won / game</div><canvas id="t_tovwon"></canvas><div class="legend" id="t_tovwon_lg"></div></div>
+      <div class="curvecard"><div class="mini-h">Teammate spacing (units)</div><canvas id="t_spacing"></canvas></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Match analytics</h2>
+      <span class="note">trained model, held-out evaluation</span>
+    </div>
+    <div class="statgrid" id="statgrid"></div>
+    <div class="curvecard">
+      <div class="mini-h">Pass mix (trained model)</div>
+      <div class="passbar" id="passbar"></div>
+      <div class="legend" id="passbar-legend"></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>What's under the hood</h2></div>
+    <div class="facts" id="facts"></div>
+  </section>
+
+  <p class="foot" id="foot"></p>
+
+</div></div>
+
+<script>
+const BEFORE = /*__BEFORE__*/ null;
+let   AFTER  = /*__AFTER__*/ null; // mutable: the "New Game" button swaps in a fresh trained match
+const CURVE  = /*__CURVE__*/ null;
+const META   = /*__META__*/ null;
+
+// ---------- headline result strip ----------
+(function(){
+  const r = document.getElementById('result');
+  const cells = [
+    {k:'Untrained vs baseline', v:META.before_diff, sub:META.before_score+' · '+Math.round(META.before_wr*100)+'% win', cls:'bad'},
+    {arrow:true},
+    {k:'Trained vs baseline', v:META.after_diff, sub:META.after_score+' · '+Math.round(META.after_wr*100)+'% win', cls:'good'},
+    {div:true},
+    {k:'Swing', v:META.swing, sub:'goal diff, '+META.iters+' iters ('+META.minutes+')', cls:'good'},
+  ];
+  let html='';
+  cells.forEach(c=>{
+    if(c.arrow){html+='<div class="arrow">→</div>';return;}
+    if(c.div){html+='<div class="div"></div>';return;}
+    html+=`<div class="cell"><div class="k">${c.k}</div><div class="v ${c.cls||''}">${c.v}</div><div class="sub">${c.sub}</div></div>`;
+  });
+  r.innerHTML=html;
+})();
+
+// ---------- facts ----------
+(function(){
+  const facts=[
+    {k:'Format',v:'<b>5 v 5</b> with keepers, ~7m net, ~40s games'},
+    {k:'Teammate spacing',v:`nearest teammate <b>~${META.spacing}</b> units · <b>${META.bunch}%</b> bunched (target 5)`},
+    {k:'Finishing',v:'short-horizon <b>aim optimizer</b> places shots past the keeper'},
+    {k:'Hardening gate',v:`selected checkpoint <b>${META.gate}</b> · git <code>${META.git}</code>`},
+    {k:'Learner + algo',v:'4 outfielders, <b>PPO</b>+<b>GAE</b>, <b>0</b> deps (own MLP/backprop)'},
+  ];
+  document.getElementById('facts').innerHTML=facts.map(f=>`<div class="fact"><div class="k">${f.k}</div><div class="v">${f.v}</div></div>`).join('');
+  document.getElementById('foot').innerHTML='Canonical main checkout · <code>cargo run --release -- train</code> · run metadata comes from <code>run_manifest.json</code> · display seed '+META.display_seed+' uses the same opening seed for both matches so the contrast is the policy, not the dice.'
+    + (META.display_matched===false ? ' <b>Note:</b> no seed matched the showcase filter (win-by-1..4 with a losing/level untrained side), so this is a <b>fallback</b> game — it may not be representative of the average result; trust the 300-game stats above, not this single match.' : '');
+})();
+
+// ---------- match analytics ----------
+(function(){
+  const tiles=[
+    {v:META.pass_completion+'%', k:'Pass completion', sub:META.pass_att+' att/game'},
+    {v:META.conversion+'%', k:'Shot conversion', sub:META.shots+' shots · '+META.shots_scored+' scored'},
+    {v:META.possession+'%', k:'Possession', sub:'share of ticks'},
+    {v:META.passes, k:'Passes / game', sub:'completed'},
+    {v:META.balls_won, k:'Balls won / game', sub:'press · tackle · intercept'},
+    {v:META.turnovers, k:'Turnovers / game', sub:'possession lost'},
+  ];
+  document.getElementById('statgrid').innerHTML=tiles.map(t=>
+    `<div class="stat"><div class="v">${t.v}</div><div class="k">${t.k}</div><div class="sub">${t.sub}</div></div>`).join('');
+
+  // pass mix bar (forward / lateral / backward)
+  const mix=[
+    {label:'forward', pct:META.pass_fwd_pct, col:'var(--teamA)'},
+    {label:'lateral', pct:META.pass_lat_pct, col:'var(--ink-dim)'},
+    {label:'backward', pct:META.pass_back_pct, col:'var(--teamB)'},
+  ];
+  document.getElementById('passbar').innerHTML=mix.map(m=>
+    m.pct>0?`<div class="seg${m.pct<12?' small':''}" style="flex:${m.pct};background:${m.col}">${m.pct>=8?m.pct+'%':''}</div>`:'').join('');
+  document.getElementById('passbar-legend').innerHTML=mix.map(m=>
+    `<span class="sw"><i style="background:${m.col}"></i>${m.label} ${m.pct}%</span>`).join('');
+
+  // ---- generic training-trend mini charts (every metric, over iterations) ----
+  function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+  const charts=[];
+  function trend(id, series, opts){
+    opts=opts||{};
+    const cv=document.getElementById(id); if(!cv) return;
+    charts.push({cv, ctx:cv.getContext('2d'), series, opts});
+    if(opts.legendId){
+      const lg=document.getElementById(opts.legendId);
+      if(lg) lg.innerHTML=series.map(s=>`<span class="sw"><i style="background:var(${s.cvar})"></i>${s.label}</span>`).join('');
+    }
+  }
+  function drawChart(c){
+    const {cv,ctx,series,opts}=c;
+    const w=cv.clientWidth||300, h=Math.round((cv.clientWidth||300)*0.62);
+    const dpr=Math.min(2,window.devicePixelRatio||1);
+    cv.width=w*dpr; cv.height=h*dpr; cv.style.height=h+'px'; ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,w,h);
+    if(!Array.isArray(CURVE)||CURVE.length===0){
+      ctx.fillStyle=css('--ink-dim');ctx.font='11px ui-monospace,monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText('no data',w/2,h/2);
+      return;
+    }
+    const padL=30,padR=10,padT=10,padB=18;
+    const maxI=Math.max(...CURVE.map(p=>p.iter),1);
+    let lo=0,hi=1;
+    if(opts.pct){lo=0;hi=100;}
+    else{ hi=-1e9; lo=0; series.forEach(s=>CURVE.forEach(p=>{const v=s.get(p)||0; if(v>hi)hi=v; if(v<lo)lo=v;}));
+      hi = hi>0 ? hi*1.12 : 1; if(lo<0) lo*=1.12; }
+    const X=i=>padL+(i/maxI)*(w-padL-padR), Y=v=>padT+(1-(v-lo)/((hi-lo)||1))*(h-padT-padB);
+    ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.font='9px ui-monospace,monospace';
+    ctx.textAlign='right';ctx.textBaseline='middle';ctx.lineWidth=1;
+    const ticks= opts.pct?[0,50,100]:[lo,(lo+hi)/2,hi];
+    ticks.forEach(g=>{const y=Y(g);ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke();
+      ctx.fillText(opts.pct?g:(Math.round(g*10)/10),padL-4,y);});
+    series.forEach(s=>{ctx.strokeStyle=css(s.cvar);ctx.lineWidth=1.8;ctx.lineJoin='round';ctx.beginPath();
+      CURVE.forEach((p,i)=>{const y=Y(s.get(p)||0);i?ctx.lineTo(X(p.iter),y):ctx.moveTo(X(p.iter),y);});ctx.stroke();
+      const last=CURVE[CURVE.length-1]; ctx.fillStyle=css(s.cvar);
+      ctx.beginPath();ctx.arc(X(last.iter),Y(s.get(last)||0),2.4,0,7);ctx.fill();});
+    ctx.textAlign='center';ctx.textBaseline='top';ctx.fillStyle=css('--ink-dim');
+    [0,maxI].forEach(i=>ctx.fillText(i,X(i),h-padB+5));
+  }
+  trend('t_pass',[{label:'attempts',cvar:'--accent',get:p=>(p.fwd||0)+(p.lat||0)+(p.back||0)},{label:'completed',cvar:'--good',get:p=>p.passcmp}],{legendId:'t_pass_lg'});
+  trend('t_comp',[{label:'completion',cvar:'--accent',get:p=>p.passcomp*100}],{pct:true});
+  trend('t_dir',[{label:'forward',cvar:'--teamA',get:p=>p.fwd},{label:'lateral',cvar:'--ink-dim',get:p=>p.lat},{label:'backward',cvar:'--teamB',get:p=>p.back}],{legendId:'t_dir_lg'});
+  trend('t_shots',[{label:'taken',cvar:'--accent',get:p=>p.shots},{label:'scored',cvar:'--good',get:p=>(p.shots||0)*(p.conv||0)}],{legendId:'t_shots_lg'});
+  trend('t_conv',[{label:'conversion',cvar:'--good',get:p=>p.conv*100}],{pct:true});
+  trend('t_poss',[{label:'possession',cvar:'--accent',get:p=>p.poss*100},{label:'bunch',cvar:'--bad',get:p=>p.bunch*100}],{legendId:'t_poss_lg',pct:true});
+  trend('t_wr',[{label:'winrate',cvar:'--accent',get:p=>p.wr*100}],{pct:true});
+  trend('t_tovwon',[{label:'turnovers',cvar:'--teamB',get:p=>p.turnovers},{label:'balls won',cvar:'--teamA',get:p=>p.won}],{legendId:'t_tovwon_lg'});
+  trend('t_spacing',[{label:'spacing',cvar:'--accent',get:p=>p.spacing}],{});
+  function drawAll(){charts.forEach(drawChart);}
+  drawAll();
+  window.addEventListener('resize',drawAll);
+  new MutationObserver(drawAll).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+})();
+
+// ---------- pitch renderer ----------
+const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim();}
+
+function makePitch(canvasId, data){
+  const cv=document.getElementById(canvasId);
+  const ctx=cv.getContext('2d');
+  const [L,W]=data.field, gh=data.goal_half;
+  const AR=W/L;                       // aspect
+  const trailLen=10;
+  function resize(){
+    const cssW=cv.clientWidth||480; const dpr=Math.min(2,window.devicePixelRatio||1);
+    cv.width=cssW*dpr; cv.height=cssW*AR*dpr; cv.style.height=(cssW*AR)+'px';
+    ctx.setTransform(dpr,0,0,dpr,0,0); pitchW=cssW; pitchH=cssW*AR;
+  }
+  let pitchW,pitchH;
+  const pad=10;
+  function X(x){return pad + (x/L)*(pitchW-2*pad);}
+  function Y(y){return pad + (y/W)*(pitchH-2*pad);}
+  function draw(fi){
+    // interpolate between sim frames so 10 Hz renders smoothly at display refresh
+    const N=data.frames.length;
+    const i0=Math.max(0,Math.min(N-1,Math.floor(fi)));
+    const i1=Math.min(N-1,i0+1);
+    const t=Math.max(0,Math.min(1,fi-i0));
+    const A=data.frames[i0], B=data.frames[i1];
+    const lp=(pa,pb)=>[pa[0]+(pb[0]-pa[0])*t, pa[1]+(pb[1]-pa[1])*t];
+    const f={
+      a:A.a.map((p,k)=>lp(p,B.a[k])),
+      b:A.b.map((p,k)=>lp(p,B.b[k])),
+      ball:lp(A.ball,B.ball),
+      own:A.own, oi:A.oi, ga:A.ga, gb:A.gb
+    };
+    ctx.clearRect(0,0,pitchW,pitchH);
+    // pitch
+    ctx.fillStyle=css('--pitch'); roundRect(ctx,pad-4,pad-4,pitchW-2*pad+8,pitchH-2*pad+8,8); ctx.fill();
+    // mow stripes
+    ctx.save();ctx.globalAlpha=.06;ctx.fillStyle='#ffffff';
+    for(let s=0;s<6;s++){ if(s%2){ const x0=X(s/6*L),x1=X((s+1)/6*L); ctx.fillRect(x0,Y(0),x1-x0,Y(W)-Y(0)); } }
+    ctx.restore();
+    ctx.strokeStyle=css('--pitch-line');ctx.lineWidth=1.4;ctx.globalAlpha=1;
+    // outline + halfway + circle
+    strokeRoundRect(ctx,X(0),Y(0),X(L)-X(0),Y(W)-Y(0),4);
+    ctx.beginPath();ctx.moveTo(X(L/2),Y(0));ctx.lineTo(X(L/2),Y(W));ctx.stroke();
+    ctx.beginPath();ctx.arc(X(L/2),Y(W/2),(X(L)-X(0))*0.09,0,7);ctx.stroke();
+    // goals
+    ctx.lineWidth=3;ctx.strokeStyle=css('--pitch-line');
+    ctx.beginPath();ctx.moveTo(X(0),Y(W/2-gh));ctx.lineTo(X(0),Y(W/2+gh));ctx.stroke();
+    ctx.beginPath();ctx.moveTo(X(L),Y(W/2-gh));ctx.lineTo(X(L),Y(W/2+gh));ctx.stroke();
+    ctx.lineWidth=1.4;
+    // trails
+    if(!reduce){
+      for(let k=1;k<=trailLen;k++){
+        const pf=data.frames[fi-k*2]; if(!pf)break;
+        const a=(1-k/trailLen)*0.16;
+        drawDots(pf,a,2.2,false);
+      }
+    }
+    // players
+    drawDots(f,1,4.6,true);
+    // ball
+    const bx=X(f.ball[0]),by=Y(f.ball[1]);
+    const ring = f.own===0?css('--teamA'):(f.own===1?css('--teamB'):css('--ink-dim'));
+    ctx.beginPath();ctx.arc(bx,by,6.5,0,7);ctx.fillStyle=ring;ctx.globalAlpha=.28;ctx.fill();ctx.globalAlpha=1;
+    ctx.beginPath();ctx.arc(bx,by,3.1,0,7);ctx.fillStyle=css('--ball');ctx.fill();
+    ctx.lineWidth=1;ctx.strokeStyle=ring;ctx.stroke();
+  }
+  function drawDots(f,alpha,r,main){
+    for(let i=0;i<f.a.length;i++) drawPlayer(f.a[i],i,0,f,alpha,r,main);
+    for(let i=0;i<f.b.length;i++) drawPlayer(f.b[i],i,1,f,alpha,r,main);
+    ctx.globalAlpha=1;
+  }
+  function drawPlayer(p,idx,team,f,alpha,r,main){
+    const x=X(p[0]),y=Y(p[1]);
+    const col= team===0?css('--teamA'):css('--teamB');
+    const isGK= idx===0;
+    // ball-carrier highlight ring (only on the live frame)
+    if(main && f.own===team && f.oi===idx){
+      ctx.globalAlpha=alpha;ctx.beginPath();ctx.arc(x,y,r+4,0,7);
+      ctx.strokeStyle=css('--ball');ctx.lineWidth=2;ctx.stroke();
+    }
+    ctx.globalAlpha=alpha;
+    ctx.beginPath();ctx.arc(x,y,isGK?r+1:r,0,7);
+    if(isGK){ ctx.fillStyle=css('--panel');ctx.fill();
+      ctx.lineWidth=2;ctx.strokeStyle=col;ctx.stroke(); }   // keeper = hollow ring
+    else { ctx.fillStyle=col;ctx.fill(); }
+    ctx.globalAlpha=1;
+  }
+  resize();
+  return {draw,resize,data};
+}
+function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+function strokeRoundRect(ctx,x,y,w,h,r){roundRect(ctx,x,y,w,h,r);ctx.stroke();}
+
+const P0=makePitch('cv0',BEFORE);
+const P1=makePitch('cv1',AFTER);
+let NF=Math.min(BEFORE.frames.length,AFTER.frames.length);
+
+// ---------- playback ----------
+let fi=0, playing=!reduce, last=0;
+const HZ=(AFTER.hz||BEFORE.hz||10);       // sim ticks/sec (1x = real-time)
+let speed=0.5;                            // default half-speed so it's watchable
+const playBtn=document.getElementById('play');
+const speedSel=document.getElementById('speed');
+if(speedSel){ speedSel.value='0.5'; speedSel.onchange=()=>{speed=parseFloat(speedSel.value);}; }
+const scrub=document.getElementById('scrub'); scrub.max=NF-1;
+const FPS=HZ; // kept for the clock (fi/HZ = real seconds regardless of playback speed)
+function updateScores(){
+  const b=BEFORE.frames[fi|0], a=AFTER.frames[fi|0];
+  document.getElementById('sa0').textContent=b.ga; document.getElementById('sb0').textContent=b.gb;
+  document.getElementById('sa1').textContent=a.ga; document.getElementById('sb1').textContent=a.gb;
+  document.getElementById('clock').textContent=((fi/FPS)).toFixed(1).padStart(4,'0')+'s';
+  scrub.value=fi|0;
+}
+function render(){P0.draw(fi);P1.draw(fi);updateScores();}
+function loop(t){
+  if(playing){
+    if(!last)last=t;
+    fi += (t-last)/1000*HZ*speed; last=t;
+    if(fi>=NF-1){fi=NF-1; render(); playing=false; playBtn.textContent='Replay'; requestAnimationFrame(loop); return;}
+    render();
+  } else last=0;
+  requestAnimationFrame(loop);
+}
+playBtn.onclick=()=>{
+  if(fi>=NF-1){fi=0;}
+  playing=!playing; playBtn.textContent=playing?'Pause':'Play'; last=0;
+};
+document.getElementById('restart').onclick=()=>{fi=0;playing=true;playBtn.textContent='Pause';last=0;render();};
+// LIVE "New Game": ask the server to record a fresh match with the trained model
+// (a new random seed), swap it into the AFTER panel, and play it. Needs the live
+// server (viz/serve_live.py); on the static server the fetch fails and we say so.
+const newGameBtn=document.getElementById('newgame');
+if(newGameBtn){newGameBtn.onclick=async()=>{
+  const old=newGameBtn.textContent; newGameBtn.disabled=true; newGameBtn.textContent='…generating';
+  try{
+    const seed=Math.floor(Math.random()*1e9);
+    const r=await fetch('/newgame?seed='+seed);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const m=await r.json();
+    if(!m || !m.frames || !m.frames.length) throw new Error('empty match');
+    AFTER=m; NF=Math.min(BEFORE.frames.length,AFTER.frames.length); scrub.max=NF-1;
+    fi=0; playing=true; playBtn.textContent='Pause'; last=0; render();
+    newGameBtn.textContent=old;
+  }catch(e){
+    newGameBtn.textContent='needs live server';
+    setTimeout(()=>{newGameBtn.textContent=old;},1800);
+  }finally{ newGameBtn.disabled=false; }
+};}
+scrub.oninput=()=>{fi=+scrub.value;playing=false;playBtn.textContent='Play';render();};
+playBtn.textContent=playing?'Pause':'Play';
+window.addEventListener('resize',()=>{P0.resize();P1.resize();render();});
+render();
+requestAnimationFrame(loop);
+
+// ---------- learning curve ----------
+(function(){
+  const cv=document.getElementById('curve');const ctx=cv.getContext('2d');
+  const pts=CURVE; // [{iter,diff,ga,gb}]
+  function resize(){const w=cv.clientWidth||900;const dpr=Math.min(2,window.devicePixelRatio||1);
+    cv.width=w*dpr;cv.height=Math.round(w*0.34)*dpr;cv.style.height=Math.round(w*0.34)+'px';ctx.setTransform(dpr,0,0,dpr,0,0);draw(w,Math.round(w*0.34));}
+  function draw(w,h){
+    ctx.clearRect(0,0,w,h);
+    const padL=44,padR=16,padT=16,padB=28;
+    const xs=pts.map(p=>p.iter), maxI=Math.max(...xs);
+    const vals=pts.flatMap(p=>[p.diff,p.ga,p.gb]);
+    let lo=Math.min(...vals,-1), hi=Math.max(...vals,1); const span=hi-lo||1; lo-=span*0.08;hi+=span*0.08;
+    const X=i=>padL+(i/maxI)*(w-padL-padR);
+    const Y=v=>padT+(1-(v-lo)/(hi-lo))*(h-padT-padB);
+    // grid + y ticks
+    ctx.strokeStyle=css('--grid');ctx.fillStyle=css('--ink-dim');ctx.lineWidth=1;
+    ctx.font='11px ui-monospace,monospace';ctx.textAlign='right';ctx.textBaseline='middle';
+    for(let g=Math.ceil(lo);g<=Math.floor(hi);g++){
+      const y=Y(g); ctx.globalAlpha=g===0?0:1;
+      ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(w-padR,y);ctx.stroke();
+      ctx.globalAlpha=1;ctx.fillText(g>0?('+'+g):(''+g),padL-8,y);
+    }
+    // break-even dashed at 0
+    ctx.setLineDash([5,4]);ctx.strokeStyle=css('--ink-dim');ctx.globalAlpha=.6;
+    ctx.beginPath();ctx.moveTo(padL,Y(0));ctx.lineTo(w-padR,Y(0));ctx.stroke();
+    ctx.setLineDash([]);ctx.globalAlpha=1;
+    // x labels
+    ctx.textAlign='center';ctx.textBaseline='top';
+    [0,Math.round(maxI/2),maxI].forEach(i=>{ctx.fillText(i+'',X(i),h-padB+8);});
+    ctx.save();ctx.textAlign='center';ctx.fillText('training iteration',(padL+w-padR)/2,h-12);ctx.restore();
+    // faint goals-for / against
+    line(pts.map(p=>[X(p.iter),Y(p.ga)]),css('--teamA'),1.4,.5);
+    line(pts.map(p=>[X(p.iter),Y(p.gb)]),css('--teamB'),1.4,.6);
+    // area under diff
+    const A=css('--accent');
+    const path=pts.map(p=>[X(p.iter),Y(p.diff)]);
+    ctx.beginPath();ctx.moveTo(path[0][0],Y(0));
+    path.forEach(pt=>ctx.lineTo(pt[0],pt[1]));
+    ctx.lineTo(path[path.length-1][0],Y(0));ctx.closePath();
+    const grad=ctx.createLinearGradient(0,padT,0,h-padB);
+    grad.addColorStop(0,hexA(A,.34));grad.addColorStop(1,hexA(A,.02));
+    ctx.fillStyle=grad;ctx.fill();
+    // diff line
+    line(path,A,2.4,1);
+    // endpoint marker
+    const last=path[path.length-1];
+    ctx.beginPath();ctx.arc(last[0],last[1],4.5,0,7);ctx.fillStyle=A;ctx.fill();
+    ctx.beginPath();ctx.arc(last[0],last[1],8,0,7);ctx.strokeStyle=hexA(A,.4);ctx.lineWidth=2;ctx.stroke();
+    // start marker
+    const first=path[0];
+    ctx.beginPath();ctx.arc(first[0],first[1],4,0,7);ctx.fillStyle=css('--bad');ctx.fill();
+  }
+  function line(pts,color,lw,alpha){ctx.globalAlpha=alpha;ctx.strokeStyle=color;ctx.lineWidth=lw;
+    ctx.lineJoin='round';ctx.beginPath();pts.forEach((p,i)=>i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));ctx.stroke();ctx.globalAlpha=1;}
+  function hexA(hex,a){const c=hex.replace('#','');if(c.length!==6)return hex;
+    const r=parseInt(c.slice(0,2),16),g=parseInt(c.slice(2,4),16),b=parseInt(c.slice(4,6),16);return `rgba(${r},${g},${b},${a})`;}
+  resize();window.addEventListener('resize',resize);
+  // redraw on theme toggle
+  new MutationObserver(resize).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+})();
+
+// redraw pitches on theme change too
+new MutationObserver(()=>render()).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+</script>

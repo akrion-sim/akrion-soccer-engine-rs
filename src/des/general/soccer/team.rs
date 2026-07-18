@@ -2534,19 +2534,30 @@ impl SoccerFormationLpBrain {
         if max_players == 0 || self.last_guidance.is_empty() {
             return 0;
         }
-        let mut candidates = self
-            .last_guidance
-            .iter()
-            .enumerate()
-            .filter_map(|(guidance_index, guidance)| {
-                soccer_local_mpc_candidate_priority(snapshot, guidance).map(|priority| {
-                    SoccerLocalMpcCandidate {
-                        guidance_index,
-                        priority,
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
+        let max_players = max_players.min(self.last_guidance.len());
+        let mut candidates = Vec::with_capacity(max_players);
+        for (guidance_index, guidance) in self.last_guidance.iter().enumerate() {
+            let Some(priority) = soccer_local_mpc_candidate_priority(snapshot, guidance) else {
+                continue;
+            };
+            let candidate = SoccerLocalMpcCandidate {
+                guidance_index,
+                priority,
+            };
+            if candidates.len() < max_players {
+                candidates.push(candidate);
+                continue;
+            }
+            if let Some((lowest_index, lowest)) = candidates.iter().enumerate().min_by(|a, b| {
+                a.1.priority
+                    .partial_cmp(&b.1.priority)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                if candidate.priority > lowest.priority {
+                    candidates[lowest_index] = candidate;
+                }
+            }
+        }
         candidates.sort_by(|a, b| {
             b.priority
                 .partial_cmp(&a.priority)
@@ -2554,7 +2565,7 @@ impl SoccerFormationLpBrain {
         });
 
         let mut solved = 0usize;
-        for candidate in candidates.into_iter().take(max_players) {
+        for candidate in candidates {
             let original = self.last_guidance[candidate.guidance_index].clone();
             if let Some(refined) = soccer_local_mpc_refined_guidance(snapshot, &original) {
                 self.last_guidance[candidate.guidance_index] = refined;
@@ -2744,16 +2755,34 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
             PlayerRole::Midfielder => 0.05,
             PlayerRole::Forward => 0.0,
         };
-        let radius = if same_team { 1.35 } else { 1.75 } + holder_bonus + role_radius_bonus;
+        let mut radius: f64 =
+            if same_team { 1.35 } else { 1.75 } + holder_bonus + role_radius_bonus;
         let kinematic_pressure = 1.0
             + velocity.len().clamp(0.0, 16.0) / 48.0
             + acceleration.len().clamp(0.0, 14.0) / 56.0;
-        let weight = if same_team { 7.0 } else { 12.0 } * kinematic_pressure
+        let mut weight = if same_team { 7.0 } else { 12.0 } * kinematic_pressure
             + if snapshot.ball.holder == Some(other.id) {
                 4.0
             } else {
                 0.0
             };
+        // HARD same-team separation floor — the MPC keep-out layer. Inflate a teammate's
+        // avoidance radius to the 4yd floor (and strengthen its weight) so the point-mass
+        // planner routes a running trajectory AROUND teammates rather than through them,
+        // keeping the plan consistent with the movement barrier + graduated penalty. Waived
+        // when BOTH players are inside an 18-yard box (legitimate goalmouth congestion). No-op
+        // (byte-identical) when the gate is off.
+        if same_team && dd_soccer_enable_same_team_separation_floor() {
+            let both_in_box = soccer_point_in_either_penalty_area(player.position, width, length)
+                && soccer_point_in_either_penalty_area(other.position, width, length);
+            if !both_in_box {
+                // Full influence radius (8yd) so the quadratic keep-out cost grows increasingly
+                // from 7→6→5→4yd, matching the graduated reward; the hard floor is the barrier.
+                radius = radius
+                    .max(SAME_TEAM_MIN_SEPARATION_YARDS + SAME_TEAM_SEPARATION_INFLUENCE_YARDS);
+                weight *= SAME_TEAM_MPC_OBSTACLE_WEIGHT_GAIN;
+            }
+        }
         obstacles.push(PlanarObstacle {
             center: [center.x, center.y],
             velocity: [obstacle_velocity.x, obstacle_velocity.y],
@@ -2772,8 +2801,10 @@ pub(crate) fn soccer_local_mpc_planar_obstacles(
         length,
         ball_position,
     );
-    let ball_obstacle_velocity =
-        limit_vec2_len(ball_velocity + ball_acceleration * dt + ball_jerk * half_dt2, 32.0);
+    let ball_obstacle_velocity = limit_vec2_len(
+        ball_velocity + ball_acceleration * dt + ball_jerk * half_dt2,
+        32.0,
+    );
     let ball_weight = 4.5
         + ball_velocity.len().clamp(0.0, 28.0) / 7.0
         + ball_acceleration.len().clamp(0.0, 28.0) / 14.0;
@@ -2842,7 +2873,7 @@ fn soccer_local_mpc_refined_guidance(
         + whole_field_context.position_weight_bonus;
     let vel_weight =
         1.25 + guidance.speed_match_weight * 3.0 + whole_field_context.velocity_weight_bonus;
-    let horizon = (2.25 / dt).round().clamp(8.0, 45.0) as usize;
+    let horizon = (1.5 / dt).round().clamp(8.0, 30.0) as usize;
     let obstacle_decay_per_step = 0.5_f64.powf(dt / 1.5).clamp(0.70, 1.0);
     let mut controller = PlanarPointMassMpc::new(PlanarMpcConfig {
         horizon,
@@ -2853,7 +2884,7 @@ fn soccer_local_mpc_refined_guidance(
         qf_vel: vel_weight * 2.0,
         r: 0.10,
         a_max: accel_cap,
-        iters: (horizon.saturating_mul(5)).clamp(48, 160),
+        iters: (horizon.saturating_mul(4)).clamp(32, 96),
         obstacle_decay_per_step,
     })
     .ok()?;
@@ -4012,6 +4043,7 @@ fn soccer_formation_lp_anchor(
     let own_goal_y = team.other().goal_y(length);
     let home_position = finite_pitch_point(player.home_position, width, length, center);
     let home_lane = ((home_position.x - width * 0.5) / (width * 0.5)).clamp(-1.0, 1.0);
+    let spread = formation_hold_tighten_enabled();
     let directive_width = soccer_lp_clamped(directive.width_yards, 14.0, width, width * 0.62);
     let defensive_line_y = soccer_lp_clamped(
         directive.defensive_line_y,
@@ -4030,6 +4062,20 @@ fn soccer_formation_lp_anchor(
     let possession = snapshot
         .controlled_possession_team()
         .or_else(|| snapshot.possession_team());
+    // Formation spread: the legacy anchor width (`width*0.62` ≈ 50yd) collapsed the block so the
+    // eleven's home lanes mapped to only ~32yd of span — the team never held the pitch wide. Floor
+    // the anchor width near the full pitch (wider in possession) so the LP nudges players onto a
+    // genuinely spread formation; the dynamic directive can still make it wider, and the player
+    // POMDP still decides whether to take the slot.
+    if spread {
+        let floor = if possession == Some(team) {
+            width * 0.92
+        } else {
+            width * 0.80
+        };
+        let effective_width = directive_width.max(floor);
+        x = width * 0.5 + home_lane * effective_width * 0.5;
+    }
     let y = match possession {
         Some(possessing) if possessing == team => match player.role {
             PlayerRole::Goalkeeper => own_goal_y + attack_dir * 7.0,
@@ -4071,6 +4117,11 @@ fn soccer_formation_lp_anchor(
                 DEFENDER_BALL_SIDE_PULL_BONUS
             };
             pull = (pull + bonus).min(0.9);
+        }
+        // Do not collapse the spread onto the ball's lane as hard — the block shifts ball-side but
+        // keeps its width so the far side of the pitch is not vacated.
+        if spread {
+            pull *= 0.60;
         }
         x = x * (1.0 - pull) + (width * 0.5 + ball_lane_pull * width * 0.28) * pull;
         let lane_x =

@@ -11,6 +11,43 @@ If a throwaway worktree is ever unavoidable, it MUST live under `tmp/worktrees/`
 worktree in the repo root or any other in-tree path: `git add -A` then stages it as an
 embedded gitlink/submodule (the `adding embedded git repository` warning). System `/tmp`
 is also fine, but `tmp/worktrees/` is the convention here.
+
+NEVER use `git stash`. It silently hides work off to the side, and when multiple agents
+(or an autosaver) touch the same tree, a stash/pop races and clobbers in-progress edits —
+a `git stash pop` landing mid-merge can drop conflict resolutions, and a background
+autosaver stashing your working tree makes any merge non-deterministic. Keep changes
+either committed on `main` or live in the working tree — never stashed. To set work aside,
+COMMIT it (a `wip:` commit is fine): durable, visible in history, and rebase/merge-safe.
+Do not add tooling that runs `git stash` (no "autosaver"). If you find a stash, reconstruct
+it into a commit and drop it; do not leave work hidden in the stash list. Past stash misuse
+also leaves ORPHANED stash commits that no longer show in `git stash list` but linger as
+unreachable objects (`git fsck --unreachable | grep commit`, subjects like `WIP on ...`,
+`index on ...`, `On <branch>: ...`). Treat these the same way: before resurrecting one, run
+the semantic-containment check below — most are snapshots of work that already landed. Only
+reconstruct+merge the genuinely-unmerged remainder; drop the rest (let git gc reclaim them),
+do NOT re-merge already-landed work (that creates duplicates).
+
+MERGE CONCEPTUALLY — never merely pick a side. When reconciling divergent work (branches,
+worktrees, reconstructed stashes) into `main`, integrate the IDEAS: keep every distinct
+concept from both sides. Resolve a conflict wholesale to one side ONLY after verifying that
+side is a strict superset (the other is an older snapshot, a pure reformat, or already
+contained) — and STATE that justification in the commit message. If both sides carry a real,
+different idea (e.g. two implementations of one feature, or one has a test/doc/insight the
+other lacks), COMBINE them — take the spec-faithful implementation AND the other's test and
+documentation. A blind "take theirs / take ours" without that superset check is a bug, not a
+merge.
+
+CHECK CONTAINMENT BY CONCEPT, NOT BY TEXT. Before merging any branch/worktree/reconstructed
+stash, verify whether its IDEAS are already in `main` — semantically, not by literal diff or
+symbol name. A textual diff or reverse-apply (`git apply -R --check`) is unreliable here:
+context drift on an old base makes already-present code look "unmerged," and a later RENAME or
+REFACTOR in `main` hides an already-landed feature (e.g. `quick_forward_release_bonus` was
+merged and then evolved into `quick_forward_release_bonus_value` + `_opportunity_reward`; a
+grep for the old names falsely reports it MISSING). So: read the actual added code, find the
+concept in `main` by behavior (constants/gates/env knob/call site/test), and only merge the
+part that is truly absent. If the whole thing is already present in evolved form, merge NOTHING
+and drop the source — re-adding it would duplicate a better implementation.
+
 x is sideline-to-sideline (width) dimension, y is goal-to-goal (length) dimension
 MDP = markov decision process
 MPC = model predictive control
@@ -81,29 +118,113 @@ upstream/learning...HEAD`). My default-on gates need no all-gates-on.sh edit, bu
 there anyway for an unambiguous lineage. (Engine changes that DON'T touch FEATURE_DIM are safe
 to CONTINUE training from the current gen.)
 
-Hetzner (use the ~/.ssh alias): `ssh hetzner-k8s-bastion` runs `kubectl` (k3s; transient
-`TLS handshake timeout` to one API VIP — just retry). `kubectl scale deploy
-dd-soccer-learning-rds-continuous --replicas=1` then `kubectl rollout restart deploy/...`.
-If Pending with `Insufficient memory` (requests, not usage), lower it:
-`kubectl set resources deploy/dd-soccer-learning-rds-continuous --requests=memory=8Gi
---limits=memory=60Gi`, and `kubectl scale deploy dd-soccer-learning-all-gates-on --replicas=0`
-(that one chronically CrashLoopBackOffs and reserves 16Gi). Confirm code: `kubectl logs <pod> |
-grep source_commit_actual` (must equal your pushed SHA).
+## Remote cluster access (~/.ssh + ~/.aws)
 
-AWS EC2 k8s — the API (https://98.90.186.114:6443, context `dd-ec2-runtime`) is firewalled
-from the laptop, BUT it IS reachable via an **SSM port-forward** (aws CLI = user `my-cli-user`,
-acct 710156900967, us-east-1; the lone SSM-Online instance is `i-0cc2461a55d491af6`). The only
-missing piece is `session-manager-plugin`; install it USER-SPACE (no sudo):
+### Hetzner (ssh, 95.217.171.250 cp / 167.233.100.88 bastion)
+
+SSH config from `~/.ssh/config`:
 ```
-ARCH=$(uname -m)  # arm64 on this Mac
-curl -so smb.zip https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/sessionmanager-bundle.zip
-unzip -oq smb.zip && xattr -dr com.apple.quarantine sessionmanager-bundle/bin/session-manager-plugin
-export PATH="$PWD/sessionmanager-bundle/bin:$PATH"
+Host hetzner-cp
+  HostName 95.217.171.250
+  User root
+  IdentityFile ~/.ssh/id_hetzner
+
+Host hetzner-k8s-bastion dd-k8s-fsn1-public
+  HostName 167.233.100.88
+  User root
+  IdentityFile ~/.ssh/id_hetzner
+  ServerAliveInterval 30
+```
+
+Both are sometimes unreachable (firewall / downtime). Try `hetzner-cp` first; if it fails,
+the bastion at `167.233.100.88` may be up. If both time out, the cluster is unreachable from here.
+
+Once connected, k3s kubectl is available immediately:
+```
+kubectl scale deploy dd-soccer-learning-rds-continuous --replicas=1
+kubectl rollout restart deploy/dd-soccer-learning-rds-continuous
+```
+If Pending with `Insufficient memory` (requests, not usage), lower it:
+```
+kubectl set resources deploy/dd-soccer-learning-rds-continuous --requests=memory=8Gi --limits=memory=60Gi
+kubectl scale deploy dd-soccer-learning-all-gates-on --replicas=0
+```
+Confirm code: `kubectl logs <pod> | grep source_commit_actual` (must equal pushed SHA).
+
+### AWS EC2 k8s (SSM tunnel via ~/.aws)
+
+The k8s API (https://98.90.186.114:6443, context `dd-ec2-runtime`) is firewalled from the laptop,
+reachable only through an **SSM port-forward**. AWS CLI uses `my-cli-user` (acct 710156900967,
+us-east-1, creds in `~/.aws/credentials`).
+
+1. Install session-manager-plugin (one-time, user-space):
+```
+curl -so /tmp/smb.zip https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/sessionmanager-bundle.zip
+unzip -oq /tmp/smb.zip -d /tmp && xattr -dr com.apple.quarantine /tmp/sessionmanager-bundle/bin/session-manager-plugin
+export PATH="/tmp/sessionmanager-bundle/bin:$PATH"
+```
+2. Start the SSM tunnel (runs in background; port 16443 → k8s API 6443):
+```
 nohup aws ssm start-session --target i-0cc2461a55d491af6 \
   --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["6443"],"localPortNumber":["16443"]}' >/tmp/ssm_pf.log 2>&1 &
-kubectl --context dd-ec2-runtime --server https://localhost:16443 --insecure-skip-tls-verify get deploy -A
+  --parameters '{"portNumber":["6443"],"localPortNumber":["16443"]}' \
+  > /tmp/ssm_pf.log 2>&1 &
 ```
-Then it's normal kubectl (same `dd-soccer-learning-rds-continuous` learner, same `learning` ref,
-same RDS experiment; a commit-watcher there auto-redeploys on new pushes). `aws ssm send-command`
+The tunnel process dies if the bash tool kills its parent session; restart it each time
+you need it. To keep it alive across tool invocations, use `setsid` (not on macOS) or a
+persistent tmux/screen.
+3. Use kubectl with the tunnel:
+```
+kubectl --context dd-ec2-runtime --server https://localhost:16443 --insecure-skip-tls-verify get pods -A
+```
+4. The `dd-soccer-commit-watcher` deployment auto-redeploys the learner and launches
+   push-tournament jobs on new commits. If push tournaments are skipped with
+   `tournament_lock_noncanonical`, the commit-watcher needs
+   `SOCCER_TOURNAMENT_ALLOW_NONCANONICAL_LOCK=true` in its env.extend block (see
+   `launch_tournament()` function in its args).
+
+It is the same `dd-soccer-learning-rds-continuous` learner, same `learning` ref, and same
+RDS experiment; the commit-watcher there auto-redeploys on new pushes. `aws ssm send-command`
 does NOT work (no AWS-RunShellCommand doc on this acct) — use the port-forward, not send-command.
+
+### RDS Postgres (soccer-learning-pg)
+
+Both clusters connect to the same RDS Postgres instance via `SOCCER_DATABASE_URL`
+(from k8s secret `dd-remote-rest-api-secrets.RDS_DATABASE_URL`). TLS is enabled but
+certificate verification is disabled (`SOCCER_PG_TLS_INSECURE=1`).
+
+Direct Postgres access from laptop: use the SSM tunnel (port 5432 → RDS):
+```
+nohup aws ssm start-session --target i-0cc2461a55d491af6 \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["5432"],"localPortNumber":["15432"]}' \
+  > /tmp/ssm_pg.log 2>&1 &
+psql "postgresql://$(kubectl get secret dd-remote-rest-api-secrets -o jsonpath='{.data.RDS_DATABASE_URL}' | base64 -d | sed 's/localhost/localhost:15432/')"
+```
+
+Key RDS tables:
+- `des_soccer_learning_runs` — per-game telemetry (payoff, policy-gen, eval vs analytic)
+- `soccer_policy_generations` — saved policy-net generations (what :5055 reads)
+
+## Command safety — STRICT (all agents MUST follow)
+
+Never run destructive or irreversible shell commands. To remove or move files,
+**always go through git** so the change is tracked and recoverable.
+
+**Blacklisted — do NOT run:**
+- `rm`, `rm -rf`, `rmdir`, `unlink` — never delete via raw `rm`.
+- bulk / indirect deletion: `find … -delete`, `find … -exec rm …`, `xargs rm` — no bypasses of the `rm` ban.
+- raw `mv` of tracked files; truncating a tracked file with `>` or `truncate`.
+- `git reset --hard`, `git clean -fdx`, `git checkout -- .` / `git restore .` mass-discard.
+- `git stash` — **all forms** (not just `drop`/`clear`): this repo forbids stash entirely, see the no-stash rule above. Plus `git branch -D`, `git tag -d` — destroy unmerged work / refs; not on shared branches unless the operator explicitly asks.
+- `git push --force` / history rewrites on shared branches (esp. `main`).
+- `dd`, `mkfs`, `shred`, recursive `chmod -R` / `chown -R` on broad paths, fork bombs.
+
+**Whitelisted — safe, prefer these:**
+- `git rm` / `git rm --cached` — remove files through git (recoverable via history).
+- `git mv` — rename/move through git.
+- `git restore <path>` (single file), `git revert` — reversible. (No `git stash` in this repo — it is forbidden entirely; see the rule above.)
+- Editing via the editor tools, `git add`, `git commit`, `git switch -c`.
+
+If a genuinely destructive action seems unavoidable, **STOP and ask the operator
+first** — do not improvise around this rule.

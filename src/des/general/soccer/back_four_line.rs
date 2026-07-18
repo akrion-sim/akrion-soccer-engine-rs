@@ -14,16 +14,18 @@
 //! so the model chooses *where inside the legal line* the four sit, never an
 //! illegal line.
 //!
-//! Inputs (the 7 groups the model is a function of), all in the defending team's
+//! Inputs (the groups the model is a function of), all in the defending team's
 //! attacking frame so the model is mirror-invariant:
 //!   1. ball position / velocity / acceleration,
 //!   2. opponent vector — position / velocity / acceleration,
-//!   3. the back four's own position / velocity / acceleration,
+//!   3. the back four's own position / velocity / acceleration plus individual line error,
 //!   4. opponent centre of mass (folded into group 2's centroid),
 //!   5. which team controls the ball,
 //!   6. our own goalkeeper's position,
 //!   7. offside-trap state now and (implicitly, via velocity/accel + the predicted
 //!      ball) over the next ~3 s.
+//!   8. the full field kinematic vector: 22 player slots + ball, each carrying
+//!      position / velocity / acceleration in the same defending frame.
 //!
 //! ## Parity
 //!
@@ -37,14 +39,29 @@
 //! head.
 
 use super::*;
-use crate::des::general::neural_network::{
-    ActivationName, FeedForwardNetwork, RandomNetworkSpec,
-};
+use crate::des::general::neural_network::{ActivationName, FeedForwardNetwork, RandomNetworkSpec};
 use crate::des::general::prng::mulberry32;
 
+/// Number of aggregate features in the original back-four line state vector.
+const BACK_FOUR_LINE_BASE_FEATURE_DIM: usize = 27;
+/// Extra group/individual line-health features: fore-aft spread, lateral width,
+/// worst individual line error, and that defender's closing velocity toward the line.
+const BACK_FOUR_LINE_SHAPE_FEATURE_DIM: usize = 4;
+/// Full-field POMDP kinematic slots: 22 players + ball.
+pub const BACK_FOUR_LINE_FIELD_PLAYERS: usize = 22;
+pub const BACK_FOUR_LINE_FIELD_BALLS: usize = 1;
+const BACK_FOUR_LINE_FIELD_ENTITIES: usize =
+    BACK_FOUR_LINE_FIELD_PLAYERS + BACK_FOUR_LINE_FIELD_BALLS;
+/// Per entity: forward position, lateral position, forward velocity, lateral
+/// velocity, forward acceleration, lateral acceleration.
+pub const BACK_FOUR_LINE_FIELD_KINEMATICS_PER_ENTITY: usize = 6;
+pub const BACK_FOUR_LINE_FIELD_KINEMATIC_DIM: usize =
+    BACK_FOUR_LINE_FIELD_ENTITIES * BACK_FOUR_LINE_FIELD_KINEMATICS_PER_ENTITY;
 /// Number of features in the back-four line state vector. The exact ordering is
 /// defined once in [`BackFourLineInputs::to_features`].
-pub const BACK_FOUR_LINE_FEATURE_DIM: usize = 26;
+pub const BACK_FOUR_LINE_FEATURE_DIM: usize = BACK_FOUR_LINE_BASE_FEATURE_DIM
+    + BACK_FOUR_LINE_SHAPE_FEATURE_DIM
+    + BACK_FOUR_LINE_FIELD_KINEMATIC_DIM;
 /// Weight on the model's own depth vs. the retained existing heuristic centre in
 /// the analytic seed (group 8: *leave in existing determinants*). `0` = pure
 /// heuristic (parity-ish), `1` = pure model. Kept modest so the well-tuned
@@ -70,9 +87,11 @@ const MIDFIELD_LINE_MODEL_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_MIDFIELD_LINE_MOD
 /// CENTRE is anchored on the [`BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS`] line while the
 /// ball is upfield of it, tracks the ball to parity between the keeper's 6 and the
 /// anchor, sticks at the 6 inside it, and trails a dynamic
-/// [`BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS`]..[`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`]
-/// behind a deep ball (never past the halfway+cap). Off (unset) ⇒ byte-identical to
-/// the existing ball-relative 20-40yd band + halfway+5 cap.
+/// possession-aware gap (5..40 in possession, 20..40 out) behind a deep ball, pressed up to fill
+/// the space in front of the foremost attackers, never past the halfway+cap. **Default-ON** in
+/// production (this is the geometry-anchored centre that removes the self-referential "sine-wave");
+/// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2=0` is the kill switch back to the legacy ball-relative
+/// 20-40yd average band. Default-OFF under test so the line-depth parity suite stays byte-identical.
 const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2";
 /// Env gate enabling **wingback-first forward priority** on the back-four line band.
 /// Without this, the 20-40yd ball cushion / flat offside line is enforced on the AVERAGE
@@ -87,6 +106,26 @@ const BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_LIN
 /// symmetric all-four-average line stands (byte-identical).
 const DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV: &str =
     "DD_SOCCER_ENABLE_WINGBACK_FORWARD_PRIORITY";
+/// Env gate (default-ON) for the press-to-attackers compaction of the v2 line centre.
+const BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS";
+/// Env kill switch (default-ON) for the TIGHTER foremost-four gaps + harder push (sit closer to the
+/// opponents' front line). See [`back_four_tighter_line_enabled`].
+const BACK_FOUR_TIGHTER_LINE_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_TIGHTER_LINE";
+/// Env kill switch (default-ON) for the ball-far offside-trap push-up. See
+/// [`back_four_ball_far_push_up_enabled`].
+const BACK_FOUR_BALL_FAR_PUSH_UP_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_BALL_FAR_PUSH_UP";
+/// Env gate (default-ON) for the energy-conservation hold deadband on the v2 line target.
+const BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV: &str =
+    "DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND";
+/// Env kill switch (default-ON) for the **sticky line anchor**: the back-four line CENTRE is latched
+/// on the sim-tick loop and HELD for [`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] (re-picked only when
+/// that window of ticks elapses, possession flips, or the fresh ideal line drops materially deeper)
+/// instead of being recomputed every tick. Holding the centre steady is what removes the unrealistic
+/// "sine-wave" walk-stop-walk: defenders already on the latched line ARE the anchors and HOLD (stand
+/// / walk, conserve energy) while only the off-line defenders adapt to them. `=0` reverts to the
+/// per-tick recompute (byte-identical), and it is default-OFF under test so the parity suite holds.
+const BACK_FOUR_LINE_STICKY_ANCHOR_ENABLE_ENV: &str =
+    "DD_SOCCER_ENABLE_BACK_FOUR_LINE_STICKY_ANCHOR";
 
 /// Comfortable resting gap (yd behind the ball) the CENTRAL defenders hold while defending
 /// under wingback-first priority. Decoupling the wingbacks from the line average removed the
@@ -107,11 +146,217 @@ pub const BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS: f64 = 15.0;
 /// deep upfield (`ball_depth > anchor + gap`). The dynamic line head picks within
 /// it: the min is a higher line (smaller gap), the max a deeper line.
 pub const BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS: f64 = 20.0;
+/// While we control possession, the back four may close the ball-to-line gap
+/// much more aggressively because the opponent cannot immediately receive in
+/// behind from our own attack phase.
+pub const BACK_FOUR_LINE_POSSESSION_GAP_MIN_YARDS: f64 = 5.0;
 pub const BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS: f64 = 40.0;
 /// Neutral gap fraction (mid-band) used when the line-depth inputs are degenerate
 /// (a roster with no defenders/opponents/keeper) so the desired gap falls back to
 /// the middle of the 20-40 band rather than an arbitrary literal.
 pub const BACK_FOUR_LINE_NEUTRAL_GAP_FRACTION: f64 = 0.5;
+/// Target spacing from the back four to the opponent's foremost four attackers.
+/// Smaller values mean the defensive line steps up harder to stay connected.
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_YARDS: f64 = 24.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_YARDS: f64 = 26.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_YARDS: f64 = 30.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_MIN_GAP_YARDS: f64 = 14.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_YARDS: f64 = 12.0;
+
+// ---- Tighter line (default-ON): sit CLOSER to the opponents' foremost four and push up harder ----
+// The legacy ideal gaps (24/26/30) left the back four sitting ~24-30yd behind the opponents' front
+// line — far too much space to play a pass into feet, and visually "backing off". These tighter
+// gaps + a higher push cap + firmer gains make the line step up to stay connected to the foremost
+// four, per the coaching cue "there shouldn't be so much space between the back 4 and the
+// forward-most opponents". Still never steps AHEAD of the attackers (no runner played onside).
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_TIGHT_YARDS: f64 = 12.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_TIGHT_YARDS: f64 = 15.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_TIGHT_YARDS: f64 = 20.0;
+pub const BACK_FOUR_FOREMOST_FOUR_ATTACKER_MAX_PUSH_TIGHT_YARDS: f64 = 26.0;
+
+// ---- Ball-far offside-trap push-up (default-ON) ----
+// "The defense can push up to play an offside trap when the ball is far away and the back four is
+// more than 5 yards inside its own half." When the (predicted) ball is upfield in the opponent
+// half by this margin AND the line still sits deeper than [own half − OWN_HALF_MARGIN], the line
+// steps up to a high trap line: a small gap GOALSIDE of the opponents' SINGLE most-advanced
+// attacker (so nobody is left in behind), capped at the high-line ceiling. Held off while the
+// opponent is in clear control (no pushing into a live counter).
+pub const BACK_FOUR_BALL_FAR_PUSH_UP_BALL_MARGIN_YARDS: f64 = 6.0;
+pub const BACK_FOUR_BALL_FAR_PUSH_UP_OWN_HALF_MARGIN_YARDS: f64 = 5.0;
+pub const BACK_FOUR_BALL_FAR_PUSH_UP_TRAP_GAP_YARDS: f64 = 4.0;
+
+/// Minimum trailing gap (yd behind the ball) the back four holds **while WE control the ball**.
+/// In possession the line may step right up to support the attack, so the floor drops from the
+/// out-of-possession [`BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS`] (20) to this (5). "Dispossession" —
+/// the opponent controlling OR a loose/contested ball with NO controller — keeps the deeper 20yd
+/// floor. So the dynamic trailing gap is **5..40 in possession, 20..40 out of possession**. The
+/// 15yd anchor non-linearity ([`BACK_FOUR_LINE_ANCHOR_DEPTH_YARDS`]) still governs the deep-ball
+/// regime in both cases.
+pub const BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS: f64 = 5.0;
+
+/// MARL/MAPPO seed for the **optimal distance** (yd) the back four sits goal-side of the opponent's
+/// foremost-attacker line while in possession or dispossession: the line presses UP to fill the
+/// space between the four and the opponent's most advanced attackers rather than leaving a large
+/// hole for a pass into feet. Only ever raises a too-deep centre toward the attackers — never steps
+/// the line AHEAD of them (that plays them onside). The learned line-depth head refines the live
+/// depth via the attacker-compactness reward term; this is the analytic seed / fallback.
+pub const BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS: f64 = 12.0;
+/// How many of the opponent's most-advanced outfielders define the "foremost attackers" line the
+/// back four compresses the space toward (the user's "foremost 4 opponent attackers").
+pub const BACK_FOUR_FOREMOST_ATTACKERS_COUNT: usize = 4;
+
+/// Energy-conservation **hold deadband** (yd) on the back-four line target: a line-bound defender
+/// already within this distance of its (legal) line target HOLDS rather than re-chasing a target
+/// that jitters a yard or two each tick with the predicted ball — the "sine-wave" walk-stop-walk.
+/// Always overridden (the defender is corrected) when it sits illegally AHEAD of the offside cap,
+/// so the deadband only ever leaves a defender a touch DEEPER than ideal (never plays a runner
+/// onside). Damps the cosmetic oscillation and saves the effort the wasted-energy penalty docks.
+pub const BACK_FOUR_LINE_HOLD_DEADBAND_YARDS: f64 = 2.0;
+
+/// How long (in SIM SECONDS — measured on the single-threaded sim-tick loop, never wall-clock) the
+/// back-four line centre is held latched before it is re-evaluated. ~3s: long enough that the line
+/// stops oscillating tick-to-tick (the "sine-wave"), short enough that it re-reads the game often.
+/// The caller converts this to a tick count via the sim `dt`, so it is framerate-independent.
+pub const BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS: f64 = 3.0;
+/// The latched line re-anchors EARLY (before the [`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`] window
+/// elapses) only when the freshly-computed ideal line has dropped at least this many yards DEEPER
+/// (toward our own goal) than the held centre — i.e. the threat grew, so the line drops promptly for
+/// safety rather than holding a too-high line. Stepping the line UP always waits for the window /
+/// possession flip, so the four never ratchet up-and-back every tick (that asymmetry is the
+/// sine-wave cure); smaller fluctuations either way are simply held.
+pub const BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS: f64 = 3.0;
+
+/// Latched back-four line centre, held on the sim-tick loop for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`]
+/// so the line stops oscillating. `centre_depth` is yards from the team's OWN goal (mirror-invariant),
+/// so it reads the same regardless of which way the team attacks. Re-picked by
+/// [`back_four_line_sticky_should_repick`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackFourLineLatch {
+    /// Held line-centre depth (yd from own goal).
+    pub centre_depth: f64,
+    /// Sim tick the latch was (re)set — expiry is measured in elapsed ticks, never wall-clock.
+    pub set_tick: u64,
+    /// Which team controlled the ball when the latch was set; a change re-picks immediately.
+    pub possession_at_set: Option<Team>,
+}
+
+/// Pure, RNG-free re-pick decision for the sticky line anchor. Re-evaluate the held centre when:
+/// possession has flipped (we won/lost the ball), OR the latch's tick window has elapsed
+/// (`ticks_held >= latch_ticks`), OR the fresh ideal line has dropped at least
+/// [`BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS`] DEEPER than the held centre (a growing threat drops
+/// the line promptly). Otherwise HOLD — and that hold is exactly what removes the sine-wave.
+/// `held_depth`/`fresh_depth` are yards-from-own-goal, so a DEEPER line is a SMALLER depth.
+pub fn back_four_line_sticky_should_repick(
+    held_depth: f64,
+    fresh_depth: f64,
+    ticks_held: u64,
+    latch_ticks: u64,
+    possession_flipped: bool,
+) -> bool {
+    possession_flipped
+        || ticks_held >= latch_ticks
+        || fresh_depth + BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS < held_depth
+}
+/// Per-yard weight of the attacker-compactness term folded into the line-depth RL reward when the
+/// attacker-press is on: each yard the back four sits behind the optimal gap to the foremost
+/// attackers docks the reward by this much, so the learned head prefers ball-gap fractions that
+/// keep the four compact with the attackers. Small relative to the territorial-advantage delta.
+pub const BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD: f64 = 0.02;
+/// MARL/MAPPO sample reward shaping: dock a line-depth action when the four-man
+/// line is still ragged after the reward window, so the shared critic learns that
+/// group push/drop choices and individual recovery must agree.
+pub const BACK_FOUR_LINE_RAGGED_REWARD_PENALTY_POINTS: f64 = 0.025;
+
+/// Env kill switch for the state-adaptive back-four block width (see
+/// [`back_four_adaptive_width_enabled`]).
+const BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV: &str = "DD_SOCCER_ENABLE_BACK_FOUR_ADAPTIVE_WIDTH";
+/// Env kill switch for flooring the back-four block width at the four's own FORMATION span (see
+/// [`back_four_formation_width_floor_enabled`]).
+const BACK_FOUR_FORMATION_WIDTH_FLOOR_ENABLE_ENV: &str =
+    "DD_SOCCER_ENABLE_BACK_FOUR_FORMATION_WIDTH_FLOOR";
+/// Fraction of the back four's home-lane span (the max minus min of the four defenders' home x)
+/// that the block width may never fall below. The adaptive-width floor
+/// ([`BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS`] = 34yd) is far narrower than a standard back-four home
+/// span (~52yd on an 80yd pitch: home x 14/31/49/66), so against a central attack the block tucked
+/// the fullbacks a full lane infield off their channels (lanes 2/9 → 3/8) and GIFTED the flanks —
+/// the "back four ignore their lane" bug. Flooring the width at ~the formation span keeps each
+/// defender in its lane; kept just under 1.0 so a small justified tuck is still allowed and the
+/// ball-side centre shift never forces the ball-far fullback off the pitch. The floor only ever
+/// WIDENS the block, so it cannot worsen flank coverage.
+pub const BACK_FOUR_FORMATION_WIDTH_FLOOR_FRACTION: f64 = 0.94;
+/// Shoulder margin (yd) the state-adaptive back-four width adds beyond the widest foremost attacker
+/// on each side, so the line COVERS the man rather than sitting level with him. See
+/// [`back_four_adaptive_width_yards`].
+pub const BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS: f64 = 6.0;
+/// Floor (yd) on the state-adaptive back-four width — even against a bunched central attack the
+/// four keep this much spread, so they never collapse onto the centre (the old fixed 22yd block
+/// that left both flanks open). Comfortably wider than that legacy block.
+pub const BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS: f64 = 34.0;
+/// Ceiling on the state-adaptive back-four width as a fraction of pitch width, so even against a
+/// touchline-to-touchline attack the four keep some central compactness rather than splitting fully
+/// to the flanks and gifting the middle.
+pub const BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION: f64 = 0.74;
+
+/// Whether the back four spans a STATE-ADAPTIVE block width — sized to cover the opponent's
+/// foremost-attacker lateral spread (+ a shoulder each side), floored and capped — instead of the
+/// fixed narrow `defensive_shape.back_four_block_width_yards` (22yd) block that left the flanks
+/// open. The width RESPONDS to the attack (wide vs a stretched front, tucked vs a central one)
+/// rather than being a forced constant — the same shape the line DEPTH already takes from an
+/// adaptive analytic seed live. Legacy fixed block is the off-state. Default-ON in production (kill
+/// switch `DD_SOCCER_ENABLE_BACK_FOUR_ADAPTIVE_WIDTH=0`); default-OFF under test so the
+/// defensive-shape parity suite stays byte-identical.
+pub fn back_four_adaptive_width_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_ADAPTIVE_WIDTH_ENABLE_ENV))
+    }
+}
+
+/// Whether the back-four block width is floored at the four's own FORMATION span
+/// ([`BACK_FOUR_FORMATION_WIDTH_FLOOR_FRACTION`] × the home-lane span), so the fullbacks hold their
+/// wide lanes instead of tucking infield behind the narrower adaptive-width floor. Default-ON in
+/// production (kill switch `DD_SOCCER_ENABLE_BACK_FOUR_FORMATION_WIDTH_FLOOR=0`); default-OFF under
+/// test so the defensive-shape parity suite stays byte-identical.
+pub fn back_four_formation_width_floor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_FORMATION_WIDTH_FLOOR_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_FORMATION_WIDTH_FLOOR_ENABLE_ENV))
+    }
+}
+
+/// State-adaptive back-four block width (yd): cover the opponent's foremost-attacker lateral
+/// `attackers_x_span` plus a [`BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS`] shoulder each side,
+/// floored at [`BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS`] and capped at
+/// [`BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION`] of the pitch. Pure + unit-tested so the band is
+/// verifiable independent of the world wiring; non-finite inputs fall back to safe defaults.
+pub fn back_four_adaptive_width_yards(attackers_x_span: f64, field_width: f64) -> f64 {
+    let span = if attackers_x_span.is_finite() {
+        attackers_x_span.max(0.0)
+    } else {
+        0.0
+    };
+    let field = if field_width.is_finite() && field_width > 0.0 {
+        field_width
+    } else {
+        80.0
+    };
+    let ceiling = (field * BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION)
+        .max(BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS);
+    (span + 2.0 * BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS)
+        .clamp(BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS, ceiling)
+}
 
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
@@ -153,7 +398,15 @@ pub fn midfield_line_model_enabled() -> bool {
 }
 
 /// Whether the v2 field-anchored back-four line depth is used at the live line
-/// chokepoint this process. Off ⇒ the existing ball-relative band stands (parity).
+/// chokepoint this process. The v2 centre is a function of **field geometry + the
+/// ball** (15yd anchor, dynamic possession-aware trailing gap, attacker compaction)
+/// rather than the AVERAGE of where the four currently are — so the four no longer
+/// chase a self-referential, jittering line average (the cosmetic "sine-wave"). It
+/// is the home of the 15yd non-linearity, the 5..40/20..40 possession band, the
+/// press-to-attackers compaction, and the hold deadband, so it is promoted to
+/// **default-ON** in production (env `DD_SOCCER_ENABLE_BACK_FOUR_LINE_DEPTH_V2=0`
+/// is the kill switch, reverting to the legacy ball-relative average band).
+/// Default-OFF under test so the line-depth parity suite stays byte-identical.
 pub fn back_four_line_depth_v2_enabled() -> bool {
     #[cfg(test)]
     {
@@ -163,7 +416,94 @@ pub fn back_four_line_depth_v2_enabled() -> bool {
     {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| env_flag_enabled(BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV))
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_DEPTH_V2_ENABLE_ENV))
+    }
+}
+
+/// Whether the **press-to-attackers compaction** is applied to the v2 line centre this process:
+/// while in possession or dispossession (NOT while the opponent drives at our goal) the back four
+/// presses UP to sit at most [`BACK_FOUR_OPTIMAL_GAP_TO_ATTACKERS_YARDS`] goal-side of the
+/// opponent's foremost-attacker line, filling the space rather than leaving a hole. MARL/MAPPO:
+/// the optimal distance is refined by the line-depth head via the attacker-compactness reward.
+/// Default-ON (kill switch `DD_SOCCER_ENABLE_BACK_FOUR_ATTACKER_PRESS=0`); default-OFF under test.
+pub fn back_four_press_to_attackers_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_ATTACKER_PRESS_ENABLE_ENV))
+    }
+}
+
+/// Whether the back four uses the TIGHTER foremost-four ideal gaps + higher push cap (sit closer to
+/// the opponents' front line, step up harder). Default-ON in production (kill switch
+/// `DD_SOCCER_ENABLE_BACK_FOUR_TIGHTER_LINE=0` reverts to the legacy 24/26/30 gaps); default-OFF
+/// under test so the line-depth parity suite stays byte-identical.
+pub fn back_four_tighter_line_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_TIGHTER_LINE_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_TIGHTER_LINE_ENABLE_ENV))
+    }
+}
+
+/// Whether the **ball-far offside-trap push-up** is applied: when the ball is far upfield and the
+/// line is still >5yd inside our own half (and we are not being driven at), step the line up to a
+/// small gap goalside of the opponents' most-advanced attacker. Default-ON in production (kill
+/// switch `DD_SOCCER_ENABLE_BACK_FOUR_BALL_FAR_PUSH_UP=0`); default-OFF under test.
+pub fn back_four_ball_far_push_up_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_BALL_FAR_PUSH_UP_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_BALL_FAR_PUSH_UP_ENABLE_ENV))
+    }
+}
+
+/// Whether the **energy-conservation hold deadband** damps the v2 line target this process: a
+/// line-bound defender already within [`BACK_FOUR_LINE_HOLD_DEADBAND_YARDS`] of its legal target
+/// holds rather than re-chasing a jittering line (the "sine-wave"). Default-ON (kill switch
+/// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_HOLD_DEADBAND=0`); default-OFF under test for parity.
+pub fn back_four_line_hold_deadband_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_HOLD_DEADBAND_ENABLE_ENV))
+    }
+}
+
+/// Whether the **sticky line anchor** holds the back-four line centre latched on the sim-tick loop
+/// this process (see [`BackFourLineLatch`]). Default-ON in production (kill switch
+/// `DD_SOCCER_ENABLE_BACK_FOUR_LINE_STICKY_ANCHOR=0` reverts to per-tick recompute); default-OFF
+/// under test so the line-depth parity suite stays byte-identical.
+pub fn back_four_line_sticky_anchor_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(BACK_FOUR_LINE_STICKY_ANCHOR_ENABLE_ENV)
+    }
+    #[cfg(not(test))]
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| gate_default_on(BACK_FOUR_LINE_STICKY_ANCHOR_ENABLE_ENV))
     }
 }
 
@@ -179,9 +519,8 @@ pub fn defensive_line_wingback_forward_priority_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         // Promoted to default-ON in production (A/B-validated low-risk behavioral hardening).
-        *ENABLED.get_or_init(|| {
-            gate_default_on(DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV)
-        })
+        *ENABLED
+            .get_or_init(|| gate_default_on(DEFENSIVE_LINE_WINGBACK_FORWARD_PRIORITY_ENABLE_ENV))
     }
 }
 
@@ -220,6 +559,60 @@ pub fn back_four_line_target_depth_v2(
     raw.clamp(lo, max_depth)
 }
 
+/// Pure trailing-gap **floor** (yd behind the ball) for the dynamic band: the in-possession floor
+/// (5) when WE control the ball, else the deeper out-of-possession floor (20) — which covers both
+/// the opponent controlling AND a loose/contested ball ("dispossession"). The band top is always
+/// [`BACK_FOUR_LINE_DESIRED_GAP_MAX_YARDS`] (40). Extracted pure so the possession band is unit-
+/// tested without toggling a process-global gate (which would race the parallel suite).
+pub fn back_four_desired_gap_min_yards(we_control: bool) -> f64 {
+    if we_control {
+        BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS
+    } else {
+        BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS
+    }
+}
+
+/// Pure **press-to-attackers compaction** of the line-CENTRE depth (yd from own goal). Raises a
+/// too-deep `centre_depth` UP toward the foremost-attacker line so the four sit at most
+/// `optimal_gap` goal-side of `attacker_depth` — never AHEAD of the attackers (no playing runners
+/// onside), never below the incoming `centre_depth` (push up only), never past `max_depth` / below
+/// `six`. Monotonic non-decreasing in `attacker_depth`.
+pub fn back_four_attacker_pressed_depth(
+    centre_depth: f64,
+    attacker_depth: f64,
+    optimal_gap: f64,
+    six: f64,
+    max_depth: f64,
+) -> f64 {
+    let press_floor = (attacker_depth - optimal_gap)
+        .min(attacker_depth)
+        .clamp(six.min(max_depth), max_depth);
+    centre_depth.max(press_floor)
+}
+
+/// Pure **hold-deadband** decision (energy conservation). Returns the forward target the defender
+/// should actually aim at: `cur_fwd` (HOLD) when it is within `deadband` of `target_fwd` and not
+/// illegally ahead of `cap`; otherwise `target_fwd`. `cap = None` ⇒ no offside concern (trap
+/// lifted), so a within-deadband target always holds. Holding only ever leaves a defender DEEPER
+/// than ideal (it never steps it ahead of the cap), so it cannot play a runner onside.
+pub fn back_four_line_hold_target_fwd(
+    cur_fwd: f64,
+    target_fwd: f64,
+    cap: Option<f64>,
+    deadband: f64,
+) -> f64 {
+    if let Some(cap) = cap {
+        if cur_fwd > cap + 1e-6 {
+            return target_fwd;
+        }
+    }
+    if (target_fwd - cur_fwd).abs() < deadband {
+        cur_fwd
+    } else {
+        target_fwd
+    }
+}
+
 /// Raw (un-normalized) state the line model is a function of, captured in the
 /// defending team's **attacking frame** (`fwd` increases toward the opponent
 /// goal; `lat` is signed distance from the pitch spine). Kept as a plain struct
@@ -241,6 +634,7 @@ pub struct BackFourLineInputs {
 
     // 2. Opponents (incl. 4: centre of mass = centroid).
     pub opp_foremost_fwd_from_own_goal: f64,
+    pub opp_foremost_four_fwd_from_own_goal: f64,
     pub opp_centroid_fwd_from_own_goal: f64,
     pub opp_centroid_lat: f64,
     pub opp_mean_vel_fwd: f64,
@@ -255,6 +649,10 @@ pub struct BackFourLineInputs {
     pub line_vel_lat: f64,
     pub line_acc_fwd: f64,
     pub line_acc_lat: f64,
+    pub line_forward_spread_yards: f64,
+    pub line_lateral_width_yards: f64,
+    pub max_member_line_error_yards: f64,
+    pub max_member_line_closing_velocity_yps: f64,
 
     // 5. Possession.
     pub we_control: bool,
@@ -273,6 +671,10 @@ pub struct BackFourLineInputs {
     // already puts the line centre. The model learns *relative to* this so the
     // well-tuned existing line is never discarded — only refined.
     pub heuristic_centre_fwd_from_own_goal: f64,
+
+    // 9. Full field vector: own 11 then opponent 11, followed by the ball. Each
+    // slot carries position / velocity / acceleration in the defending frame.
+    pub field_kinematics: [f64; BACK_FOUR_LINE_FIELD_KINEMATIC_DIM],
 }
 
 impl BackFourLineInputs {
@@ -287,42 +689,142 @@ impl BackFourLineInputs {
         let vel = |v: f64| (v / REF_TOP_SPEED_YPS).clamp(-2.0, 2.0);
         let acc = |a: f64| (a / REF_ACCEL_YPS2).clamp(-2.0, 2.0);
         let b = |flag: bool| if flag { 1.0 } else { 0.0 };
-        [
-            // 1. Ball.
-            fwd(self.ball_fwd_from_own_goal),
-            lat(self.ball_lat),
-            vel(self.ball_vel_fwd),
-            vel(self.ball_vel_lat),
-            acc(self.ball_acc_fwd),
-            acc(self.ball_acc_lat),
-            // 2. Opponents (+ 4: centroid = centre of mass).
-            fwd(self.opp_foremost_fwd_from_own_goal),
-            fwd(self.opp_centroid_fwd_from_own_goal),
-            lat(self.opp_centroid_lat),
-            vel(self.opp_mean_vel_fwd),
-            vel(self.opp_mean_vel_lat),
-            acc(self.opp_mean_acc_fwd),
-            acc(self.opp_mean_acc_lat),
-            // 3. Self.
-            fwd(self.line_fwd_from_own_goal),
-            lat(self.line_lat),
-            vel(self.line_vel_fwd),
-            vel(self.line_vel_lat),
-            acc(self.line_acc_fwd),
-            acc(self.line_acc_lat),
-            // 5. Possession.
-            b(self.we_control),
-            b(self.they_control),
-            // 6. Own GK.
-            fwd(self.gk_fwd_from_own_goal),
-            lat(self.gk_lat),
-            // 7. Offside-trap state.
-            b(self.offside_in_force),
-            b(self.trap_active_or_imminent),
-            // 8. Existing heuristic determinant (the retained base line).
-            fwd(self.heuristic_centre_fwd_from_own_goal),
-        ]
+        let mut features = [0.0; BACK_FOUR_LINE_FEATURE_DIM];
+        let mut i = 0usize;
+        let mut push = |value: f64| {
+            features[i] = value;
+            i += 1;
+        };
+
+        // 1. Ball.
+        push(fwd(self.ball_fwd_from_own_goal));
+        push(lat(self.ball_lat));
+        push(vel(self.ball_vel_fwd));
+        push(vel(self.ball_vel_lat));
+        push(acc(self.ball_acc_fwd));
+        push(acc(self.ball_acc_lat));
+        // 2. Opponents (+ 4: centroid = centre of mass).
+        push(fwd(self.opp_foremost_fwd_from_own_goal));
+        push(fwd(self.opp_foremost_four_fwd_from_own_goal));
+        push(fwd(self.opp_centroid_fwd_from_own_goal));
+        push(lat(self.opp_centroid_lat));
+        push(vel(self.opp_mean_vel_fwd));
+        push(vel(self.opp_mean_vel_lat));
+        push(acc(self.opp_mean_acc_fwd));
+        push(acc(self.opp_mean_acc_lat));
+        // 3. Self.
+        push(fwd(self.line_fwd_from_own_goal));
+        push(lat(self.line_lat));
+        push(vel(self.line_vel_fwd));
+        push(vel(self.line_vel_lat));
+        push(acc(self.line_acc_fwd));
+        push(acc(self.line_acc_lat));
+        // 5. Possession.
+        push(b(self.we_control));
+        push(b(self.they_control));
+        // 6. Own GK.
+        push(fwd(self.gk_fwd_from_own_goal));
+        push(lat(self.gk_lat));
+        // 7. Offside-trap state.
+        push(b(self.offside_in_force));
+        push(b(self.trap_active_or_imminent));
+        // 8. Existing heuristic determinant (the retained base line).
+        push(fwd(self.heuristic_centre_fwd_from_own_goal));
+        // 9. Group and individual line health.
+        push((self.line_forward_spread_yards / 20.0).clamp(0.0, 2.0));
+        push((self.line_lateral_width_yards / self.field_width.max(1.0)).clamp(0.0, 2.0));
+        push((self.max_member_line_error_yards / 12.0).clamp(0.0, 2.0));
+        push(vel(self.max_member_line_closing_velocity_yps));
+        // 10. Full field kinematics.
+        for &value in self.field_kinematics.iter() {
+            push(value.clamp(-2.0, 2.0));
+        }
+        debug_assert_eq!(i, BACK_FOUR_LINE_FEATURE_DIM);
+        features
     }
+}
+
+fn empty_back_four_line_field_kinematics() -> [f64; BACK_FOUR_LINE_FIELD_KINEMATIC_DIM] {
+    [0.0; BACK_FOUR_LINE_FIELD_KINEMATIC_DIM]
+}
+
+fn push_back_four_line_field_kinematic(
+    out: &mut [f64; BACK_FOUR_LINE_FIELD_KINEMATIC_DIM],
+    cursor: &mut usize,
+    position: Vec2,
+    velocity: Vec2,
+    acceleration: Vec2,
+    own_goal_fwd: f64,
+    field_length: f64,
+    mid_x: f64,
+    half_width: f64,
+    attack: f64,
+) {
+    let fwd = |y: f64| ((y * attack - own_goal_fwd) / field_length).clamp(-0.2, 1.2);
+    let lat = |x: f64| (((x - mid_x) * attack) / half_width).clamp(-1.5, 1.5);
+    let vel = |v: f64| (v / REF_TOP_SPEED_YPS).clamp(-2.0, 2.0);
+    let acc = |a: f64| (a / REF_ACCEL_YPS2).clamp(-2.0, 2.0);
+    let values = [
+        fwd(position.y),
+        lat(position.x),
+        vel(velocity.y * attack),
+        vel(velocity.x * attack),
+        acc(acceleration.y * attack),
+        acc(acceleration.x * attack),
+    ];
+    for value in values {
+        if *cursor < out.len() {
+            out[*cursor] = finite_metric(value);
+            *cursor += 1;
+        }
+    }
+}
+
+fn back_four_line_field_kinematics(
+    snapshot: &WorldSnapshot,
+    team: Team,
+) -> [f64; BACK_FOUR_LINE_FIELD_KINEMATIC_DIM] {
+    let attack = team.attack_dir();
+    let field_length = snapshot.field_length.max(1.0);
+    let half_width = (snapshot.field_width * 0.5).max(1.0);
+    let mid_x = snapshot.field_width * 0.5;
+    let own_goal_fwd = snapshot.own_goal_y_for(team) * attack;
+    let mut out = empty_back_four_line_field_kinematics();
+    let mut cursor = 0usize;
+    let mut ordered: Vec<&PlayerSnapshot> = snapshot.players.iter().collect();
+    ordered.sort_by(|a, b| {
+        let a_team = if a.team == team { 0 } else { 1 };
+        let b_team = if b.team == team { 0 } else { 1 };
+        a_team.cmp(&b_team).then(a.id.cmp(&b.id))
+    });
+    for player in ordered.into_iter().take(BACK_FOUR_LINE_FIELD_PLAYERS) {
+        push_back_four_line_field_kinematic(
+            &mut out,
+            &mut cursor,
+            snapshot.player_snapshot_position(player),
+            player.velocity,
+            player.acceleration,
+            own_goal_fwd,
+            field_length,
+            mid_x,
+            half_width,
+            attack,
+        );
+    }
+    cursor = BACK_FOUR_LINE_FIELD_PLAYERS * BACK_FOUR_LINE_FIELD_KINEMATICS_PER_ENTITY;
+    push_back_four_line_field_kinematic(
+        &mut out,
+        &mut cursor,
+        snapshot.ball.position,
+        snapshot.ball.velocity,
+        snapshot.ball.acceleration,
+        own_goal_fwd,
+        field_length,
+        mid_x,
+        half_width,
+        attack,
+    );
+    out
 }
 
 /// Analytic, deterministic, RNG-free seed policy for the line-centre **gap
@@ -356,6 +858,46 @@ pub fn analytic_line_centre_gap_fraction(inputs: &BackFourLineInputs) -> f64 {
     } else if inputs.they_control {
         gap += 0.08;
     }
+
+    // Stay connected to the opponent's foremost attacking four. A large gap
+    // here is the classic "sine wave" failure: defenders preserve the flat line
+    // while floating too far behind the attackers. When we have it, and also in
+    // 50:50 dispossession phases, press up more; when they control, apply a
+    // milder squeeze so the line still respects the ball threat.
+    let attacker_gap =
+        (inputs.opp_foremost_four_fwd_from_own_goal - inputs.line_fwd_from_own_goal).max(0.0);
+    let (ideal_attacker_gap, press_weight) = if inputs.we_control {
+        (
+            BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_IN_POSSESSION_YARDS,
+            0.22,
+        )
+    } else if inputs.they_control {
+        (
+            BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DEFENDING_YARDS,
+            0.10,
+        )
+    } else {
+        (
+            BACK_FOUR_FOREMOST_FOUR_ATTACKER_IDEAL_GAP_DISPOSSESSION_YARDS,
+            0.22,
+        )
+    };
+    let excess_attacker_gap = ((attacker_gap - ideal_attacker_gap) / 24.0).clamp(0.0, 1.0);
+    gap -= press_weight * excess_attacker_gap;
+    let crowded_attacker_gap =
+        ((BACK_FOUR_FOREMOST_FOUR_ATTACKER_MIN_GAP_YARDS - attacker_gap) / 14.0).clamp(0.0, 1.0);
+    gap += 0.08 * crowded_attacker_gap;
+
+    // The group line decision must also know whether the four individual defenders
+    // are actually flat and recovering. A ragged line should not squeeze as boldly;
+    // a worst outlier already closing toward the line lets the group keep stepping.
+    let spread_pressure = ((inputs.line_forward_spread_yards - BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS)
+        / 8.0)
+        .clamp(0.0, 1.0);
+    let individual_error_pressure = (inputs.max_member_line_error_yards / 10.0).clamp(0.0, 1.0);
+    let closing_relief =
+        (inputs.max_member_line_closing_velocity_yps / REF_TOP_SPEED_YPS).clamp(-1.0, 1.0);
+    gap += 0.08 * spread_pressure + 0.06 * individual_error_pressure - 0.04 * closing_relief;
 
     // A live, meaningful offside trap is the squeeze tool: hold a high line.
     if inputs.trap_active_or_imminent {
@@ -499,9 +1041,9 @@ impl BackFourLineHead {
                 continue;
             }
             let target = [target.clamp(0.0, 1.0)];
-            let result = self
-                .network
-                .train_sample_clipped(&features[..], &target, learning_rate, 4.0);
+            let result =
+                self.network
+                    .train_sample_clipped(&features[..], &target, learning_rate, 4.0);
             if result.applied && result.loss.is_finite() {
                 total += result.loss;
                 applied += 1;
@@ -577,6 +1119,32 @@ impl BackFourLineHead {
         };
         self.last_loss = Some(mean);
         mean
+    }
+
+    pub fn from_snapshot(snapshot: &SoccerAuxiliaryHeadSnapshot) -> Result<Self, String> {
+        let network = build_soccer_feed_forward_network_from_snapshot(
+            &snapshot.network,
+            BACK_FOUR_LINE_FEATURE_DIM,
+            1,
+            &[],
+            "back-four line-depth head",
+        )?;
+        Ok(BackFourLineHead {
+            network,
+            training_steps: snapshot.training_steps,
+            last_loss: snapshot.average_loss,
+        })
+    }
+
+    pub(crate) fn to_snapshot(&self) -> SoccerAuxiliaryHeadSnapshot {
+        let mut network = soccer_neural_network_snapshot(&self.network);
+        network.training_steps = self.training_steps;
+        network.average_loss = self.last_loss;
+        SoccerAuxiliaryHeadSnapshot {
+            network,
+            training_steps: self.training_steps,
+            average_loss: self.last_loss,
+        }
     }
 
     pub fn training_steps(&self) -> usize {
@@ -681,6 +1249,7 @@ impl WorldSnapshot {
         let mut def_vel = Vec2::zero();
         let mut def_acc = Vec2::zero();
         let mut def_n = 0.0;
+        let mut line_members: Vec<(Vec2, Vec2)> = Vec::new();
         // 2/4. Opponent outfield centroid + foremost (deepest toward our goal).
         let mut opp_pos = Vec2::zero();
         let mut opp_vel = Vec2::zero();
@@ -689,12 +1258,15 @@ impl WorldSnapshot {
         // Foremost attacker = the one deepest into our territory = the smallest
         // forward-gap-from-our-goal in the defending frame.
         let mut opp_foremost_fwd_from_goal = f64::INFINITY;
+        let mut opp_fwd_from_goal_values = Vec::new();
         for p in &self.players {
             if p.team == team {
                 if p.role == self_role {
-                    def_pos = def_pos + p.position;
+                    let position = self.player_snapshot_position(p);
+                    def_pos = def_pos + position;
                     def_vel = def_vel + p.velocity;
                     def_acc = def_acc + p.acceleration;
+                    line_members.push((position, p.velocity));
                     def_n += 1.0;
                 }
             } else if p.role != PlayerRole::Goalkeeper {
@@ -702,12 +1274,25 @@ impl WorldSnapshot {
                 opp_vel = opp_vel + p.velocity;
                 opp_acc = opp_acc + p.acceleration;
                 opp_n += 1.0;
-                opp_foremost_fwd_from_goal = opp_foremost_fwd_from_goal.min(fwd_from_goal(p.position.y));
+                let opp_fwd_from_goal = fwd_from_goal(p.position.y);
+                opp_foremost_fwd_from_goal = opp_foremost_fwd_from_goal.min(opp_fwd_from_goal);
+                opp_fwd_from_goal_values.push(opp_fwd_from_goal);
             }
         }
         if def_n < 1.0 || opp_n < 1.0 || !opp_foremost_fwd_from_goal.is_finite() {
             return None;
         }
+        opp_fwd_from_goal_values.sort_by(|a, b| a.total_cmp(b));
+        let foremost_four_count = opp_fwd_from_goal_values.len().min(4);
+        let opp_foremost_four_fwd_from_goal = if foremost_four_count > 0 {
+            opp_fwd_from_goal_values
+                .iter()
+                .take(foremost_four_count)
+                .sum::<f64>()
+                / foremost_four_count as f64
+        } else {
+            opp_foremost_fwd_from_goal
+        };
         let gk = self
             .players
             .iter()
@@ -721,11 +1306,45 @@ impl WorldSnapshot {
         let opp_pos = opp_pos * inv_opp;
         let opp_vel = opp_vel * inv_opp;
         let opp_acc = opp_acc * inv_opp;
+        let line_fwd = fwd_from_goal(def_pos.y);
+        let mut line_min_fwd = f64::INFINITY;
+        let mut line_max_fwd = f64::NEG_INFINITY;
+        let mut line_min_lat = f64::INFINITY;
+        let mut line_max_lat = f64::NEG_INFINITY;
+        let mut max_member_line_error_yards = 0.0_f64;
+        let mut max_member_line_closing_velocity_yps = 0.0_f64;
+        for (position, velocity) in &line_members {
+            let member_fwd = fwd_from_goal(position.y);
+            let member_lat = lat(position.x);
+            line_min_fwd = line_min_fwd.min(member_fwd);
+            line_max_fwd = line_max_fwd.max(member_fwd);
+            line_min_lat = line_min_lat.min(member_lat);
+            line_max_lat = line_max_lat.max(member_lat);
+            let line_error = member_fwd - line_fwd;
+            let error_abs = line_error.abs();
+            if error_abs >= max_member_line_error_yards {
+                max_member_line_error_yards = error_abs;
+                max_member_line_closing_velocity_yps = if error_abs > 1e-9 {
+                    -line_error.signum() * velocity.y * attack
+                } else {
+                    0.0
+                };
+            }
+        }
+        let line_forward_spread_yards = if line_min_fwd.is_finite() && line_max_fwd.is_finite() {
+            (line_max_fwd - line_min_fwd).abs()
+        } else {
+            0.0
+        };
+        let line_lateral_width_yards = if line_min_lat.is_finite() && line_max_lat.is_finite() {
+            (line_max_lat - line_min_lat).abs()
+        } else {
+            0.0
+        };
 
         let controlled = self.controlled_possession_team();
-        let trap_active_or_imminent = !self.offside_currently_suspended()
-            && controlled != Some(team)
-            && {
+        let trap_active_or_imminent =
+            !self.offside_currently_suspended() && controlled != Some(team) && {
                 let ball_from_own_goal = fwd_from_goal(self.ball.position.y).max(0.0);
                 ball_from_own_goal > self.field_length / 3.0
             };
@@ -742,6 +1361,7 @@ impl WorldSnapshot {
             ball_acc_lat: self.ball.acceleration.x * attack,
 
             opp_foremost_fwd_from_own_goal: opp_foremost_fwd_from_goal,
+            opp_foremost_four_fwd_from_own_goal: opp_foremost_four_fwd_from_goal,
             opp_centroid_fwd_from_own_goal: fwd_from_goal(opp_pos.y),
             opp_centroid_lat: lat(opp_pos.x),
             opp_mean_vel_fwd: opp_vel.y * attack,
@@ -749,12 +1369,16 @@ impl WorldSnapshot {
             opp_mean_acc_fwd: opp_acc.y * attack,
             opp_mean_acc_lat: opp_acc.x * attack,
 
-            line_fwd_from_own_goal: fwd_from_goal(def_pos.y),
+            line_fwd_from_own_goal: line_fwd,
             line_lat: lat(def_pos.x),
             line_vel_fwd: def_vel.y * attack,
             line_vel_lat: def_vel.x * attack,
             line_acc_fwd: def_acc.y * attack,
             line_acc_lat: def_acc.x * attack,
+            line_forward_spread_yards,
+            line_lateral_width_yards,
+            max_member_line_error_yards,
+            max_member_line_closing_velocity_yps,
 
             we_control: controlled == Some(team),
             they_control: controlled == Some(team.other()),
@@ -768,7 +1392,8 @@ impl WorldSnapshot {
             // Default the retained-heuristic determinant to the line's current
             // centroid; the live chokepoint overrides it with the precise band
             // centre it has in hand (see `back_four_line_model_centre_fwd`).
-            heuristic_centre_fwd_from_own_goal: fwd_from_goal(def_pos.y),
+            heuristic_centre_fwd_from_own_goal: line_fwd,
+            field_kinematics: back_four_line_field_kinematics(self, team),
         })
     }
 
@@ -828,7 +1453,10 @@ impl WorldSnapshot {
     /// fraction comes from [`analytic_midfield_gap_fraction`] today; swap to a
     /// trained [`BackFourLineHead`] once promoted. The caller maps the fraction to
     /// yards and forms the actual flat line over the 5s consistency window.
-    pub(crate) fn midfield_line_model_ideal_gap_fraction(&self, me: &PlayerSnapshot) -> Option<f64> {
+    pub(crate) fn midfield_line_model_ideal_gap_fraction(
+        &self,
+        me: &PlayerSnapshot,
+    ) -> Option<f64> {
         if !midfield_line_model_enabled() {
             return None;
         }
@@ -839,6 +1467,53 @@ impl WorldSnapshot {
 }
 
 impl SoccerMatch {
+    /// Maintain the per-team **sticky back-four line-centre latch** on the sim-tick loop (never
+    /// wall-clock): hold the line centre for ~[`BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS`], re-picking
+    /// when that window of ticks elapses, possession flips, or the fresh ideal line drops materially
+    /// deeper (a growing threat — [`back_four_line_sticky_should_repick`]). Holding the centre steady
+    /// is what removes the "sine-wave": defenders already on the latched line hold (conserve energy)
+    /// and only off-line defenders adapt. Called once per tick off the tick-start `snapshot`. Clears
+    /// the latch (⇒ fresh per-tick recompute, byte-identical) when the sticky anchor or the v2 line
+    /// is gated off, so an unconfigured / test process is unaffected.
+    pub(crate) fn update_back_four_line_latch(&mut self, snapshot: &WorldSnapshot) {
+        if !back_four_line_sticky_anchor_enabled() || !back_four_line_depth_v2_enabled() {
+            self.back_four_line_latch = [None, None];
+            return;
+        }
+        // Convert the hold window from sim seconds to ticks via the sim dt (framerate-independent).
+        let latch_ticks = (BACK_FOUR_LINE_STICKY_ANCHOR_SECONDS / self.config.dt_seconds.max(1e-6))
+            .round()
+            .max(1.0) as u64;
+        let controlled = snapshot.controlled_possession_team();
+        let tick = self.tick;
+        for team in [Team::Home, Team::Away] {
+            let idx = team_index(team);
+            let attack = team.attack_dir();
+            let own_goal_fwd = snapshot.own_goal_y_for(team) * attack;
+            let fresh_depth = snapshot.back_four_line_v2_centre_fwd_fresh(team) - own_goal_fwd;
+            if !fresh_depth.is_finite() {
+                continue;
+            }
+            let repick = match self.back_four_line_latch[idx] {
+                None => true,
+                Some(latch) => back_four_line_sticky_should_repick(
+                    latch.centre_depth,
+                    fresh_depth,
+                    tick.saturating_sub(latch.set_tick),
+                    latch_ticks,
+                    controlled != latch.possession_at_set,
+                ),
+            };
+            if repick {
+                self.back_four_line_latch[idx] = Some(BackFourLineLatch {
+                    centre_depth: fresh_depth,
+                    set_tick: tick,
+                    possession_at_set: controlled,
+                });
+            }
+        }
+    }
+
     /// Gated per-tick RL sample collection for the line-depth heads (Gap 5), driven
     /// off the already-built per-tick learning `snapshot`. A **no-op** (zero cost,
     /// byte-identical) unless a line-depth model is enabled, so the default learner
@@ -859,10 +1534,34 @@ impl SoccerMatch {
                 let decision = self.pending_line_depth.swap_remove(i);
                 let now_territorial = territorial_advantage(snapshot, decision.team);
                 if now_territorial.is_finite() && decision.decision_territorial.is_finite() {
+                    // MARL/MAPPO attacker-compactness shaping: dock the reward by how far the back
+                    // four sits behind the optimal gap to the opponent's foremost attackers over the
+                    // window, so the learned head prefers depths that keep the four compact with the
+                    // attackers (fills the space) rather than leaving a hole. Gated with the press.
+                    let mut reward = now_territorial - decision.decision_territorial;
+                    if back_four_press_to_attackers_enabled() {
+                        if let Some(excess) =
+                            snapshot.back_four_attacker_gap_excess_yards(decision.team)
+                        {
+                            reward -= BACK_FOUR_ATTACKER_COMPACTNESS_REWARD_PER_YARD * excess;
+                        }
+                    }
+                    if let Some(current_inputs) =
+                        snapshot.build_line_depth_inputs(decision.team, PlayerRole::Defender)
+                    {
+                        let spread_pressure = ((current_inputs.line_forward_spread_yards
+                            - BACK_FOUR_OFFSIDE_LEVEL_BAND_YARDS)
+                            / 8.0)
+                            .clamp(0.0, 1.0);
+                        let individual_pressure =
+                            (current_inputs.max_member_line_error_yards / 10.0).clamp(0.0, 1.0);
+                        reward -= BACK_FOUR_LINE_RAGGED_REWARD_PENALTY_POINTS
+                            * (spread_pressure + individual_pressure);
+                    }
                     self.line_depth_samples.push(LineDepthSample {
                         inputs: decision.inputs,
                         action_gap_fraction: decision.action_gap_fraction,
-                        reward: now_territorial - decision.decision_territorial,
+                        reward,
                     });
                     if self.line_depth_samples.len() > LINE_DEPTH_SAMPLE_CAP {
                         let overflow = self.line_depth_samples.len() - LINE_DEPTH_SAMPLE_CAP;
@@ -930,6 +1629,7 @@ mod back_four_line_tests {
             ball_acc_fwd: 0.0,
             ball_acc_lat: 0.0,
             opp_foremost_fwd_from_own_goal: 40.0,
+            opp_foremost_four_fwd_from_own_goal: 48.0,
             opp_centroid_fwd_from_own_goal: 55.0,
             opp_centroid_lat: 0.0,
             opp_mean_vel_fwd: 0.0,
@@ -942,6 +1642,10 @@ mod back_four_line_tests {
             line_vel_lat: 0.0,
             line_acc_fwd: 0.0,
             line_acc_lat: 0.0,
+            line_forward_spread_yards: 0.5,
+            line_lateral_width_yards: 38.0,
+            max_member_line_error_yards: 0.25,
+            max_member_line_closing_velocity_yps: 0.0,
             we_control: false,
             they_control: true,
             gk_fwd_from_own_goal: 6.0,
@@ -949,6 +1653,7 @@ mod back_four_line_tests {
             offside_in_force: false,
             trap_active_or_imminent: true,
             heuristic_centre_fwd_from_own_goal: 35.0,
+            field_kinematics: empty_back_four_line_field_kinematics(),
         }
     }
 
@@ -969,14 +1674,89 @@ mod back_four_line_tests {
     }
 
     #[test]
+    fn feature_tail_carries_full_field_kinematics() {
+        let mut inputs = baseline_inputs();
+        inputs.field_kinematics[0] = 0.25;
+        inputs.field_kinematics[BACK_FOUR_LINE_FIELD_KINEMATIC_DIM - 1] = -0.5;
+        let features = inputs.to_features();
+        let tail_start = BACK_FOUR_LINE_BASE_FEATURE_DIM + BACK_FOUR_LINE_SHAPE_FEATURE_DIM;
+        assert_eq!(features.len(), BACK_FOUR_LINE_FEATURE_DIM);
+        assert_eq!(
+            &features[tail_start..],
+            inputs.field_kinematics.as_slice(),
+            "full 22-player-plus-ball kinematic vector must be appended intact"
+        );
+    }
+
+    #[test]
+    fn line_inputs_build_22_players_plus_ball_vector() {
+        let sim = SoccerMatch::default_11v11(MatchConfig::default());
+        let snapshot = WorldSnapshot::from_match(&sim);
+        let inputs = snapshot
+            .build_back_four_line_inputs(Team::Home)
+            .expect("default 11v11 should expose a back-four line input");
+        assert_eq!(
+            inputs.field_kinematics.len(),
+            BACK_FOUR_LINE_FIELD_KINEMATIC_DIM
+        );
+        let ball_offset = BACK_FOUR_LINE_FIELD_PLAYERS * BACK_FOUR_LINE_FIELD_KINEMATICS_PER_ENTITY;
+        assert!(
+            inputs.field_kinematics[ball_offset] > 0.45
+                && inputs.field_kinematics[ball_offset] < 0.55,
+            "ball slot should carry normalized midfield depth: {:?}",
+            &inputs.field_kinematics
+                [ball_offset..ball_offset + BACK_FOUR_LINE_FIELD_KINEMATICS_PER_ENTITY]
+        );
+        assert!(
+            inputs
+                .field_kinematics
+                .iter()
+                .all(|value| value.is_finite() && value.abs() <= 2.0),
+            "field vector must be finite and normalized"
+        );
+    }
+
+    #[test]
+    fn ragged_individual_line_drops_group_decision() {
+        let flat = baseline_inputs();
+        let mut ragged = flat.clone();
+        ragged.line_forward_spread_yards = 11.0;
+        ragged.max_member_line_error_yards = 7.0;
+        ragged.max_member_line_closing_velocity_yps = -3.0;
+        assert!(
+            analytic_line_centre_gap_fraction(&ragged) > analytic_line_centre_gap_fraction(&flat),
+            "a ragged back four should choose a deeper group line until individuals recover"
+        );
+    }
+
+    #[test]
+    fn adaptive_width_covers_attack_span_within_floor_and_cap() {
+        let fw = 80.0;
+        // A central, bunched attack still gets the floor width — never the old narrow block.
+        let bunched = back_four_adaptive_width_yards(8.0, fw);
+        assert_eq!(bunched, BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS);
+        // A moderately spread attack is covered: span + two shoulders.
+        let mid = back_four_adaptive_width_yards(30.0, fw);
+        assert!((mid - (30.0 + 2.0 * BACK_FOUR_ADAPTIVE_WIDTH_SHOULDER_MARGIN_YARDS)).abs() < 1e-9);
+        // ...and materially wider than the legacy fixed 22yd block.
+        assert!(mid > 22.0);
+        // A touchline-to-touchline attack is capped below full pitch width (keep central compactness).
+        let wide = back_four_adaptive_width_yards(78.0, fw);
+        assert!(wide <= fw * BACK_FOUR_ADAPTIVE_WIDTH_MAX_FIELD_FRACTION + 1e-9);
+        assert!(wide < fw);
+        // Non-finite inputs fall back safely to an in-band width.
+        let degenerate = back_four_adaptive_width_yards(f64::NAN, f64::NAN);
+        assert!(degenerate.is_finite() && degenerate >= BACK_FOUR_ADAPTIVE_WIDTH_MIN_YARDS);
+    }
+
+    #[test]
     fn deep_ball_pushes_line_deeper_than_high_ball() {
         let mut deep = baseline_inputs();
         deep.ball_fwd_from_own_goal = 15.0; // ball near our own goal
         let mut high = baseline_inputs();
         high.ball_fwd_from_own_goal = 105.0; // ball near their goal
         assert!(
-            analytic_line_centre_gap_fraction(&deep)
-                > analytic_line_centre_gap_fraction(&high),
+            analytic_line_centre_gap_fraction(&deep) > analytic_line_centre_gap_fraction(&high),
             "a deeper ball should yield a deeper (larger-gap) line"
         );
     }
@@ -990,8 +1770,7 @@ mod back_four_line_tests {
         theirs.we_control = false;
         theirs.they_control = true;
         assert!(
-            analytic_line_centre_gap_fraction(&ours)
-                < analytic_line_centre_gap_fraction(&theirs),
+            analytic_line_centre_gap_fraction(&ours) < analytic_line_centre_gap_fraction(&theirs),
             "controlling the ball should hold a higher (smaller-gap) line"
         );
     }
@@ -1017,6 +1796,31 @@ mod back_four_line_tests {
     }
 
     #[test]
+    fn line_depth_head_snapshot_round_trips_prediction_and_progress() {
+        let inputs = baseline_inputs();
+        let mut head = BackFourLineHead::new(13);
+        let samples: Vec<(BackFourLineInputs, f64)> =
+            std::iter::repeat_with(|| (inputs.clone(), 0.7))
+                .take(8)
+                .collect();
+        head.train(&samples, 0.02);
+        let before = head.predict(&inputs).expect("finite prediction");
+        let snapshot = head.to_snapshot();
+
+        let restored = BackFourLineHead::from_snapshot(&snapshot).expect("restores line head");
+        let after = restored
+            .predict(&inputs)
+            .expect("finite restored prediction");
+
+        assert_eq!(restored.training_steps(), head.training_steps());
+        assert_eq!(restored.last_loss(), head.last_loss());
+        assert!(
+            (before - after).abs() < 1e-12,
+            "restored line head changed prediction: {before} -> {after}"
+        );
+    }
+
+    #[test]
     fn head_trains_toward_a_target() {
         let mut head = BackFourLineHead::new(11);
         let samples: Vec<(BackFourLineInputs, f64)> =
@@ -1034,7 +1838,10 @@ mod back_four_line_tests {
     #[test]
     fn midfield_fraction_is_a_valid_gap() {
         let f = analytic_midfield_gap_fraction(&baseline_inputs());
-        assert!((0.0..=1.0).contains(&f), "midfield fraction {f} out of [0,1]");
+        assert!(
+            (0.0..=1.0).contains(&f),
+            "midfield fraction {f} out of [0,1]"
+        );
     }
 
     #[test]
@@ -1135,7 +1942,10 @@ mod back_four_line_tests {
         assert!((d(6.0) - 6.0).abs() < 1e-9, "ball 6 -> {}", d(6.0));
         // Inside the 6 the centre sticks at 6 ⇒ a signed (negative) gap behind ball.
         assert!((d(4.0) - 6.0).abs() < 1e-9, "ball 4 -> {}", d(4.0));
-        assert!(4.0 - d(4.0) < 0.0, "ball 4 should give a negative signed gap");
+        assert!(
+            4.0 - d(4.0) < 0.0,
+            "ball 4 should give a negative signed gap"
+        );
     }
 
     #[test]
@@ -1155,10 +1965,139 @@ mod back_four_line_tests {
         let mut ball = 0.0;
         while ball <= 120.0 {
             let cur = d(ball);
-            assert!(cur + 1e-9 >= prev, "non-monotonic at ball={ball}: {prev} -> {cur}");
+            assert!(
+                cur + 1e-9 >= prev,
+                "non-monotonic at ball={ball}: {prev} -> {cur}"
+            );
             prev = cur;
             ball += 0.5;
         }
+    }
+
+    #[test]
+    fn desired_gap_floor_is_possession_aware() {
+        // In possession the line may step right up to 5yd; out of possession (incl. a loose ball)
+        // it holds the deeper 20yd floor. Band top is always 40 either way.
+        assert!(
+            (back_four_desired_gap_min_yards(true)
+                - BACK_FOUR_LINE_DESIRED_GAP_IN_POSSESSION_MIN_YARDS)
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (back_four_desired_gap_min_yards(false) - BACK_FOUR_LINE_DESIRED_GAP_MIN_YARDS).abs()
+                < 1e-9
+        );
+        assert!(back_four_desired_gap_min_yards(true) < back_four_desired_gap_min_yards(false));
+    }
+
+    #[test]
+    fn attacker_press_raises_a_deep_centre_but_never_steps_ahead() {
+        // anchor/six 6, cap 65, optimal gap 12. Attackers' foremost line at depth 40.
+        let pressed = |centre: f64| back_four_attacker_pressed_depth(centre, 40.0, 12.0, 6.0, 65.0);
+        // A too-deep centre (15) is raised toward the attackers: 40 - 12 = 28.
+        assert!(
+            (pressed(15.0) - 28.0).abs() < 1e-9,
+            "deep centre -> {}",
+            pressed(15.0)
+        );
+        // A centre already higher than the press floor is left alone (push up only).
+        assert!(
+            (pressed(35.0) - 35.0).abs() < 1e-9,
+            "high centre -> {}",
+            pressed(35.0)
+        );
+        // Never sits AHEAD of the attacker line even with a tiny optimal gap.
+        let ahead = back_four_attacker_pressed_depth(10.0, 40.0, 0.0, 6.0, 65.0);
+        assert!(
+            ahead <= 40.0 + 1e-9,
+            "must not step ahead of attackers: {ahead}"
+        );
+    }
+
+    #[test]
+    fn attacker_press_is_monotonic_and_respects_six_and_cap() {
+        let pressed = |att: f64| back_four_attacker_pressed_depth(0.0, att, 12.0, 6.0, 65.0);
+        // A higher attacker line ⇒ a higher (or equal) pressed centre.
+        assert!(pressed(50.0) >= pressed(30.0));
+        // Never below the keeper's six even when attackers are very deep / centre is 0.
+        assert!(
+            pressed(10.0) >= 6.0 - 1e-9,
+            "floored at six: {}",
+            pressed(10.0)
+        );
+        // Never past the high-line cap.
+        assert!(pressed(200.0) <= 65.0 + 1e-9, "capped: {}", pressed(200.0));
+    }
+
+    #[test]
+    fn hold_deadband_holds_within_band_and_corrects_outside_or_ahead_of_cap() {
+        let db = BACK_FOUR_LINE_HOLD_DEADBAND_YARDS;
+        // Within the deadband, no cap ⇒ HOLD current position (ignore the jittering target).
+        assert!(
+            (back_four_line_hold_target_fwd(30.0, 30.0 + db * 0.5, None, db) - 30.0).abs() < 1e-9
+        );
+        // Outside the deadband ⇒ move to the target.
+        let far = 30.0 + db * 2.0;
+        assert!((back_four_line_hold_target_fwd(30.0, far, None, db) - far).abs() < 1e-9);
+        // Illegally AHEAD of the cap ⇒ always corrected to the target, deadband notwithstanding.
+        let cap = 29.0;
+        let target = 28.5;
+        assert!(
+            (back_four_line_hold_target_fwd(30.0, target, Some(cap), db) - target).abs() < 1e-9,
+            "ahead of cap must be corrected"
+        );
+        // Behind the cap and within the band ⇒ HOLD.
+        assert!(
+            (back_four_line_hold_target_fwd(27.0, 27.0 + db * 0.5, Some(40.0), db) - 27.0).abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn sticky_anchor_holds_then_repicks_on_window_flip_or_deep_drop() {
+        let latch_ticks = 45; // ~3s at 15tps
+                              // Held steady: small fluctuation, same possession, window not elapsed ⇒ HOLD.
+        assert!(!back_four_line_sticky_should_repick(
+            20.0,
+            21.5,
+            10,
+            latch_ticks,
+            false
+        ));
+        // The ideal line stepping UP (larger depth-from-goal) is held, never re-picked early —
+        // this is the asymmetry that kills the sine-wave's up-and-back ratchet.
+        assert!(!back_four_line_sticky_should_repick(
+            20.0,
+            20.0 + BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS + 5.0,
+            10,
+            latch_ticks,
+            false
+        ));
+        // Window elapsed ⇒ re-pick.
+        assert!(back_four_line_sticky_should_repick(
+            20.0,
+            20.0,
+            latch_ticks,
+            latch_ticks,
+            false
+        ));
+        // Possession flipped ⇒ re-pick immediately.
+        assert!(back_four_line_sticky_should_repick(
+            20.0,
+            20.0,
+            1,
+            latch_ticks,
+            true
+        ));
+        // Fresh line dropped materially DEEPER (smaller depth) ⇒ re-pick promptly for safety.
+        assert!(back_four_line_sticky_should_repick(
+            20.0,
+            20.0 - BACK_FOUR_LINE_STICKY_REANCHOR_DROP_YARDS - 0.5,
+            1,
+            latch_ticks,
+            false
+        ));
     }
 
     #[test]
