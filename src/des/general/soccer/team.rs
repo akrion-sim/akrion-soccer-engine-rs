@@ -652,6 +652,94 @@ mod team_strategy_mode_tests {
             sim.players[p].dizziness
         );
     }
+
+    #[test]
+    fn bounded_team_mode_model_is_total_and_mirror_symmetric() {
+        const TEAMS: [Team; 2] = [Team::Home, Team::Away];
+        const PHASES: [TacticalPhase; 6] = [
+            TacticalPhase::Kickoff,
+            TacticalPhase::HomeBuildUp,
+            TacticalPhase::AwayBuildUp,
+            TacticalPhase::HomeAttack,
+            TacticalPhase::AwayAttack,
+            TacticalPhase::Transition,
+        ];
+        const POSSESSIONS: [Option<Team>; 3] = [None, Some(Team::Home), Some(Team::Away)];
+
+        fn mirror_phase(phase: TacticalPhase) -> TacticalPhase {
+            match phase {
+                TacticalPhase::Kickoff => TacticalPhase::Kickoff,
+                TacticalPhase::HomeBuildUp => TacticalPhase::AwayBuildUp,
+                TacticalPhase::AwayBuildUp => TacticalPhase::HomeBuildUp,
+                TacticalPhase::HomeAttack => TacticalPhase::AwayAttack,
+                TacticalPhase::AwayAttack => TacticalPhase::HomeAttack,
+                TacticalPhase::Transition => TacticalPhase::Transition,
+            }
+        }
+
+        fn mirror_possession(possession: Option<Team>) -> Option<Team> {
+            match possession {
+                None => None,
+                Some(Team::Home) => Some(Team::Away),
+                Some(Team::Away) => Some(Team::Home),
+            }
+        }
+
+        let mut checked = 0_usize;
+        for team in TEAMS {
+            for phase in PHASES {
+                for possession in POSSESSIONS {
+                    let mode = team_brain_mode_for(team, phase, possession);
+                    let mirrored = team_brain_mode_for(
+                        team.other(),
+                        mirror_phase(phase),
+                        mirror_possession(possession),
+                    );
+                    assert_eq!(
+                        mode, mirrored,
+                        "mirror mismatch for {team:?}/{phase:?}/{possession:?}"
+                    );
+
+                    match (phase, possession) {
+                        (TacticalPhase::Kickoff, None)
+                        | (TacticalPhase::Kickoff, Some(Team::Home))
+                        | (TacticalPhase::Kickoff, Some(Team::Away)) => {
+                            assert_eq!(mode, TeamBrainMode::Kickoff)
+                        }
+                        (
+                            TacticalPhase::HomeBuildUp
+                            | TacticalPhase::AwayBuildUp
+                            | TacticalPhase::HomeAttack
+                            | TacticalPhase::AwayAttack
+                            | TacticalPhase::Transition,
+                            None,
+                        ) => assert_eq!(mode, TeamBrainMode::Transition),
+                        (
+                            TacticalPhase::HomeBuildUp
+                            | TacticalPhase::AwayBuildUp
+                            | TacticalPhase::HomeAttack
+                            | TacticalPhase::AwayAttack
+                            | TacticalPhase::Transition,
+                            Some(owner),
+                        ) if owner != team => assert_eq!(mode, TeamBrainMode::Defend),
+                        (
+                            TacticalPhase::HomeBuildUp
+                            | TacticalPhase::AwayBuildUp
+                            | TacticalPhase::HomeAttack
+                            | TacticalPhase::AwayAttack
+                            | TacticalPhase::Transition,
+                            Some(_),
+                        ) => assert!(matches!(
+                            mode,
+                            TeamBrainMode::Attack | TeamBrainMode::BuildUp
+                        )),
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, TEAMS.len() * PHASES.len() * POSSESSIONS.len());
+    }
 }
 
 fn default_tactical_learning_preference_weight() -> f64 {
@@ -5912,18 +6000,39 @@ pub(crate) fn team_brain_mode_for(
     phase: TacticalPhase,
     possession_team: Option<Team>,
 ) -> TeamBrainMode {
-    if phase == TacticalPhase::Kickoff {
-        return TeamBrainMode::Kickoff;
-    }
-    match possession_team {
-        Some(possession) if possession == team => match (team, phase) {
-            (Team::Home, TacticalPhase::HomeAttack) | (Team::Away, TacticalPhase::AwayAttack) => {
-                TeamBrainMode::Attack
+    let owns_ball_in_attacking_phase = match (team, phase) {
+        (Team::Home, TacticalPhase::HomeAttack) | (Team::Away, TacticalPhase::AwayAttack) => true,
+        (Team::Home, TacticalPhase::Kickoff)
+        | (Team::Home, TacticalPhase::HomeBuildUp)
+        | (Team::Home, TacticalPhase::AwayBuildUp)
+        | (Team::Home, TacticalPhase::AwayAttack)
+        | (Team::Home, TacticalPhase::Transition)
+        | (Team::Away, TacticalPhase::Kickoff)
+        | (Team::Away, TacticalPhase::HomeBuildUp)
+        | (Team::Away, TacticalPhase::AwayBuildUp)
+        | (Team::Away, TacticalPhase::HomeAttack)
+        | (Team::Away, TacticalPhase::Transition) => false,
+    };
+
+    match phase {
+        TacticalPhase::Kickoff => TeamBrainMode::Kickoff,
+        TacticalPhase::HomeBuildUp
+        | TacticalPhase::AwayBuildUp
+        | TacticalPhase::HomeAttack
+        | TacticalPhase::AwayAttack
+        | TacticalPhase::Transition => match (team, possession_team) {
+            (Team::Home, Some(Team::Home)) | (Team::Away, Some(Team::Away)) => {
+                if owns_ball_in_attacking_phase {
+                    TeamBrainMode::Attack
+                } else {
+                    TeamBrainMode::BuildUp
+                }
             }
-            _ => TeamBrainMode::BuildUp,
+            (Team::Home, Some(Team::Away)) | (Team::Away, Some(Team::Home)) => {
+                TeamBrainMode::Defend
+            }
+            (Team::Home, None) | (Team::Away, None) => TeamBrainMode::Transition,
         },
-        Some(_) => TeamBrainMode::Defend,
-        None => TeamBrainMode::Transition,
     }
 }
 
