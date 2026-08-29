@@ -21,6 +21,7 @@
 pub use des_engine;
 
 pub mod des;
+pub mod tactical_transition;
 
 // Ergonomic top-level re-exports so consumers (the axum servers, a desktop game)
 // can reach the engine without the mirrored `des::general::…` path, e.g.

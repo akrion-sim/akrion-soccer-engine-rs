@@ -13,12 +13,12 @@ permissions:
 #   des_engine -> ../discrete-event-system.rs (public: ORESoftware/discrete-event-system.rs)
 # so it must sit alongside this repo for cargo to resolve it.
 #
-# NOTE on tests: the full `cargo test` suite is intentionally NOT a CI gate.
-# This is a research repo where main carries ~164 known-red behavioral tests
-# (assertions pinned to old reward values + parallel-flaky controller/realtime
-# tests). Changes are judged locally by diffing the failing SET against the
-# baseline, not by counts — see AGENTS.md. CI gates on what is reliable:
-# everything compiles, and the hermetic standalone-5v5 suite stays green.
+# NOTE on tests: CI executes the full `cargo test --lib` suite in the
+# `main-crate-known-red` job below, preserving its real failing result and logs.
+# The job is explicitly an allowed failure because main carries ~164 known-red
+# behavioral and parallel-sensitive tests whose membership is not stable enough
+# for a count or name allowlist. The reliable compile/lifecycle/fmt/Clippy and
+# hermetic standalone-5v5 jobs remain blocking while DEN-1229 tracks the debt.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -73,8 +73,12 @@ jobs:
           repository: ORESoftware/discrete-event-system.rs
           path: discrete-event-system.rs
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # action pinned
         with:
+          # The Clippy ratchet baseline is diagnostic-version-specific. Pin the
+          # compiler that produced it so a moving `stable` cannot reclassify
+          # unchanged source as new debt.
+          toolchain: 1.95.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
@@ -114,6 +118,40 @@ jobs:
         working-directory: akrion-soccer-engine.rs
         run: python3 scripts/clippy_ratchet.py
 
+  # DEN-1229: execute the complete main-crate library suite on every CI run.
+  # Keep the actual `cargo test` exit status: a failing suite produces a failing
+  # job rather than a green wrapper step. Job-level `continue-on-error` makes
+  # that known-red result non-blocking without hiding it. Do not replace this
+  # with a count or test-name allowlist; repeated runs have shown the failure
+  # membership is parallel/timing-sensitive even at the same commit.
+  main-crate-known-red:
+    name: main crate cargo test --lib (known-red, allowed failure)
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.ref != 'agent/publish-oresoftware-mcp-rust-libs-20260731'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: akrion-soccer-engine.rs
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ORESoftware/discrete-event-system.rs
+          path: discrete-event-system.rs
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # action pinned
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: akrion-soccer-engine.rs
+      - name: Execute full main-crate library suite (known-red)
+        working-directory: akrion-soccer-engine.rs
+        run: cargo test --lib
+
   # The standalone 5v5 demo is hermetic (zero deps, own [workspace] table), so
   # its suite is fast and reliably green — a real blocking gate.
   standalone-5v5:
@@ -126,7 +164,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # action pinned
+        with:
+          toolchain: 1.95.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           workspaces: standalone-5v5
