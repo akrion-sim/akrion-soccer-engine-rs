@@ -579,6 +579,19 @@ pub enum RestartLabel {
 }
 
 impl RestartLabel {
+    /// Complete finite restart vocabulary. Formal round-trip checks enumerate this set,
+    /// so every stable wire label is checked for injectivity and parser refinement.
+    pub const ALL: [Self; 8] = [
+        Self::Kickoff,
+        Self::ThrowIn,
+        Self::GoalKick,
+        Self::CornerKick,
+        Self::FreeKick,
+        Self::DirectFreeKick,
+        Self::IndirectFreeKick,
+        Self::Offside,
+    ];
+
     /// The canonical wire string for this restart label.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -614,10 +627,16 @@ impl RestartLabel {
 
     /// Whether this is any of the free-kick variants (direct/indirect/plain).
     pub fn is_free_kick_family(&self) -> bool {
-        matches!(
-            self,
-            RestartLabel::FreeKick | RestartLabel::DirectFreeKick | RestartLabel::IndirectFreeKick
-        )
+        match self {
+            RestartLabel::FreeKick
+            | RestartLabel::DirectFreeKick
+            | RestartLabel::IndirectFreeKick => true,
+            RestartLabel::Kickoff
+            | RestartLabel::ThrowIn
+            | RestartLabel::GoalKick
+            | RestartLabel::CornerKick
+            | RestartLabel::Offside => false,
+        }
     }
 }
 
@@ -630,6 +649,7 @@ impl fmt::Display for RestartLabel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn canonical_round_trips_through_enum() {
@@ -691,5 +711,36 @@ mod tests {
         assert_eq!(SoccerActionLabel::canonical_str("brand-new"), None);
         // Bare canonical that had no explicit alias arm also passes through.
         assert_eq!(SoccerActionLabel::canonical_str("hold"), None);
+    }
+
+    #[test]
+    fn finite_restart_vocabulary_is_a_bijection() {
+        let mut canonical_labels = HashSet::new();
+        let mut free_kicks = HashSet::new();
+
+        for restart in RestartLabel::ALL {
+            let canonical = restart.as_str();
+            assert!(
+                canonical_labels.insert(canonical),
+                "duplicate canonical restart label: {canonical}"
+            );
+            assert_eq!(RestartLabel::from_canonical(canonical), Some(restart));
+            assert_eq!(restart.to_string(), canonical);
+            if restart.is_free_kick_family() {
+                free_kicks.insert(restart);
+            }
+        }
+
+        assert_eq!(canonical_labels.len(), RestartLabel::ALL.len());
+        assert_eq!(
+            free_kicks,
+            HashSet::from([
+                RestartLabel::FreeKick,
+                RestartLabel::DirectFreeKick,
+                RestartLabel::IndirectFreeKick,
+            ])
+        );
+        assert_eq!(RestartLabel::from_canonical("free_kick"), None);
+        assert_eq!(RestartLabel::from_canonical(""), None);
     }
 }
