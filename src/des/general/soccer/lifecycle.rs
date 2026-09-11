@@ -59,6 +59,21 @@ pub enum MatchAction {
     Finish,
 }
 
+impl MatchAction {
+    /// Complete finite action alphabet used by the bounded production model check.
+    pub const ALL: [Self; 9] = [
+        Self::Start,
+        Self::Tick,
+        Self::HomePossession,
+        Self::AwayPossession,
+        Self::LooseBall,
+        Self::HomeGoal,
+        Self::AwayGoal,
+        Self::Restart,
+        Self::Finish,
+    ];
+}
+
 /// Stable projection shared with the JSON-lines/ITF formal adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MatchProjection {
@@ -112,63 +127,79 @@ impl SoccerMatch {
     }
 
     pub fn apply(&mut self, action: MatchAction) -> MatchProjection {
-        if self.state.phase == MatchPhase::Finished {
-            return self.state;
-        }
-
+        let before = self.state;
         match action {
-            MatchAction::Finish => {
-                self.state.phase = MatchPhase::Finished;
-                self.state.possession = Possession::None;
-                return self.state;
-            }
-            MatchAction::Start if self.state.phase == MatchPhase::PreKickoff => {
-                self.state.phase = MatchPhase::InPlay;
-                self.state.possession = self.state.restart_side.into();
-                return self.state;
-            }
-            MatchAction::Restart if self.state.phase == MatchPhase::Stoppage => {
-                self.state.phase = MatchPhase::InPlay;
-                self.state.possession = self.state.restart_side.into();
-                return self.state;
-            }
-            _ => {}
-        }
-
-        if self.state.phase != MatchPhase::InPlay {
-            return self.state;
-        }
-
-        match action {
-            MatchAction::Tick => {
-                self.state.tick = self.state.tick.saturating_add(1).min(self.max_ticks);
-                if self.state.tick >= self.max_ticks {
+            MatchAction::Start => match self.state.phase {
+                MatchPhase::PreKickoff => {
+                    self.state.phase = MatchPhase::InPlay;
+                    self.state.possession = self.state.restart_side.into();
+                }
+                MatchPhase::InPlay | MatchPhase::Stoppage | MatchPhase::Finished => {}
+            },
+            MatchAction::Restart => match self.state.phase {
+                MatchPhase::Stoppage => {
+                    self.state.phase = MatchPhase::InPlay;
+                    self.state.possession = self.state.restart_side.into();
+                }
+                MatchPhase::PreKickoff | MatchPhase::InPlay | MatchPhase::Finished => {}
+            },
+            MatchAction::Finish => match self.state.phase {
+                MatchPhase::PreKickoff | MatchPhase::InPlay | MatchPhase::Stoppage => {
                     self.state.phase = MatchPhase::Finished;
                     self.state.possession = Possession::None;
                 }
-            }
-            MatchAction::HomePossession => self.state.possession = Possession::Home,
-            MatchAction::AwayPossession => self.state.possession = Possession::Away,
-            MatchAction::LooseBall => self.state.possession = Possession::None,
-            MatchAction::HomeGoal if self.state.home_score < self.score_cap => {
-                self.state.home_score += 1;
-                self.state.phase = MatchPhase::Stoppage;
-                self.state.possession = Possession::None;
-                self.state.restart_side = Side::Away;
-            }
-            MatchAction::AwayGoal if self.state.away_score < self.score_cap => {
-                self.state.away_score += 1;
-                self.state.phase = MatchPhase::Stoppage;
-                self.state.possession = Possession::None;
-                self.state.restart_side = Side::Home;
-            }
-            MatchAction::Start
-            | MatchAction::Restart
-            | MatchAction::Finish
-            | MatchAction::HomeGoal
-            | MatchAction::AwayGoal => {}
+                MatchPhase::Finished => {}
+            },
+            MatchAction::Tick => match self.state.phase {
+                MatchPhase::InPlay => {
+                    self.state.tick = self.state.tick.saturating_add(1).min(self.max_ticks);
+                    if self.state.tick >= self.max_ticks {
+                        self.state.phase = MatchPhase::Finished;
+                        self.state.possession = Possession::None;
+                    }
+                }
+                MatchPhase::PreKickoff | MatchPhase::Stoppage | MatchPhase::Finished => {}
+            },
+            MatchAction::HomePossession => match self.state.phase {
+                MatchPhase::InPlay => self.state.possession = Possession::Home,
+                MatchPhase::PreKickoff | MatchPhase::Stoppage | MatchPhase::Finished => {}
+            },
+            MatchAction::AwayPossession => match self.state.phase {
+                MatchPhase::InPlay => self.state.possession = Possession::Away,
+                MatchPhase::PreKickoff | MatchPhase::Stoppage | MatchPhase::Finished => {}
+            },
+            MatchAction::LooseBall => match self.state.phase {
+                MatchPhase::InPlay => self.state.possession = Possession::None,
+                MatchPhase::PreKickoff | MatchPhase::Stoppage | MatchPhase::Finished => {}
+            },
+            MatchAction::HomeGoal => match self.state.phase {
+                MatchPhase::InPlay if self.state.home_score < self.score_cap => {
+                    self.state.home_score += 1;
+                    self.state.phase = MatchPhase::Stoppage;
+                    self.state.possession = Possession::None;
+                    self.state.restart_side = Side::Away;
+                }
+                MatchPhase::PreKickoff
+                | MatchPhase::InPlay
+                | MatchPhase::Stoppage
+                | MatchPhase::Finished => {}
+            },
+            MatchAction::AwayGoal => match self.state.phase {
+                MatchPhase::InPlay if self.state.away_score < self.score_cap => {
+                    self.state.away_score += 1;
+                    self.state.phase = MatchPhase::Stoppage;
+                    self.state.possession = Possession::None;
+                    self.state.restart_side = Side::Home;
+                }
+                MatchPhase::PreKickoff
+                | MatchPhase::InPlay
+                | MatchPhase::Stoppage
+                | MatchPhase::Finished => {}
+            },
         }
 
+        debug_assert!(self.validate().is_ok());
+        debug_assert!(transition_satisfies_contract(before, action, self.state));
         self.state
     }
 
@@ -188,6 +219,56 @@ impl SoccerMatch {
         }
         Ok(())
     }
+}
+
+/// Relational safety contract checked after every debug transition and exhaustively by
+/// the bounded model test below. This deliberately talks only about the stable projection.
+fn transition_satisfies_contract(
+    before: MatchProjection,
+    action: MatchAction,
+    after: MatchProjection,
+) -> bool {
+    if after.tick < before.tick
+        || after.home_score < before.home_score
+        || after.away_score < before.away_score
+        || after.home_score - before.home_score > 1
+        || after.away_score - before.away_score > 1
+    {
+        return false;
+    }
+    if before.phase == MatchPhase::Finished && after != before {
+        return false;
+    }
+
+    let score_transition_is_valid = match action {
+        MatchAction::HomeGoal => {
+            after.away_score == before.away_score
+                && (after.home_score == before.home_score
+                    || (after.home_score == before.home_score + 1
+                        && after.phase == MatchPhase::Stoppage
+                        && after.possession == Possession::None
+                        && after.restart_side == Side::Away))
+        }
+        MatchAction::AwayGoal => {
+            after.home_score == before.home_score
+                && (after.away_score == before.away_score
+                    || (after.away_score == before.away_score + 1
+                        && after.phase == MatchPhase::Stoppage
+                        && after.possession == Possession::None
+                        && after.restart_side == Side::Home))
+        }
+        MatchAction::Start
+        | MatchAction::Tick
+        | MatchAction::HomePossession
+        | MatchAction::AwayPossession
+        | MatchAction::LooseBall
+        | MatchAction::Restart
+        | MatchAction::Finish => {
+            after.home_score == before.home_score && after.away_score == before.away_score
+        }
+    };
+
+    score_transition_is_valid
 }
 
 impl Default for SoccerMatch {
@@ -242,6 +323,7 @@ impl Default for SoccerRealtimeSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashSet, VecDeque};
 
     #[test]
     fn goal_stops_play_and_gives_restart_to_conceding_side() {
@@ -315,5 +397,44 @@ mod tests {
         }
         .validate()
         .is_ok());
+    }
+
+    #[test]
+    fn bounded_production_state_space_satisfies_every_transition_contract() {
+        let initial = SoccerMatch::formal_fixture();
+        let mut reachable = HashSet::from([initial.projection()]);
+        let mut pending = VecDeque::from([initial.projection()]);
+        let mut transitions = 0_usize;
+
+        while let Some(state) = pending.pop_front() {
+            for action in MatchAction::ALL {
+                let mut model = SoccerMatch {
+                    state,
+                    max_ticks: FORMAL_MAX_TICKS,
+                    score_cap: FORMAL_SCORE_CAP,
+                };
+                let after = model.apply(action);
+                transitions += 1;
+
+                assert!(
+                    model.validate().is_ok(),
+                    "invalid {after:?} after {state:?} + {action:?}"
+                );
+                assert!(
+                    transition_satisfies_contract(state, action, after),
+                    "contract failed for {state:?} + {action:?} -> {after:?}"
+                );
+                if reachable.insert(after) {
+                    pending.push_back(after);
+                }
+            }
+        }
+
+        assert_eq!(
+            reachable.len(),
+            270,
+            "formal fixture reachability changed; review the model bounds and refinement claim"
+        );
+        assert_eq!(transitions, reachable.len() * MatchAction::ALL.len());
     }
 }

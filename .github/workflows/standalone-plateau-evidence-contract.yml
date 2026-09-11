@@ -1,0 +1,27 @@
+name: Standalone plateau evidence contract
+
+on:
+  pull_request:
+    paths:
+      - 'standalone-5v5/src/bin/plateau_evidence_contract.rs'
+      - '.github/workflows/standalone-plateau-evidence-contract.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'standalone-5v5/src/bin/plateau_evidence_contract.rs'
+      - '.github/workflows/standalone-plateau-evidence-contract.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4305c38b25d97ef35a8ad1f985ccf2d2242004f2 # stable
+      - run: cargo test --manifest-path standalone-5v5/Cargo.toml --bin plateau_evidence_contract
+      - run: cargo run --quiet --manifest-path standalone-5v5/Cargo.toml --bin plateau_evidence_contract
