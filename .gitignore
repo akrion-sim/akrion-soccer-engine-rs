@@ -15,3 +15,6 @@ viz/tune_log.csv
 temp
 tmp/worktrees
 temp/worktrees
+
+# Machine-local agent instruction symlink (absolute path; never committed)
+.ores/
