@@ -239,13 +239,19 @@ pub fn plan(
         } else {
             solve_reference(&qp)
         };
-        let chosen = if step_status == SolverStatus::Feasible {
-            candidate
-        } else {
+        if step_status != SolverStatus::Feasible {
+            // A future planned tick can become infeasible after earlier ones
+            // appeared feasible. Revoke the earlier first control as well:
+            // returning a projected first control with a braking decision
+            // would misrepresent the action the caller should apply.
             decision = Decision::SafeBraking;
             status = step_status;
-            safe_braking(current, config)
-        };
+            first = safe_braking(initial, config);
+            predicted.clear();
+            predicted.push(step_dynamics(initial, first, config.dt));
+            break;
+        }
+        let chosen = candidate;
         if tick == 0 {
             first = chosen;
         }
@@ -254,10 +260,6 @@ pub fn plan(
             return Err(ControlError::InvalidInput);
         }
         predicted.push(current);
-        // Freeze after a fallback; do not call a "planned" future safe.
-        if decision == Decision::SafeBraking {
-            break;
-        }
     }
     Ok(Plan {
         first_acceleration: first,
