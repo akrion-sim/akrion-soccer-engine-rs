@@ -1,8 +1,8 @@
 //! Tactical policy is intentionally isolated from omniscient world state.
 //! MDP/POMDP belief and learned networks can be plugged in above this boundary.
-use std::collections::VecDeque;
 use crate::locomotion::MotionGoal;
 use crate::math::Vec2;
+use std::collections::VecDeque;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Player {
@@ -23,8 +23,10 @@ pub struct Vision {
 }
 impl Vision {
     pub fn valid(self) -> bool {
-        self.maximum_distance.is_finite() && self.maximum_distance > 0.0
-            && self.half_angle.is_finite() && self.half_angle > 0.0
+        self.maximum_distance.is_finite()
+            && self.maximum_distance > 0.0
+            && self.half_angle.is_finite()
+            && self.half_angle > 0.0
             && self.half_angle <= core::f64::consts::PI
     }
 }
@@ -38,19 +40,29 @@ pub struct Observation {
 fn seen(origin: Vec2, forward: Vec2, target: Vec2, vision: Vision) -> bool {
     let relative = target - origin;
     let distance = relative.norm();
-    if distance > vision.maximum_distance { return false; }
-    if distance <= 1e-9 { return true; }
-    let Some(direction) = forward.unit() else { return false; };
+    if distance > vision.maximum_distance {
+        return false;
+    }
+    if distance <= 1e-9 {
+        return true;
+    }
+    let Some(direction) = forward.unit() else {
+        return false;
+    };
     let cosine = (direction.dot(relative) / distance).clamp(-1.0, 1.0);
     cosine >= vision.half_angle.cos()
 }
 fn occluded(origin: Vec2, target: Vec2, blockers: &[Player], own_id: u32) -> bool {
     let segment = target - origin;
     let length_sq = segment.norm_sq();
-    if length_sq <= 1e-12 { return false; }
+    if length_sq <= 1e-12 {
+        return false;
+    }
     blockers.iter().filter(|p| p.id != own_id).any(|p| {
         let projection = (p.position - origin).dot(segment) / length_sq;
-        if projection <= 0.0 || projection >= 1.0 { return false; }
+        if projection <= 0.0 || projection >= 1.0 {
+            return false;
+        }
         let nearest = origin + segment * projection;
         (p.position - nearest).norm_sq() <= p.radius * p.radius
     })
@@ -63,8 +75,13 @@ pub fn observe(
     vision: Vision,
     frame: u64,
 ) -> Option<Observation> {
-    if !vision.valid() || !facing.finite() || !world.ball.finite()
-        || world.players.iter().any(|p| !p.position.finite() || !p.radius.is_finite() || p.radius <= 0.0)
+    if !vision.valid()
+        || !facing.finite()
+        || !world.ball.finite()
+        || world
+            .players
+            .iter()
+            .any(|p| !p.position.finite() || !p.radius.is_finite() || p.radius <= 0.0)
     {
         return None;
     }
@@ -73,13 +90,21 @@ pub fn observe(
         && !occluded(me.position, world.ball, &world.players, own_id)
     {
         Some(world.ball)
-    } else { None };
-    let mut visible_players: Vec<_> = world.players.iter()
+    } else {
+        None
+    };
+    let mut visible_players: Vec<_> = world
+        .players
+        .iter()
         .filter(|p| p.id != own_id && seen(me.position, facing, p.position, vision))
-        .map(|p| (p.id, p.position)).collect();
+        .map(|p| (p.id, p.position))
+        .collect();
     visible_players.sort_by_key(|(id, _)| *id);
     Some(Observation {
-        own_position: me.position, ball_position, visible_players, frame
+        own_position: me.position,
+        ball_position,
+        visible_players,
+        frame,
     })
 }
 /// Reaction latency is expressed in whole **physics frames**. Before enough
@@ -90,14 +115,22 @@ pub struct ObservationDelay {
 }
 impl ObservationDelay {
     pub fn new(lag_frames: usize) -> Option<Self> {
-        if lag_frames <= 1000 { Some(Self { lag_frames, history: VecDeque::new() }) }
-        else { None }
+        if lag_frames <= 1000 {
+            Some(Self {
+                lag_frames,
+                history: VecDeque::new(),
+            })
+        } else {
+            None
+        }
     }
     pub fn push(&mut self, observation: Observation) -> Option<Observation> {
         self.history.push_back(observation);
         if self.history.len() > self.lag_frames {
             self.history.pop_front()
-        } else { None }
+        } else {
+            None
+        }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -124,7 +157,9 @@ pub fn select_motion(
     let position = match choice {
         TacticalChoice::Hold => observation.own_position,
         TacticalChoice::MoveTo(target) => {
-            if !target.finite() { return (PolicyFeedback::NonFiniteTarget, None); }
+            if !target.finite() {
+                return (PolicyFeedback::NonFiniteTarget, None);
+            }
             target
         }
         TacticalChoice::ChaseVisibleBall => {
@@ -134,5 +169,11 @@ pub fn select_motion(
             ball
         }
     };
-    (PolicyFeedback::Accepted, Some(MotionGoal { position, velocity: Vec2::ZERO }))
+    (
+        PolicyFeedback::Accepted,
+        Some(MotionGoal {
+            position,
+            velocity: Vec2::ZERO,
+        }),
+    )
 }
