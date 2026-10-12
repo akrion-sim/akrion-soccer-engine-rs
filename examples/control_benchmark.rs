@@ -1,18 +1,26 @@
 //! Repeatable diagnostic microbenchmark, not proof of meeting 60Hz budgets.
 use akrion_soccer_engine::{
-    locomotion::{plan,Config,State,MotionGoal},
+    locomotion::{plan, Config, MotionGoal, State},
     math::Vec2,
 };
 use std::hint::black_box;
 use std::time::Instant;
 fn main() {
     let config = Config {
-        dt: 0.1, horizon: 5, max_speed: 7.0, max_acceleration: 4.0,
-        contact_radius: 0.35, collision_margin: 0.1
+        dt: 0.1,
+        horizon: 5,
+        max_speed: 7.0,
+        max_acceleration: 4.0,
+        contact_radius: 0.35,
+        collision_margin: 0.1,
     };
-    println!("platform={} arch={} build=release={} rustc=see workflow log",
-        std::env::consts::OS, std::env::consts::ARCH, !cfg!(debug_assertions));
-    for players in [1,22] {
+    println!(
+        "platform={} arch={} build=release={} rustc=see workflow log",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        !cfg!(debug_assertions)
+    );
+    for players in [1, 22] {
         let count = 4000;
         let start = Instant::now();
         let mut checksum = 0u64;
@@ -33,7 +41,13 @@ fn main() {
             }
         }
         let nanos = start.elapsed().as_nanos();
-        println!("players={} iterations={} elapsed_ns={} avg_group_ns={} checksum={:016x}",
-            players,count,nanos,nanos/(count as u128),checksum);
+        println!(
+            "players={} iterations={} elapsed_ns={} avg_group_ns={} checksum={:016x}",
+            players,
+            count,
+            nanos,
+            nanos / (count as u128),
+            checksum
+        );
     }
 }
