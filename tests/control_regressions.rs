@@ -144,6 +144,24 @@ fn local_contact_plane_restricts_approach_without_global_collision_claim() {
     }
 }
 #[test]
+fn future_obstacle_revokes_earlier_feasible_first_control() {
+    let c = config();
+    let initial = state(Vec2::ZERO, Vec2::ZERO);
+    let incoming = Neighbor {
+        id: 2,
+        position: Vec2::new(1.5, 0.0),
+        velocity: Vec2::new(-2.5, 0.0),
+        radius: 0.35,
+        intentional_contact: false,
+    };
+    let plan = plan(initial, goal(Vec2::new(10.0, 0.0)), c, &[incoming]).unwrap();
+    assert_eq!(plan.solver_status, SolverStatus::Infeasible);
+    assert_eq!(plan.decision, Decision::SafeBraking);
+    assert_eq!(plan.first_acceleration, safe_braking(initial, c));
+    assert_eq!(plan.predicted.len(), 1);
+}
+
+#[test]
 fn broad_phase_is_order_independent_and_omits_distant_players() {
     let c = config();
     let near = Neighbor {
