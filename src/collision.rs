@@ -70,34 +70,36 @@ pub struct SweptContact {
     pub minimum_distance: f64,
     pub intentional: bool,
 }
+#[derive(Clone, Copy, Debug)]
+pub struct SweptBody {
+    pub position: Vec2,
+    pub velocity: Vec2,
+    pub radius: f64,
+}
 /// Analytical swept-circle contact detection across an entire physics tick:
 /// catches tunneling between discrete MPC samples without mutating positions.
 /// A separate deterministic physics solver owns impulses, friction and tackles.
 pub fn swept_contact(
-    left_position: Vec2,
-    left_velocity: Vec2,
-    left_radius: f64,
-    right_position: Vec2,
-    right_velocity: Vec2,
-    right_radius: f64,
+    left: SweptBody,
+    right: SweptBody,
     dt: f64,
     intentional: bool,
 ) -> Option<SweptContact> {
-    if !left_position.finite()
-        || !left_velocity.finite()
-        || !right_position.finite()
-        || !right_velocity.finite()
+    if !left.position.finite()
+        || !left.velocity.finite()
+        || !right.position.finite()
+        || !right.velocity.finite()
         || !dt.is_finite()
         || dt <= 0.0
-        || !left_radius.is_finite()
-        || !right_radius.is_finite()
-        || left_radius <= 0.0
-        || right_radius <= 0.0
+        || !left.radius.is_finite()
+        || !right.radius.is_finite()
+        || left.radius <= 0.0
+        || right.radius <= 0.0
     {
         return None;
     }
-    let relative = left_position - right_position;
-    let velocity = left_velocity - right_velocity;
+    let relative = left.position - right.position;
+    let velocity = left.velocity - right.velocity;
     let v2 = velocity.norm_sq();
     let time = if v2 > 1e-12 {
         (-relative.dot(velocity) / v2).clamp(0.0, dt)
@@ -105,7 +107,7 @@ pub fn swept_contact(
         0.0
     };
     let minimum_distance = (relative + velocity * time).norm();
-    if minimum_distance <= left_radius + right_radius {
+    if minimum_distance <= left.radius + right.radius {
         Some(SweptContact {
             time,
             minimum_distance,
