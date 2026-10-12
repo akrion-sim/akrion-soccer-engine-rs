@@ -29,12 +29,18 @@ pub struct Config {
 }
 impl Config {
     pub fn validate(self) -> Result<Self, ControlError> {
-        if !self.dt.is_finite() || self.dt <= 0.0 || self.dt > 1.0
+        if !self.dt.is_finite()
+            || self.dt <= 0.0
+            || self.dt > 1.0
             || !(1..=20).contains(&self.horizon)
-            || !self.max_speed.is_finite() || self.max_speed <= 0.0
-            || !self.max_acceleration.is_finite() || self.max_acceleration <= 0.0
-            || !self.contact_radius.is_finite() || self.contact_radius <= 0.0
-            || !self.collision_margin.is_finite() || self.collision_margin < 0.0
+            || !self.max_speed.is_finite()
+            || self.max_speed <= 0.0
+            || !self.max_acceleration.is_finite()
+            || self.max_acceleration <= 0.0
+            || !self.contact_radius.is_finite()
+            || self.contact_radius <= 0.0
+            || !self.collision_margin.is_finite()
+            || self.collision_margin < 0.0
         {
             return Err(ControlError::InvalidInput);
         }
@@ -42,7 +48,9 @@ impl Config {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControlError { InvalidInput }
+pub enum ControlError {
+    InvalidInput,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Halfspace {
@@ -54,7 +62,9 @@ impl Halfspace {
     pub fn valid(self) -> bool {
         self.normal.finite() && self.upper.is_finite() && self.normal.norm_sq() > 1e-15
     }
-    pub fn slack(self, u: Vec2) -> f64 { self.upper - self.normal.dot(u) }
+    pub fn slack(self, u: Vec2) -> f64 {
+        self.upper - self.normal.dot(u)
+    }
 }
 
 /// A 2-variable strictly convex quadratic objective and linear constraints.
@@ -69,14 +79,23 @@ pub struct QpStep {
 }
 impl QpStep {
     pub fn valid(&self) -> bool {
-        self.hessian_scalar.is_finite() && self.hessian_scalar > 0.0
-            && self.linear.finite() && self.inequalities.iter().all(|c| c.valid())
+        self.hessian_scalar.is_finite()
+            && self.hessian_scalar > 0.0
+            && self.linear.finite()
+            && self.inequalities.iter().all(|c| c.valid())
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SolverStatus { Feasible, Infeasible, NonFinite }
+pub enum SolverStatus {
+    Feasible,
+    Infeasible,
+    NonFinite,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decision { Projected, SafeBraking }
+pub enum Decision {
+    Projected,
+    SafeBraking,
+}
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub first_acceleration: Vec2,
@@ -109,25 +128,57 @@ pub fn formulate(
     let a = config.max_acceleration / core::f64::consts::SQRT_2;
     let v = config.max_speed / core::f64::consts::SQRT_2;
     let mut inequalities = vec![
-        Halfspace { normal: Vec2::new(1.0, 0.0), upper: a },
-        Halfspace { normal: Vec2::new(-1.0, 0.0), upper: a },
-        Halfspace { normal: Vec2::new(0.0, 1.0), upper: a },
-        Halfspace { normal: Vec2::new(0.0, -1.0), upper: a },
-        Halfspace { normal: Vec2::new(dt, 0.0), upper: v - s.velocity.x },
-        Halfspace { normal: Vec2::new(-dt, 0.0), upper: v + s.velocity.x },
-        Halfspace { normal: Vec2::new(0.0, dt), upper: v - s.velocity.y },
-        Halfspace { normal: Vec2::new(0.0, -dt), upper: v + s.velocity.y },
+        Halfspace {
+            normal: Vec2::new(1.0, 0.0),
+            upper: a,
+        },
+        Halfspace {
+            normal: Vec2::new(-1.0, 0.0),
+            upper: a,
+        },
+        Halfspace {
+            normal: Vec2::new(0.0, 1.0),
+            upper: a,
+        },
+        Halfspace {
+            normal: Vec2::new(0.0, -1.0),
+            upper: a,
+        },
+        Halfspace {
+            normal: Vec2::new(dt, 0.0),
+            upper: v - s.velocity.x,
+        },
+        Halfspace {
+            normal: Vec2::new(-dt, 0.0),
+            upper: v + s.velocity.x,
+        },
+        Halfspace {
+            normal: Vec2::new(0.0, dt),
+            upper: v - s.velocity.y,
+        },
+        Halfspace {
+            normal: Vec2::new(0.0, -dt),
+            upper: v + s.velocity.y,
+        },
     ];
     inequalities.extend_from_slice(collision_planes);
-    QpStep { hessian_scalar: h, linear, inequalities }
+    QpStep {
+        hessian_scalar: h,
+        linear,
+        inequalities,
+    }
 }
 /// Projected halfspace reference feasibility solver. Cyclic projection is NOT
 /// a general QP optimizer. Status is checked after a fixed iteration budget.
 /// Infeasible/nonfinite => deterministic braking, not a fabricated solution.
 pub fn solve_reference(qp: &QpStep) -> (SolverStatus, Vec2) {
-    if !qp.valid() { return (SolverStatus::NonFinite, Vec2::ZERO); }
+    if !qp.valid() {
+        return (SolverStatus::NonFinite, Vec2::ZERO);
+    }
     let mut u = qp.linear * (1.0 / qp.hessian_scalar);
-    if !u.finite() { return (SolverStatus::NonFinite, Vec2::ZERO); }
+    if !u.finite() {
+        return (SolverStatus::NonFinite, Vec2::ZERO);
+    }
     for _ in 0..96 {
         for c in &qp.inequalities {
             let violation = c.normal.dot(u) - c.upper;
@@ -136,7 +187,9 @@ pub fn solve_reference(qp: &QpStep) -> (SolverStatus, Vec2) {
             }
         }
     }
-    if !u.finite() { return (SolverStatus::NonFinite, Vec2::ZERO); }
+    if !u.finite() {
+        return (SolverStatus::NonFinite, Vec2::ZERO);
+    }
     if qp.inequalities.iter().any(|c| c.slack(u) < -1e-7) {
         return (SolverStatus::Infeasible, Vec2::ZERO);
     }
@@ -145,7 +198,9 @@ pub fn solve_reference(qp: &QpStep) -> (SolverStatus, Vec2) {
 /// Braking magnitude is physically capped; no jump to zero velocity.
 pub fn safe_braking(s: State, config: Config) -> Vec2 {
     let speed = s.velocity.norm();
-    if speed <= 1e-12 || !speed.is_finite() { return Vec2::ZERO; }
+    if speed <= 1e-12 || !speed.is_finite() {
+        return Vec2::ZERO;
+    }
     s.velocity * (-config.max_acceleration.min(speed / config.dt) / speed)
 }
 pub fn plan(
@@ -155,8 +210,10 @@ pub fn plan(
     neighbors: &[Neighbor],
 ) -> Result<Plan, ControlError> {
     config.validate()?;
-    if !initial.position.finite() || !initial.velocity.finite()
-        || !goal.position.finite() || !goal.velocity.finite()
+    if !initial.position.finite()
+        || !initial.velocity.finite()
+        || !goal.position.finite()
+        || !goal.velocity.finite()
         || neighbors.iter().any(|n| !n.valid())
     {
         return Err(ControlError::InvalidInput);
@@ -189,14 +246,24 @@ pub fn plan(
             status = step_status;
             safe_braking(current, config)
         };
-        if tick == 0 { first = chosen; }
+        if tick == 0 {
+            first = chosen;
+        }
         current = step_dynamics(current, chosen, config.dt);
         if !current.position.finite() || !current.velocity.finite() {
             return Err(ControlError::InvalidInput);
         }
         predicted.push(current);
         // Freeze after a fallback; do not call a "planned" future safe.
-        if decision == Decision::SafeBraking { break; }
+        if decision == Decision::SafeBraking {
+            break;
+        }
     }
-    Ok(Plan { first_acceleration: first, predicted, decision, constraint_count, solver_status: status })
+    Ok(Plan {
+        first_acceleration: first,
+        predicted,
+        decision,
+        constraint_count,
+        solver_status: status,
+    })
 }
