@@ -186,41 +186,81 @@ fn broad_phase_is_order_independent_and_omits_distant_players() {
 #[test]
 fn tunneling_head_on_crossing_chase_and_intentional_contact_are_reported_to_physics() {
     let head_on = swept_contact(
-        SweptBody { position: Vec2::new(-2.0, 0.0), velocity: Vec2::new(10.0, 0.0), radius: 0.3 },
-        SweptBody { position: Vec2::new(2.0, 0.0), velocity: Vec2::new(-10.0, 0.0), radius: 0.3 },
+        SweptBody {
+            position: Vec2::new(-2.0, 0.0),
+            velocity: Vec2::new(10.0, 0.0),
+            radius: 0.3,
+        },
+        SweptBody {
+            position: Vec2::new(2.0, 0.0),
+            velocity: Vec2::new(-10.0, 0.0),
+            radius: 0.3,
+        },
         0.3,
-        false
+        false,
     )
     .unwrap();
     assert!((head_on.time - 0.2).abs() < 1e-9);
     assert!(head_on.minimum_distance < 1e-9);
     let crossing = swept_contact(
-        SweptBody { position: Vec2::new(-1.0, 0.0), velocity: Vec2::new(4.0, 0.0), radius: 0.25 },
-        SweptBody { position: Vec2::new(0.0, -1.0), velocity: Vec2::new(0.0, 4.0), radius: 0.25 },
+        SweptBody {
+            position: Vec2::new(-1.0, 0.0),
+            velocity: Vec2::new(4.0, 0.0),
+            radius: 0.25,
+        },
+        SweptBody {
+            position: Vec2::new(0.0, -1.0),
+            velocity: Vec2::new(0.0, 4.0),
+            radius: 0.25,
+        },
         0.5,
-        false
+        false,
     )
     .unwrap();
     assert!(crossing.minimum_distance < 1e-9);
     let chase = swept_contact(
-        SweptBody { position: Vec2::new(-2.0, 0.0), velocity: Vec2::new(5.0, 0.0), radius: 0.3 },
-        SweptBody { position: Vec2::new(0.0, 0.0), velocity: Vec2::new(1.0, 0.0), radius: 0.3 },
+        SweptBody {
+            position: Vec2::new(-2.0, 0.0),
+            velocity: Vec2::new(5.0, 0.0),
+            radius: 0.3,
+        },
+        SweptBody {
+            position: Vec2::new(0.0, 0.0),
+            velocity: Vec2::new(1.0, 0.0),
+            radius: 0.3,
+        },
         0.5,
-        false
+        false,
     )
     .unwrap();
     assert!(chase.minimum_distance <= 0.6);
     let legal = swept_contact(
-        SweptBody { position: Vec2::ZERO, velocity: Vec2::ZERO, radius: 0.35 },
-        SweptBody { position: Vec2::new(0.2, 0.0), velocity: Vec2::ZERO, radius: 0.35 },
+        SweptBody {
+            position: Vec2::ZERO,
+            velocity: Vec2::ZERO,
+            radius: 0.35,
+        },
+        SweptBody {
+            position: Vec2::new(0.2, 0.0),
+            velocity: Vec2::ZERO,
+            radius: 0.35,
+        },
         0.1,
-        true
+        true,
     )
     .unwrap();
     assert!(legal.intentional);
     assert!(swept_contact(
-        SweptBody { position: Vec2::ZERO, velocity: Vec2::ZERO, radius: 0.35 },
-        SweptBody { position: Vec2::new(10.0, 0.0), velocity: Vec2::ZERO, radius: 0.35 },
+        SweptBody {
+            position: Vec2::ZERO,
+            velocity: Vec2::ZERO,
+            radius: 0.35
+        },
+        SweptBody {
+            position: Vec2::new(10.0, 0.0),
+            velocity: Vec2::ZERO,
+            radius: 0.35
+        },
         0.1,
         false
     )
