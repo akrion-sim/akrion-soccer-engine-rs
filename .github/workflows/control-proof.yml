@@ -14,20 +14,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustc --version && cargo --version
-      - name: Generate reproducible rustfmt candidate
-        run: cargo fmt --all
-      - name: Export exact rustfmt product for reviewed commit
-        run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          for path in [*sorted(Path('src').glob('*.rs')), *sorted(Path('tests').glob('*.rs')), *sorted(Path('examples').glob('*.rs'))]:
-              s = path.read_text(encoding='utf8')
-              if len(s) > 150000: raise SystemExit('unexpected rustfmt size')
-              parts = [s[i:i+2300] for i in range(0,len(s),2300)] or ['']
-              for i,part in enumerate(parts):
-                  print('@@RUSTFMT@@'+json.dumps({'path':str(path),'index':i,'parts':len(parts),'content':part},ensure_ascii=True,separators=(',',':')))
-          PY
+      - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - name: Measured local scenario microbenchmark
