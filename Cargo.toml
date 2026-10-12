@@ -1,0 +1,14 @@
+[package]
+name = "akrion-soccer-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Deterministic soccer control research foundation"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "akrion_soccer_engine"
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
